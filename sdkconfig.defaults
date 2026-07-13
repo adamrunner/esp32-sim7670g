@@ -9,3 +9,13 @@ CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
 
 # Roomier HTTP headers for browser requests
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+
+# Cellular data: lwIP PPP client over UART to the SIM7670G (esp_modem)
+CONFIG_LWIP_PPP_SUPPORT=y
+CONFIG_LWIP_PPP_PAP_SUPPORT=y
+CONFIG_LWIP_PPP_CHAP_SUPPORT=y
+CONFIG_UART_ISR_IN_IRAM=y
+
+# esp_modem C API copies AT responses through a bounded buffer; match the
+# web UI AT console's response size
+CONFIG_ESP_MODEM_C_API_STR_MAX=2048

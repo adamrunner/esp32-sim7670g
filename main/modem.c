@@ -1,5 +1,6 @@
 #include "modem.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -9,8 +10,16 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "driver/uart.h"
+#include "esp_event.h"
 #include "esp_log.h"
+#include "esp_modem_api.h"
+#include "esp_netif.h"
+#include "esp_netif_ppp.h"
 #include "esp_timer.h"
+#include "lwip/inet.h"
+#include "lwip/ip_addr.h"
+#include "lwip/netdb.h"
+#include "ping/ping_sock.h"
 #include "nvs.h"
 
 static const char *TAG = "modem";
@@ -20,81 +29,72 @@ static const char *TAG = "modem";
 #define MODEM_TX_PIN    18
 #define MODEM_RX_PIN    17
 #define MODEM_BAUD      115200
-#define UART_BUF_SIZE   2048
-#define AT_RESP_MAX     2048
+#define AT_RESP_MAX     2048    // keep in sync with CONFIG_ESP_MODEM_C_API_STR_MAX
 
-// Default APN for the EIOTCLUB SIM; change via the web UI if it doesn't attach.
-#define DEFAULT_APN     "wbdata"
+// Blank = let the carrier assign the APN. The EIOTCLUB SIM roaming on
+// Verizon requires a blank attach context (it hands out "globaldata");
+// forcing e.g. "wbdata" into CGDCONT 1 makes the network reject the LTE
+// attach outright after the next modem reboot. Override via the web UI
+// only if a SIM genuinely needs a named APN.
+#define DEFAULT_APN     ""
 
 #define NVS_NAMESPACE   "cellcfg"
 #define NVS_KEY_APN     "apn"
 
-static SemaphoreHandle_t s_uart_mutex;
+#define CONNECT_RETRY_MS 20000
+
+static esp_modem_dce_t *s_dce;
+static esp_netif_t *s_ppp_netif;
+
+static SemaphoreHandle_t s_at_mutex;      // serializes AT commands through esp_modem
 static SemaphoreHandle_t s_status_mutex;
 static SemaphoreHandle_t s_diag_mutex;
 static modem_status_t s_status;
 static char s_apn[MODEM_APN_MAX] = DEFAULT_APN;
 static bool s_apn_dirty;
 
-static void uart_init(void)
+// Written by esp_event handlers, read by the modem task (s_status_mutex).
+static bool s_ppp_up;
+static char s_ppp_ip[40];
+
+// The UART carries either AT commands or PPP data, never both. (The
+// SIM7670G nominally supports CMUX multiplexing, but esp_modem's CMUX
+// negotiation wedges this modem into a state only a reset clears — see
+// README. Plain PPP data mode is reliable.)
+static bool at_channel_available(void)
 {
-    uart_config_t cfg = {
-        .baud_rate = MODEM_BAUD,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
-    };
-    ESP_ERROR_CHECK(uart_driver_install(MODEM_UART, UART_BUF_SIZE * 2, 0, 0, NULL, 0));
-    ESP_ERROR_CHECK(uart_param_config(MODEM_UART, &cfg));
-    ESP_ERROR_CHECK(uart_set_pin(MODEM_UART, MODEM_TX_PIN, MODEM_RX_PIN,
-                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    uart_flush_input(MODEM_UART);
+    return !s_ppp_up;
 }
 
-// Send one AT command and read until a final result code or timeout.
+// Send one AT command and capture the raw response (echo of URCs included).
 // Returns ESP_OK on "OK", ESP_FAIL on ERROR/+CME/+CMS ERROR, ESP_ERR_TIMEOUT otherwise.
 static esp_err_t at_transact(const char *cmd, char *resp, size_t resp_len, uint32_t timeout_ms)
 {
+    static char buf[AT_RESP_MAX];   // guarded by s_at_mutex
+    char full[300];
+
     if (resp && resp_len) {
         resp[0] = '\0';
     }
-    xSemaphoreTake(s_uart_mutex, portMAX_DELAY);
-    uart_flush_input(MODEM_UART);
-    uart_write_bytes(MODEM_UART, cmd, strlen(cmd));
-    uart_write_bytes(MODEM_UART, "\r\n", 2);
-
-    static char buf[AT_RESP_MAX];
-    size_t used = 0;
-    esp_err_t result = ESP_ERR_TIMEOUT;
-    int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
-
-    while (esp_timer_get_time() < deadline) {
-        int n = uart_read_bytes(MODEM_UART, (uint8_t *)buf + used,
-                                (AT_RESP_MAX - 1) - used, pdMS_TO_TICKS(50));
-        if (n > 0) {
-            used += n;
-            buf[used] = '\0';
-            if (strstr(buf, "\r\nOK\r\n")) {
-                result = ESP_OK;
-                break;
-            }
-            if (strstr(buf, "\r\nERROR\r\n") || strstr(buf, "+CME ERROR") ||
-                strstr(buf, "+CMS ERROR")) {
-                result = ESP_FAIL;
-                break;
-            }
-            if (used >= AT_RESP_MAX - 1) {
-                break;
-            }
-        }
+    if (snprintf(full, sizeof(full), "%s\r", cmd) >= (int)sizeof(full)) {
+        return ESP_ERR_INVALID_ARG;
     }
 
+    xSemaphoreTake(s_at_mutex, portMAX_DELAY);
+    if (!at_channel_available()) {
+        xSemaphoreGive(s_at_mutex);
+        if (resp && resp_len) {
+            snprintf(resp, resp_len, "unavailable: UART is carrying PPP data\r\n");
+        }
+        return ESP_ERR_INVALID_STATE;
+    }
+    buf[0] = '\0';
+    // "+CME ERROR"/"+CMS ERROR" both contain "ERROR", so one fail phrase covers all
+    esp_err_t result = esp_modem_at_raw(s_dce, full, buf, "OK", "ERROR", timeout_ms);
     if (resp && resp_len) {
         snprintf(resp, resp_len, "%s", buf);
     }
-    xSemaphoreGive(s_uart_mutex);
+    xSemaphoreGive(s_at_mutex);
     return result;
 }
 
@@ -103,43 +103,9 @@ esp_err_t modem_send_at(const char *cmd, char *resp, size_t resp_len, uint32_t t
     return at_transact(cmd, resp, resp_len, timeout_ms);
 }
 
-// Like at_transact, but for commands whose real result is an unsolicited
-// line arriving after OK (e.g. +CPING). Collects into `resp` until the
-// line containing `urc_done` is complete, ERROR, or timeout.
-static esp_err_t at_transact_urc(const char *cmd, const char *urc_done,
-                                 char *resp, size_t resp_len, uint32_t timeout_ms)
-{
-    xSemaphoreTake(s_uart_mutex, portMAX_DELAY);
-    uart_flush_input(MODEM_UART);
-    uart_write_bytes(MODEM_UART, cmd, strlen(cmd));
-    uart_write_bytes(MODEM_UART, "\r\n", 2);
-
-    size_t used = 0;
-    esp_err_t result = ESP_ERR_TIMEOUT;
-    int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
-    resp[0] = '\0';
-
-    while (esp_timer_get_time() < deadline && used < resp_len - 1) {
-        int n = uart_read_bytes(MODEM_UART, (uint8_t *)resp + used,
-                                (resp_len - 1) - used, pdMS_TO_TICKS(100));
-        if (n <= 0) {
-            continue;
-        }
-        used += n;
-        resp[used] = '\0';
-        char *tok = strstr(resp, urc_done);
-        if (tok && strchr(tok, '\n')) {
-            result = ESP_OK;
-            break;
-        }
-        if (strstr(resp, "\r\nERROR\r\n") || strstr(resp, "+CME ERROR")) {
-            result = ESP_FAIL;
-            break;
-        }
-    }
-    xSemaphoreGive(s_uart_mutex);
-    return result;
-}
+// ---------------------------------------------------------------------------
+// Network diagnostics: DNS + ICMP ping through the ESP32's own lwIP stack,
+// i.e. this actually exercises the PPP link, not the modem's internal stack.
 
 static bool valid_hostname(const char *h)
 {
@@ -156,6 +122,70 @@ static bool valid_hostname(const char *h)
     return true;
 }
 
+static void __attribute__((format(printf, 2, 3)))
+diag_line(modem_netdiag_t *out, const char *fmt, ...)
+{
+    char line[128];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    strlcat(out->raw, line, sizeof(out->raw));
+}
+
+typedef struct {
+    modem_netdiag_t *out;
+    SemaphoreHandle_t done;
+    uint32_t sum_ms;
+} ping_ctx_t;
+
+static void ping_on_success(esp_ping_handle_t h, void *args)
+{
+    ping_ctx_t *ctx = args;
+    modem_netdiag_t *out = ctx->out;
+    uint16_t seq = 0;
+    uint32_t elapsed = 0, bytes = 0;
+    ip_addr_t target = {0};
+    esp_ping_get_profile(h, ESP_PING_PROF_SEQNO, &seq, sizeof(seq));
+    esp_ping_get_profile(h, ESP_PING_PROF_TIMEGAP, &elapsed, sizeof(elapsed));
+    esp_ping_get_profile(h, ESP_PING_PROF_SIZE, &bytes, sizeof(bytes));
+    esp_ping_get_profile(h, ESP_PING_PROF_IPADDR, &target, sizeof(target));
+
+    if (out->received == 0 || (int)elapsed < out->min_ms) {
+        out->min_ms = elapsed;
+    }
+    if ((int)elapsed > out->max_ms) {
+        out->max_ms = elapsed;
+    }
+    ctx->sum_ms += elapsed;
+    out->received++;
+    diag_line(out, "%u bytes from %s: icmp_seq=%u time=%u ms\n",
+              (unsigned)bytes, ipaddr_ntoa(&target), seq, (unsigned)elapsed);
+}
+
+static void ping_on_timeout(esp_ping_handle_t h, void *args)
+{
+    ping_ctx_t *ctx = args;
+    uint16_t seq = 0;
+    esp_ping_get_profile(h, ESP_PING_PROF_SEQNO, &seq, sizeof(seq));
+    diag_line(ctx->out, "request timeout for icmp_seq %u\n", seq);
+}
+
+static void ping_on_end(esp_ping_handle_t h, void *args)
+{
+    ping_ctx_t *ctx = args;
+    modem_netdiag_t *out = ctx->out;
+    uint32_t sent = 0, received = 0;
+    esp_ping_get_profile(h, ESP_PING_PROF_REQUEST, &sent, sizeof(sent));
+    esp_ping_get_profile(h, ESP_PING_PROF_REPLY, &received, sizeof(received));
+    out->sent = sent;
+    out->received = received;
+    out->lost = sent - received;
+    out->avg_ms = received ? (int)(ctx->sum_ms / received) : 0;
+    out->ping_ok = true;
+    xSemaphoreGive(ctx->done);
+}
+
 esp_err_t modem_ping_host(const char *host, modem_netdiag_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -163,67 +193,98 @@ esp_err_t modem_ping_host(const char *host, modem_netdiag_t *out)
         return ESP_ERR_INVALID_ARG;
     }
 
-    char cmd[160];
-    static char resp[1024];  // guarded by s_diag_mutex
     xSemaphoreTake(s_diag_mutex, portMAX_DELAY);
 
-    // DNS: one "+CDNSGIP: <n>,"host","ip"" line per address (before OK);
-    // "+CDNSGIP: 0,<err>" followed by ERROR on failure.
-    snprintf(cmd, sizeof(cmd), "AT+CDNSGIP=\"%s\"", host);
-    at_transact(cmd, resp, sizeof(resp), 20000);
-    strlcat(out->raw, resp, sizeof(out->raw));
-
-    const char *p = resp;
-    while ((p = strstr(p, "+CDNSGIP:")) != NULL) {
-        p += strlen("+CDNSGIP:");
-        if (atoi(p) == 0) {
-            const char *comma = strchr(p, ',');
-            out->dns_err = comma ? atoi(comma + 1) : -1;
-        } else if (out->num_ips < MODEM_PING_MAX_IPS) {
-            // IP is the second quoted string on the line
-            const char *q[4] = {0};
-            const char *scan = p;
-            for (int i = 0; i < 4; i++) {
-                q[i] = strchr(scan, '"');
-                if (!q[i] || (i > 0 && strchr(scan, '\n') && strchr(scan, '\n') < q[i])) {
-                    q[i] = NULL;
-                    break;
-                }
-                scan = q[i] + 1;
-            }
-            if (q[3]) {
-                size_t len = q[3] - (q[2] + 1);
-                if (len > 0 && len < sizeof(out->ips[0])) {
-                    memcpy(out->ips[out->num_ips], q[2] + 1, len);
-                    out->ips[out->num_ips][len] = '\0';
-                    out->num_ips++;
-                }
-            }
-        }
-    }
-    out->dns_ok = out->num_ips > 0;
-    if (!out->dns_ok) {
+    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+    bool up = s_ppp_up;
+    xSemaphoreGive(s_status_mutex);
+    if (!up) {
+        diag_line(out, "cellular data link is down; nothing to ping through\n");
         xSemaphoreGive(s_diag_mutex);
         return ESP_OK;
     }
 
-    // Ping: 4 packets, 64 bytes, 1 s interval, 10 s per-packet timeout
-    // (10000 is the modem's minimum). Summary URC: +CPING: 3,...
-    snprintf(cmd, sizeof(cmd), "AT+CPING=\"%s\",1,4,64,1000,10000,64", host);
-    esp_err_t err = at_transact_urc(cmd, "+CPING: 3", resp, sizeof(resp), 55000);
-    strlcat(out->raw, resp, sizeof(out->raw));
-
-    if (err == ESP_OK) {
-        const char *s = strstr(resp, "+CPING: 3");
-        if (s && sscanf(s + strlen("+CPING: 3"), ",%d,%d,%d,%d,%d,%d",
-                        &out->sent, &out->received, &out->lost,
-                        &out->min_ms, &out->max_ms, &out->avg_ms) == 6) {
-            out->ping_ok = true;
+    // DNS via the resolvers the carrier handed us during PPP negotiation
+    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+    struct addrinfo *res = NULL;
+    int rc = getaddrinfo(host, NULL, &hints, &res);
+    if (rc != 0 || !res) {
+        out->dns_err = rc;
+        diag_line(out, "DNS lookup for %s failed (getaddrinfo error %d)\n", host, rc);
+        if (res) {
+            freeaddrinfo(res);
+        }
+        xSemaphoreGive(s_diag_mutex);
+        return ESP_OK;
+    }
+    for (struct addrinfo *ai = res; ai && out->num_ips < MODEM_PING_MAX_IPS; ai = ai->ai_next) {
+        if (ai->ai_family != AF_INET) {
+            continue;
+        }
+        struct sockaddr_in *sa = (struct sockaddr_in *)ai->ai_addr;
+        char ipstr[16];
+        if (!inet_ntop(AF_INET, &sa->sin_addr, ipstr, sizeof(ipstr))) {
+            continue;
+        }
+        bool dup = false;
+        for (int i = 0; i < out->num_ips; i++) {
+            if (strcmp(out->ips[i], ipstr) == 0) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) {
+            strlcpy(out->ips[out->num_ips++], ipstr, sizeof(out->ips[0]));
         }
     }
+    freeaddrinfo(res);
+    out->dns_ok = out->num_ips > 0;
+    if (!out->dns_ok) {
+        diag_line(out, "DNS returned no IPv4 addresses for %s\n", host);
+        xSemaphoreGive(s_diag_mutex);
+        return ESP_OK;
+    }
+
+    ip_addr_t target;
+    if (!ipaddr_aton(out->ips[0], &target)) {
+        xSemaphoreGive(s_diag_mutex);
+        return ESP_OK;
+    }
+
+    ping_ctx_t ctx = { .out = out, .done = xSemaphoreCreateBinary() };
+    esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
+    cfg.target_addr = target;
+    cfg.count = 4;
+    cfg.interval_ms = 1000;
+    cfg.timeout_ms = 3000;
+    cfg.data_size = 56;
+    esp_ping_callbacks_t cbs = {
+        .cb_args = &ctx,
+        .on_ping_success = ping_on_success,
+        .on_ping_timeout = ping_on_timeout,
+        .on_ping_end = ping_on_end,
+    };
+
+    diag_line(out, "PING %s (%s): %u data bytes\n", host, out->ips[0], (unsigned)cfg.data_size);
+    esp_ping_handle_t ping;
+    if (esp_ping_new_session(&cfg, &cbs, &ping) == ESP_OK) {
+        esp_ping_start(ping);
+        if (xSemaphoreTake(ctx.done, pdMS_TO_TICKS(cfg.count * (cfg.interval_ms + cfg.timeout_ms) + 5000)) != pdTRUE) {
+            esp_ping_stop(ping);
+            diag_line(out, "ping did not complete\n");
+        }
+        esp_ping_delete_session(ping);
+    } else {
+        diag_line(out, "failed to start ping session\n");
+    }
+    vSemaphoreDelete(ctx.done);
+
     xSemaphoreGive(s_diag_mutex);
     return ESP_OK;
 }
+
+// ---------------------------------------------------------------------------
+// Status polling helpers (same AT parsing as before, now via esp_modem)
 
 // Copy the rest of the line following `prefix` in `resp` into out (trimmed).
 static bool extract_line_after(const char *resp, const char *prefix, char *out, size_t out_len)
@@ -326,16 +387,6 @@ void modem_get_status(modem_status_t *out)
     xSemaphoreGive(s_status_mutex);
 }
 
-// Configure the PDP context with the current APN and activate it.
-static void pdp_setup(const char *apn)
-{
-    char cmd[MODEM_APN_MAX + 32];
-    snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", apn);
-    at_transact(cmd, NULL, 0, 5000);
-    at_transact("AT+CGATT=1", NULL, 0, 10000);
-    at_transact("AT+CGACT=1,1", NULL, 0, 15000);
-}
-
 // One-time identity queries once the modem answers.
 static void read_identity(modem_status_t *st)
 {
@@ -357,48 +408,57 @@ static void read_identity(modem_status_t *st)
     }
 }
 
-static void poll_once(modem_status_t *st)
+// Returns how many poll commands succeeded, so the caller can notice a dead
+// AT channel (0 successes) and force a re-sync.
+static int poll_once(modem_status_t *st)
 {
     char resp[AT_RESP_MAX];
     char line[96];
+    int ok = 0;
 
-    // SIM state
-    st->sim_ready = false;
-    if (at_transact("AT+CPIN?", resp, sizeof(resp), 3000) == ESP_OK &&
-        strstr(resp, "READY")) {
-        st->sim_ready = true;
+    // SIM state (keep the last known value if the query itself fails, e.g.
+    // "+CME ERROR: SIM busy" right after a modem reboot)
+    if (at_transact("AT+CPIN?", resp, sizeof(resp), 3000) == ESP_OK) {
+        ok++;
+        st->sim_ready = strstr(resp, "READY") != NULL;
     }
 
     // Signal: +CSQ: <rssi>,<ber>  (dBm = -113 + 2*rssi, 99 = unknown)
     st->rssi_dbm = 0;
-    if (at_transact("AT+CSQ", resp, sizeof(resp), 3000) == ESP_OK &&
-        extract_line_after(resp, "+CSQ:", line, sizeof(line))) {
-        int rssi = atoi(line);
-        if (rssi >= 0 && rssi <= 31) {
-            st->rssi_dbm = -113 + 2 * rssi;
+    if (at_transact("AT+CSQ", resp, sizeof(resp), 3000) == ESP_OK) {
+        ok++;
+        if (extract_line_after(resp, "+CSQ:", line, sizeof(line))) {
+            int rssi = atoi(line);
+            if (rssi >= 0 && rssi <= 31) {
+                st->rssi_dbm = -113 + 2 * rssi;
+            }
         }
     }
 
     // LTE registration: +CEREG: <n>,<stat>
     st->reg_status = 0;
-    if (at_transact("AT+CEREG?", resp, sizeof(resp), 3000) == ESP_OK &&
-        extract_line_after(resp, "+CEREG:", line, sizeof(line))) {
-        char *comma = strchr(line, ',');
-        if (comma) {
-            st->reg_status = atoi(comma + 1);
+    if (at_transact("AT+CEREG?", resp, sizeof(resp), 3000) == ESP_OK) {
+        ok++;
+        if (extract_line_after(resp, "+CEREG:", line, sizeof(line))) {
+            char *comma = strchr(line, ',');
+            if (comma) {
+                st->reg_status = atoi(comma + 1);
+            }
         }
     }
 
     // Operator: +COPS: 0,0,"T-Mobile",7
     st->operator_name[0] = '\0';
-    if (at_transact("AT+COPS?", resp, sizeof(resp), 5000) == ESP_OK &&
-        extract_line_after(resp, "+COPS:", line, sizeof(line))) {
-        char *q1 = strchr(line, '"');
-        if (q1) {
-            char *q2 = strchr(q1 + 1, '"');
-            if (q2) {
-                *q2 = '\0';
-                strlcpy(st->operator_name, q1 + 1, sizeof(st->operator_name));
+    if (at_transact("AT+COPS?", resp, sizeof(resp), 5000) == ESP_OK) {
+        ok++;
+        if (extract_line_after(resp, "+COPS:", line, sizeof(line))) {
+            char *q1 = strchr(line, '"');
+            if (q1) {
+                char *q2 = strchr(q1 + 1, '"');
+                if (q2) {
+                    *q2 = '\0';
+                    strlcpy(st->operator_name, q1 + 1, sizeof(st->operator_name));
+                }
             }
         }
     }
@@ -406,95 +466,236 @@ static void poll_once(modem_status_t *st)
     // System info: +CPSI: LTE,Online,310-260,0x...,...,EUTRAN-BAND2,...
     st->rat[0] = '\0';
     st->band[0] = '\0';
-    if (at_transact("AT+CPSI?", resp, sizeof(resp), 5000) == ESP_OK &&
-        extract_line_after(resp, "+CPSI:", line, sizeof(line))) {
-        char *tok, *save = NULL;
-        int idx = 0;
-        for (tok = strtok_r(line, ",", &save); tok; tok = strtok_r(NULL, ",", &save), idx++) {
-            if (idx == 0) {
-                strlcpy(st->rat, tok, sizeof(st->rat));
-            } else if (strncmp(tok, "EUTRAN", 6) == 0 || strncmp(tok, "NR", 2) == 0 ||
-                       strstr(tok, "BAND")) {
-                strlcpy(st->band, tok, sizeof(st->band));
-            }
-        }
-    }
-
-    // PDP address: +CGPADDR: 1,10.x.x.x
-    st->pdp_active = false;
-    st->ip_addr[0] = '\0';
-    if (at_transact("AT+CGPADDR=1", resp, sizeof(resp), 5000) == ESP_OK &&
-        extract_line_after(resp, "+CGPADDR:", line, sizeof(line))) {
-        char *comma = strchr(line, ',');
-        if (comma) {
-            char *ip = comma + 1;
-            // strip quotes if present
-            if (*ip == '"') {
-                ip++;
-                char *q = strchr(ip, '"');
-                if (q) {
-                    *q = '\0';
+    if (at_transact("AT+CPSI?", resp, sizeof(resp), 5000) == ESP_OK) {
+        ok++;
+        if (extract_line_after(resp, "+CPSI:", line, sizeof(line))) {
+            char *tok, *save = NULL;
+            int idx = 0;
+            for (tok = strtok_r(line, ",", &save); tok; tok = strtok_r(NULL, ",", &save), idx++) {
+                if (idx == 0) {
+                    strlcpy(st->rat, tok, sizeof(st->rat));
+                } else if (strncmp(tok, "EUTRAN", 6) == 0 || strncmp(tok, "NR", 2) == 0 ||
+                           strstr(tok, "BAND")) {
+                    strlcpy(st->band, tok, sizeof(st->band));
                 }
             }
-            if (strlen(ip) > 0 && strcmp(ip, "0.0.0.0") != 0) {
-                strlcpy(st->ip_addr, ip, sizeof(st->ip_addr));
-                st->pdp_active = true;
-            }
         }
     }
+    return ok;
+}
+
+// The PS domain must be attached before a data call will succeed; dialing
+// too early (right after boot/registration) fails and destabilizes esp_modem.
+static bool ps_attached(void)
+{
+    char resp[AT_RESP_MAX];
+    return at_transact("AT+CGATT?", resp, sizeof(resp), 5000) == ESP_OK &&
+           strstr(resp, "+CGATT: 1");
+}
+
+// ---------------------------------------------------------------------------
+// PPP lifecycle
+
+static void on_ip_event(void *arg, esp_event_base_t base, int32_t event_id, void *data)
+{
+    if (event_id == IP_EVENT_PPP_GOT_IP) {
+        ip_event_got_ip_t *ev = data;
+        xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+        s_ppp_up = true;
+        snprintf(s_ppp_ip, sizeof(s_ppp_ip), IPSTR, IP2STR(&ev->ip_info.ip));
+        xSemaphoreGive(s_status_mutex);
+
+        esp_netif_dns_info_t dns = {0};
+        esp_netif_get_dns_info(ev->esp_netif, ESP_NETIF_DNS_MAIN, &dns);
+        ESP_LOGI(TAG, "PPP up: ip " IPSTR " gw " IPSTR " dns " IPSTR,
+                 IP2STR(&ev->ip_info.ip), IP2STR(&ev->ip_info.gw),
+                 IP2STR(&dns.ip.u_addr.ip4));
+    } else if (event_id == IP_EVENT_PPP_LOST_IP) {
+        xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+        s_ppp_up = false;
+        s_ppp_ip[0] = '\0';
+        xSemaphoreGive(s_status_mutex);
+        ESP_LOGW(TAG, "PPP lost IP");
+    }
+}
+
+static void on_ppp_status(void *arg, esp_event_base_t base, int32_t event_id, void *data)
+{
+    // Events below the phase offset are lwIP PPP errors (peer hangup, LCP
+    // failure, ...); treat any of them as "link down" so the task redials.
+    if (event_id > NETIF_PPP_ERRORNONE && event_id < NETIF_PP_PHASE_OFFSET) {
+        ESP_LOGW(TAG, "PPP error event %d — link down", (int)event_id);
+        xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+        s_ppp_up = false;
+        s_ppp_ip[0] = '\0';
+        xSemaphoreGive(s_status_mutex);
+    }
+}
+
+// After a failed mode transition esp_modem can be left in an undefined
+// state where every command fails instantly; force it back to command mode.
+static void restore_command_mode(void)
+{
+    esp_modem_set_mode(s_dce, ESP_MODEM_MODE_COMMAND);  // may no-op, that's fine
+    esp_modem_sync(s_dce);
+}
+
+// Dial the PPP session: the whole UART switches to PPP data.
+static bool data_connect(void)
+{
+    if (esp_modem_set_mode(s_dce, ESP_MODEM_MODE_DATA) != ESP_OK) {
+        ESP_LOGW(TAG, "entering data mode failed");
+        restore_command_mode();
+        return false;
+    }
+    return true;
+}
+
+// Hang up / leave data mode ("+++" escape) and return to command mode.
+static void data_disconnect(void)
+{
+    if (esp_modem_set_mode(s_dce, ESP_MODEM_MODE_COMMAND) != ESP_OK) {
+        ESP_LOGW(TAG, "hangup failed; forcing recovery on next cycle");
+    }
+    esp_modem_sync(s_dce);
 }
 
 static void modem_task(void *arg)
 {
     modem_status_t st = {0};
     bool identity_read = false;
-    bool pdp_configured = false;
+    bool was_up = false;
+    int64_t last_dial_us = 0;
+    int denied_polls = 0;
+    int dead_polls = 0;
+    int healthy_polls = 0;
 
     while (1) {
+        xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+        bool ppp_up = s_ppp_up;
+        strlcpy(st.ip_addr, s_ppp_ip, sizeof(st.ip_addr));
+        char apn[MODEM_APN_MAX];
+        strlcpy(apn, s_apn, sizeof(apn));
+        bool apn_dirty = s_apn_dirty;
+        xSemaphoreGive(s_status_mutex);
+
+        st.ppp_up = ppp_up;
+        st.pdp_active = ppp_up;  // LED turns blue when the data link is up
+
+        // PPP just dropped (carrier hangup, LCP failure): leave data mode so
+        // the AT channel comes back, then the loop below polls and redials.
+        if (was_up && !ppp_up) {
+            ESP_LOGW(TAG, "PPP link lost; returning to command mode");
+            data_disconnect();
+            healthy_polls = 0;
+        }
+
+        // One-shot connectivity check after each connect: proves DNS + ICMP
+        // actually flow through the link, not just that IPCP negotiated.
+        if (!was_up && ppp_up) {
+            static modem_netdiag_t diag;  // ~1 KB, keep off the task stack
+            modem_ping_host("google.com", &diag);
+            if (diag.ping_ok && diag.received > 0) {
+                ESP_LOGI(TAG, "connectivity check: %s -> %s, %d/%d replies, avg %d ms",
+                         "google.com", diag.ips[0], diag.received, diag.sent, diag.avg_ms);
+            } else {
+                ESP_LOGW(TAG, "connectivity check failed (dns_ok=%d received=%d)",
+                         diag.dns_ok, diag.received);
+            }
+        }
+        was_up = ppp_up;
+
         // Probe the modem until it answers AT
-        if (!st.at_ok) {
-            if (at_transact("AT", NULL, 0, 2000) == ESP_OK) {
+        if (!st.at_ok && at_channel_available()) {
+            if (esp_modem_sync(s_dce) == ESP_OK) {
                 st.at_ok = true;
-                at_transact("ATE0", NULL, 0, 2000);      // echo off simplifies parsing
+                at_transact("ATE0", NULL, 0, 2000);         // echo off simplifies parsing
                 at_transact("AT+COPS=3,0", NULL, 0, 2000);  // long operator names
                 ESP_LOGI(TAG, "modem is responding");
             } else {
                 ESP_LOGW(TAG, "modem not responding to AT yet");
+                // A previous boot may have left the modem in CMUX or PPP mode
+                // (the modem doesn't reset when the ESP32 does). Detect the
+                // leftover state and drop back to plain command mode.
+                if (esp_modem_set_mode(s_dce, ESP_MODEM_MODE_DETECT) == ESP_OK) {
+                    ESP_LOGI(TAG, "detected leftover modem state; recovering to command mode");
+                    esp_modem_set_mode(s_dce, ESP_MODEM_MODE_COMMAND);
+                }
             }
         }
 
-        if (st.at_ok) {
+        if (st.at_ok && at_channel_available()) {
             if (!identity_read) {
                 read_identity(&st);
                 identity_read = (st.imei[0] != '\0');
             }
+            if (poll_once(&st) == 0) {
+                // AT channel went dead (bad mode transition, modem reboot,
+                // leftover PPP...) — force a fresh sync + recovery cycle
+                healthy_polls = 0;
+                if (++dead_polls >= 2) {
+                    ESP_LOGW(TAG, "AT channel dead; forcing re-sync");
+                    st.at_ok = false;
+                    dead_polls = 0;
+                }
+            } else {
+                dead_polls = 0;
+                if (healthy_polls < 100) {  // just avoid overflow
+                    healthy_polls++;
+                }
+            }
 
-            poll_once(&st);
+            // Self-heal a rejected LTE attach: a named APN left in context 1
+            // (by a previous dial) makes some networks deny registration
+            // after a modem reboot. Blank the attach context and re-scan.
+            if (st.reg_status == 3) {
+                if (++denied_polls >= 3) {
+                    denied_polls = 0;
+                    ESP_LOGW(TAG, "registration denied; blanking attach APN and re-scanning");
+                    at_transact("AT+CGDCONT=1,\"IPV4V6\",\"\"", NULL, 0, 5000);
+                    at_transact("AT+COPS=2", NULL, 0, 15000);
+                    at_transact("AT+COPS=0", NULL, 0, 15000);
+                }
+            } else {
+                denied_polls = 0;
+            }
+        }
 
-            // (Re)configure PDP when needed: first time registered, or APN changed
+        if (apn_dirty && st.at_ok) {
             xSemaphoreTake(s_status_mutex, portMAX_DELAY);
-            bool apn_dirty = s_apn_dirty;
             s_apn_dirty = false;
-            char apn[MODEM_APN_MAX];
-            strlcpy(apn, s_apn, sizeof(apn));
             xSemaphoreGive(s_status_mutex);
 
-            bool registered = (st.reg_status == 1 || st.reg_status == 5);
-            if (apn_dirty || (registered && !st.pdp_active && !pdp_configured)) {
-                ESP_LOGI(TAG, "activating PDP context, APN=\"%s\"", apn);
-                pdp_setup(apn);
-                pdp_configured = true;
-                poll_once(&st);  // refresh IP right away
+            ESP_LOGI(TAG, "APN changed to \"%s\" — redialing", apn);
+            if (ppp_up) {
+                data_disconnect();
+                ppp_up = false;
             }
-            if (apn_dirty) {
-                pdp_configured = false;  // allow a retry cycle with the new APN
-            }
+            esp_modem_set_apn(s_dce, apn);   // takes effect on the next dial
+            last_dial_us = 0;                // dial immediately below
+        }
 
+        // Dial once the modem has been stably responsive for 2+ poll cycles:
+        // dialing right after modem boot (URC noise, PS attach pending)
+        // fails and can destabilize the esp_modem state machine.
+        bool registered = (st.reg_status == 1 || st.reg_status == 5);
+        if (st.at_ok && registered && !ppp_up && healthy_polls >= 2 &&
+            esp_timer_get_time() - last_dial_us > (int64_t)CONNECT_RETRY_MS * 1000) {
+            last_dial_us = esp_timer_get_time();
+            if (ps_attached()) {
+                ESP_LOGI(TAG, "dialing PPP, APN=\"%s\"", apn[0] ? apn : "(carrier default)");
+                data_connect();
+            } else {
+                ESP_LOGI(TAG, "registered but PS not attached yet; delaying dial");
+            }
+        }
+
+        if (st.at_ok) {
             st.last_update_us = esp_timer_get_time();
-            ESP_LOGI(TAG, "sim=%d reg=%d rssi=%ddBm op=\"%s\" rat=%s ip=%s",
+            ESP_LOGI(TAG, "sim=%d reg=%d rssi=%ddBm op=\"%s\" rat=%s ppp=%s",
                      st.sim_ready, st.reg_status, st.rssi_dbm,
                      st.operator_name, st.rat,
-                     st.pdp_active ? st.ip_addr : "-");
+                     st.ppp_up ? st.ip_addr : "down");
         }
 
         xSemaphoreTake(s_status_mutex, portMAX_DELAY);
@@ -507,10 +708,38 @@ static void modem_task(void *arg)
 
 void modem_init(void)
 {
-    s_uart_mutex = xSemaphoreCreateMutex();
+    s_at_mutex = xSemaphoreCreateMutex();
     s_status_mutex = xSemaphoreCreateMutex();
     s_diag_mutex = xSemaphoreCreateMutex();
     nvs_load_apn();
-    uart_init();
+
+    esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_PPP();
+    s_ppp_netif = esp_netif_new(&netif_cfg);
+    assert(s_ppp_netif);
+
+    // Error events (peer hangup etc.) are off by default; the redial logic needs them
+    esp_netif_ppp_config_t ppp_cfg;
+    ESP_ERROR_CHECK(esp_netif_ppp_get_params(s_ppp_netif, &ppp_cfg));
+    ppp_cfg.ppp_error_event_enabled = true;
+    ESP_ERROR_CHECK(esp_netif_ppp_set_params(s_ppp_netif, &ppp_cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, on_ip_event, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID, on_ppp_status, NULL));
+
+    esp_modem_dte_config_t dte_cfg = ESP_MODEM_DTE_DEFAULT_CONFIG();
+    dte_cfg.uart_config.port_num = MODEM_UART;
+    dte_cfg.uart_config.tx_io_num = MODEM_TX_PIN;
+    dte_cfg.uart_config.rx_io_num = MODEM_RX_PIN;
+    dte_cfg.uart_config.baud_rate = MODEM_BAUD;
+    dte_cfg.uart_config.rx_buffer_size = 4096;
+    dte_cfg.uart_config.tx_buffer_size = 2048;
+    dte_cfg.dte_buffer_size = 1024;
+    dte_cfg.task_stack_size = 6144;
+
+    // SIM7670G speaks the same AT/PPP dialect as the SIM7600 family
+    esp_modem_dce_config_t dce_cfg = ESP_MODEM_DCE_DEFAULT_CONFIG(s_apn);
+    s_dce = esp_modem_new_dev(ESP_MODEM_DCE_SIM7600, &dte_cfg, &dce_cfg, s_ppp_netif);
+    assert(s_dce);
+
     xTaskCreate(modem_task, "modem", 6144, NULL, 5, NULL);
 }

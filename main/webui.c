@@ -24,9 +24,7 @@ extern const uint8_t index_html_end[]   asm("_binary_index_html_end");
 
 static void wifi_ap_init(void)
 {
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_ap();
+    esp_netif_create_default_wifi_ap();  // esp_netif/event loop init in app_main
 
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
@@ -78,6 +76,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "reg_status", st.reg_status);
     cJSON_AddStringToObject(root, "reg_text", reg_status_str(st.reg_status));
     cJSON_AddBoolToObject(root, "pdp_active", st.pdp_active);
+    cJSON_AddBoolToObject(root, "ppp_up", st.ppp_up);
     cJSON_AddNumberToObject(root, "rssi_dbm", st.rssi_dbm);
     cJSON_AddStringToObject(root, "model", st.model);
     cJSON_AddStringToObject(root, "fw_rev", st.fw_rev);

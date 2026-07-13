@@ -11,7 +11,8 @@ typedef struct {
     bool at_ok;             // modem responds to AT
     bool sim_ready;         // +CPIN: READY
     int reg_status;         // +CEREG stat: 1=home, 5=roaming, 2=searching, 0/3/4=not registered
-    bool pdp_active;        // has an IP address
+    bool ppp_up;            // PPP session established, ESP32 has cellular IP connectivity
+    bool pdp_active;        // same as ppp_up (kept for the LED / web UI)
     int rssi_dbm;           // 0 = unknown
     char model[32];
     char fw_rev[48];
@@ -25,7 +26,9 @@ typedef struct {
     int64_t last_update_us; // esp_timer time of last successful poll
 } modem_status_t;
 
-// Start the modem UART and background poll task.
+// Create the PPP netif + esp_modem DCE and start the background task that
+// polls status and keeps the PPP data connection dialed while registered.
+// Requires esp_netif_init() and the default event loop to exist already.
 void modem_init(void);
 
 // Thread-safe snapshot of the latest modem status.
@@ -39,19 +42,19 @@ esp_err_t modem_send_at(const char *cmd, char *resp, size_t resp_len, uint32_t t
 
 typedef struct {
     bool dns_ok;
-    int dns_err;                        // +CDNSGIP error code when dns_ok == false
+    int dns_err;                        // getaddrinfo error code when dns_ok == false
     int num_ips;
     char ips[MODEM_PING_MAX_IPS][40];
-    bool ping_ok;                       // got a ping summary
+    bool ping_ok;                       // ping session completed (stats valid)
     int sent, received, lost;
     int min_ms, max_ms, avg_ms;
-    char raw[1024];                     // raw modem output, for display
+    char raw[1024];                     // ping-style transcript, for display
 } modem_netdiag_t;
 
-// DNS-resolve `host` and ping it 4 times over the cellular connection.
-// Blocks for up to ~1 min worst case (unreachable host). Returns
-// ESP_ERR_INVALID_ARG for a malformed hostname; DNS/ping failures are
-// reported in `out`, not the return value.
+// DNS-resolve `host` and ping it 4 times using the ESP32's own lwIP stack,
+// i.e. through the PPP link. Blocks for up to ~20 s worst case (unreachable
+// host). Returns ESP_ERR_INVALID_ARG for a malformed hostname; DNS/ping
+// failures are reported in `out`, not the return value.
 esp_err_t modem_ping_host(const char *host, modem_netdiag_t *out);
 
 // Persist a new APN to NVS and re-run PDP context setup.

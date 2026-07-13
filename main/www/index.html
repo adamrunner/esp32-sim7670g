@@ -48,7 +48,7 @@
       <dt>Modem</dt><dd id="modem_ok">…</dd>
       <dt>SIM</dt><dd id="sim_ready">…</dd>
       <dt>Registration</dt><dd id="reg_text">…</dd>
-      <dt>Data (PDP)</dt><dd id="pdp_active">…</dd>
+      <dt>Data (PPP)</dt><dd id="pdp_active">…</dd>
       <dt>Signal</dt><dd id="rssi">…</dd>
       <dt>Operator</dt><dd id="operator">…</dd>
       <dt>Network</dt><dd id="rat">…</dd>
@@ -68,7 +68,7 @@
   <div class="card">
     <h2>APN</h2>
     <form id="apnform">
-      <input id="apn" placeholder="apn" autocomplete="off">
+      <input id="apn" placeholder="blank = carrier default" autocomplete="off">
       <button type="submit">Save &amp; reconnect</button>
     </form>
     <div class="msg" id="apnmsg"></div>
@@ -159,7 +159,7 @@ $('pingform').addEventListener('submit', async ev => {
   if (!host || pinging) return;
   pinging = true;
   $('pingbtn').disabled = true;
-  $('pingdns').textContent = 'running — a few seconds (up to ~1 min if unreachable)…';
+  $('pingdns').textContent = 'running — a few seconds (up to ~20 s if unreachable)…';
   $('pingsum').textContent = '';
   $('pinglog').value = '';
   try {
@@ -174,13 +174,13 @@ $('pingform').addEventListener('submit', async ev => {
       const j = await r.json();
       $('pinglog').value = (j.raw || '').replace(/\r/g, '').replace(/\n{2,}/g, '\n').trim();
       if (!j.dns_ok) {
-        $('pingdns').textContent = 'DNS lookup failed (modem error code ' + j.dns_err + ')';
+        $('pingdns').textContent = 'DNS lookup failed (error ' + j.dns_err + ')';
       } else {
         $('pingdns').textContent = 'DNS: ' + host + ' → ' + j.ips.join(', ');
         $('pingsum').textContent = j.ping_ok
           ? j.sent + ' sent, ' + j.received + ' received, ' + j.lost + ' lost — ' +
             'rtt min/avg/max = ' + j.min_ms + '/' + j.avg_ms + '/' + j.max_ms + ' ms'
-          : 'ping failed (no reply summary from modem)';
+          : 'ping failed (no replies)';
       }
     }
   } catch (e) {
