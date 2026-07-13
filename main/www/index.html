@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SIM7670G Status</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 1rem;
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: #12161c; color: #dde3ea;
+  }
+  h1 { font-size: 1.2rem; margin: 0 0 1rem; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; max-width: 960px; }
+  .card { background: #1b222c; border: 1px solid #2a3441; border-radius: 10px; padding: 1rem; }
+  .card h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.06em; color: #8b98a8; margin: 0 0 0.75rem; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 0.35rem 1rem; margin: 0; font-size: 0.95rem; }
+  dt { color: #8b98a8; }
+  dd { margin: 0; font-variant-numeric: tabular-nums; word-break: break-all; }
+  .pill { display: inline-block; padding: 0.1rem 0.6rem; border-radius: 999px; font-size: 0.85rem; }
+  .ok   { background: #143d2b; color: #4ade80; }
+  .warn { background: #3d3414; color: #fbbf24; }
+  .bad  { background: #3d1a1a; color: #f87171; }
+  input, button, textarea {
+    font: inherit; border-radius: 6px; border: 1px solid #2a3441;
+    background: #12161c; color: #dde3ea; padding: 0.45rem 0.6rem;
+  }
+  button { background: #1f4fd8; border: none; cursor: pointer; }
+  button:hover { background: #2b5ceb; }
+  form { display: flex; gap: 0.5rem; }
+  form input { flex: 1; min-width: 0; }
+  #atlog, #pinglog {
+    width: 100%; height: 10rem; margin-top: 0.5rem; resize: vertical;
+    font-family: ui-monospace, Menlo, monospace; font-size: 0.8rem; white-space: pre;
+  }
+  #pinglog { height: 8rem; }
+  .msg { font-size: 0.85rem; color: #8b98a8; margin-top: 0.5rem; min-height: 1.2em; }
+</style>
+</head>
+<body>
+<h1>ESP32-S3 &middot; SIM7670G Cellular Status</h1>
+<div class="cards">
+  <div class="card">
+    <h2>Connection</h2>
+    <dl>
+      <dt>Modem</dt><dd id="modem_ok">…</dd>
+      <dt>SIM</dt><dd id="sim_ready">…</dd>
+      <dt>Registration</dt><dd id="reg_text">…</dd>
+      <dt>Data (PDP)</dt><dd id="pdp_active">…</dd>
+      <dt>Signal</dt><dd id="rssi">…</dd>
+      <dt>Operator</dt><dd id="operator">…</dd>
+      <dt>Network</dt><dd id="rat">…</dd>
+      <dt>Band</dt><dd id="band">…</dd>
+      <dt>IP address</dt><dd id="ip">…</dd>
+    </dl>
+  </div>
+  <div class="card">
+    <h2>Modem / SIM</h2>
+    <dl>
+      <dt>Model</dt><dd id="model">…</dd>
+      <dt>Firmware</dt><dd id="fw_rev">…</dd>
+      <dt>IMEI</dt><dd id="imei">…</dd>
+      <dt>ICCID</dt><dd id="iccid">…</dd>
+    </dl>
+  </div>
+  <div class="card">
+    <h2>APN</h2>
+    <form id="apnform">
+      <input id="apn" placeholder="apn" autocomplete="off">
+      <button type="submit">Save &amp; reconnect</button>
+    </form>
+    <div class="msg" id="apnmsg"></div>
+  </div>
+  <div class="card">
+    <h2>Ping</h2>
+    <form id="pingform">
+      <input id="pinghost" placeholder="google.com" autocomplete="off" spellcheck="false">
+      <button type="submit" id="pingbtn">Ping</button>
+    </form>
+    <div class="msg" id="pingdns"></div>
+    <div class="msg" id="pingsum"></div>
+    <textarea id="pinglog" readonly></textarea>
+  </div>
+  <div class="card">
+    <h2>AT console</h2>
+    <form id="atform">
+      <input id="atcmd" placeholder="AT+CSQ" autocomplete="off" spellcheck="false">
+      <button type="submit">Send</button>
+    </form>
+    <textarea id="atlog" readonly></textarea>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let apnEdited = false;
+
+function pill(el, text, cls) {
+  el.innerHTML = '<span class="pill ' + cls + '">' + text + '</span>';
+}
+
+async function refresh() {
+  if (pinging) return;  // server handles one request at a time; don't queue behind a ping
+  try {
+    const r = await fetch('/api/status');
+    const s = await r.json();
+    pill($('modem_ok'), s.modem_ok ? 'responding' : 'no response', s.modem_ok ? 'ok' : 'bad');
+    pill($('sim_ready'), s.sim_ready ? 'ready' : 'not ready', s.sim_ready ? 'ok' : 'bad');
+    const regOk = s.reg_status === 1 || s.reg_status === 5;
+    pill($('reg_text'), s.reg_text, regOk ? 'ok' : (s.reg_status === 2 ? 'warn' : 'bad'));
+    pill($('pdp_active'), s.pdp_active ? 'connected' : 'down', s.pdp_active ? 'ok' : 'warn');
+    $('rssi').textContent = s.rssi_dbm ? s.rssi_dbm + ' dBm' : 'unknown';
+    for (const k of ['operator','rat','band','ip','model','fw_rev','imei','iccid'])
+      $(k).textContent = s[k] || '—';
+    if (!apnEdited && document.activeElement !== $('apn')) $('apn').value = s.apn || '';
+  } catch (e) { /* board busy; try again next tick */ }
+}
+
+$('apn').addEventListener('input', () => { apnEdited = true; });
+
+$('apnform').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  $('apnmsg').textContent = 'saving…';
+  try {
+    const r = await fetch('/api/apn', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({apn: $('apn').value.trim()})
+    });
+    $('apnmsg').textContent = r.ok ? 'saved — reconnecting with new APN' : 'error: ' + r.status;
+    apnEdited = false;
+  } catch (e) { $('apnmsg').textContent = 'request failed'; }
+});
+
+$('atform').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const cmd = $('atcmd').value.trim();
+  if (!cmd) return;
+  $('atlog').value += '> ' + cmd + '\n';
+  try {
+    const r = await fetch('/api/at', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({cmd})
+    });
+    const j = await r.json();
+    $('atlog').value += (j.response || '') + (j.timeout ? '[timeout]\n' : '');
+  } catch (e) { $('atlog').value += '[request failed]\n'; }
+  $('atlog').scrollTop = $('atlog').scrollHeight;
+  $('atcmd').value = '';
+});
+
+let pinging = false;
+$('pingform').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const host = $('pinghost').value.trim();
+  if (!host || pinging) return;
+  pinging = true;
+  $('pingbtn').disabled = true;
+  $('pingdns').textContent = 'running — a few seconds (up to ~1 min if unreachable)…';
+  $('pingsum').textContent = '';
+  $('pinglog').value = '';
+  try {
+    const r = await fetch('/api/ping', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({host})
+    });
+    if (!r.ok) {
+      $('pingdns').textContent = 'error: ' + (await r.text());
+    } else {
+      const j = await r.json();
+      $('pinglog').value = (j.raw || '').replace(/\r/g, '').replace(/\n{2,}/g, '\n').trim();
+      if (!j.dns_ok) {
+        $('pingdns').textContent = 'DNS lookup failed (modem error code ' + j.dns_err + ')';
+      } else {
+        $('pingdns').textContent = 'DNS: ' + host + ' → ' + j.ips.join(', ');
+        $('pingsum').textContent = j.ping_ok
+          ? j.sent + ' sent, ' + j.received + ' received, ' + j.lost + ' lost — ' +
+            'rtt min/avg/max = ' + j.min_ms + '/' + j.avg_ms + '/' + j.max_ms + ' ms'
+          : 'ping failed (no reply summary from modem)';
+      }
+    }
+  } catch (e) {
+    $('pingdns').textContent = 'request failed';
+  } finally {
+    pinging = false;
+    $('pingbtn').disabled = false;
+  }
+});
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

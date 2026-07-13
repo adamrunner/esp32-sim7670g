@@ -1,0 +1,11 @@
+CONFIG_IDF_TARGET="esp32s3"
+
+# Waveshare ESP32-S3-SIM7670G-4G: 16MB quad flash
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+# Console: UART0 primary, USB-Serial-JTAG secondary (IDF default) — logs
+# still show on the board's USB-C via the secondary console.
+
+# Roomier HTTP headers for browser requests
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
