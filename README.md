@@ -120,7 +120,9 @@ filename (Cloudflare edge-caches `.bin` files forever; `manifest.json`
 is never cached). Publish after every deploy: a device left running a
 newer local build than the manifest advertises will "update" backwards
 on its next check. Test builds can track a staging manifest via
-`idf.py -DOTA_MANIFEST_URL=... build`.
+`idf.py -DOTA_MANIFEST_URL=... build` — but that override sticks in the
+CMake cache until `idf.py fullclean`, so the script also verifies the
+URL actually embedded in the binary before publishing.
 
 ## API
 

@@ -93,6 +93,15 @@ if [[ "$VERSION" == *-dirty && $ALLOW_DIRTY -eq 0 ]]; then
     die "refusing to publish dirty version '$VERSION' (commit first, or pass --allow-dirty)"
 fi
 
+# The manifest URL the image polls is baked in at compile time, and an
+# `idf.py -DOTA_MANIFEST_URL=...` test override STICKS in the CMake cache
+# across later plain builds (clear with `idf.py fullclean`). A published
+# image polling a staging manifest never sees another release, so check the
+# string actually embedded in the binary. No flag bypasses this.
+BAKED_URL="$(grep -a -o 'https://[a-zA-Z0-9./_-]*manifest\.json' "$BIN" | sort -u)"
+[[ "$BAKED_URL" == "$BASE_URL/manifest.json" ]] || \
+    die "binary polls '$BAKED_URL', not $BASE_URL/manifest.json (stale OTA_MANIFEST_URL in the CMake cache? run: idf.py fullclean)"
+
 if command -v sha256sum >/dev/null 2>&1; then
     SHA256="$(sha256sum "$BIN" | cut -d' ' -f1)"
 else
