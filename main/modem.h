@@ -26,10 +26,29 @@ typedef struct {
     int64_t last_update_us; // esp_timer time of last successful poll
 } modem_status_t;
 
+typedef struct {
+    bool powered;           // GNSS engine is on (AT+CGNSSPWR=1 accepted)
+    bool has_fix;           // most recent CGNSSINFO poll had a position
+    double lat, lon;        // decimal degrees, last known fix (valid if fix_time_us != 0)
+    float alt_m;
+    float speed_kmh;
+    float course_deg;
+    int sats;               // satellites in view, summed across constellations
+    int sats_used;          // satellites used in the fix (<NoSV>), 0 if not reported
+    float hdop;
+    char utc[24];           // fix timestamp, "2026-07-13 04:37:54" (UTC)
+    int64_t fix_time_us;    // esp_timer time of last fix, 0 = never
+    int64_t poll_time_us;   // esp_timer time of last successful CGNSSINFO poll
+} modem_gnss_t;
+
 // Create the PPP netif + esp_modem DCE and start the background task that
 // polls status and keeps the PPP data connection dialed while registered.
 // Requires esp_netif_init() and the default event loop to exist already.
 void modem_init(void);
+
+// Thread-safe snapshot of the latest GNSS state. Position fields keep the
+// last known fix when the current poll has none (check has_fix/fix_time_us).
+void modem_get_gnss(modem_gnss_t *out);
 
 // Thread-safe snapshot of the latest modem status.
 void modem_get_status(modem_status_t *out);

@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "esp_http_server.h"
+#include "esp_timer.h"
 #include "cJSON.h"
 
 #include "modem.h"
@@ -53,6 +54,25 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     cJSON_AddStringToObject(root, "band", st.band);
     cJSON_AddStringToObject(root, "ip", st.ip_addr);
     cJSON_AddStringToObject(root, "apn", st.apn);
+
+    modem_gnss_t g;
+    modem_get_gnss(&g);
+    cJSON *gnss = cJSON_AddObjectToObject(root, "gnss");
+    cJSON_AddBoolToObject(gnss, "powered", g.powered);
+    cJSON_AddBoolToObject(gnss, "fix", g.has_fix);
+    cJSON_AddNumberToObject(gnss, "sats", g.sats);
+    cJSON_AddNumberToObject(gnss, "sats_used", g.sats_used);
+    cJSON_AddNumberToObject(gnss, "hdop", g.hdop);
+    if (g.fix_time_us) {    // last known position, even if the current poll lost the fix
+        cJSON_AddNumberToObject(gnss, "lat", g.lat);
+        cJSON_AddNumberToObject(gnss, "lon", g.lon);
+        cJSON_AddNumberToObject(gnss, "alt_m", g.alt_m);
+        cJSON_AddNumberToObject(gnss, "speed_kmh", g.speed_kmh);
+        cJSON_AddNumberToObject(gnss, "course_deg", g.course_deg);
+        cJSON_AddStringToObject(gnss, "utc", g.utc);
+        int64_t fix_age_s = (esp_timer_get_time() - g.fix_time_us) / 1000000;
+        cJSON_AddNumberToObject(gnss, "fix_age_s", (double)fix_age_s);
+    }
 
     char *json = cJSON_PrintUnformatted(root);
     httpd_resp_set_type(req, "application/json");

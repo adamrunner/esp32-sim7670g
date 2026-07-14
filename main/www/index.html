@@ -39,6 +39,7 @@
   }
   #pinglog { height: 8rem; }
   .msg { font-size: 0.85rem; color: #8b98a8; margin-top: 0.5rem; min-height: 1.2em; }
+  a { color: #6ea8fe; }
 </style>
 </head>
 <body>
@@ -56,6 +57,19 @@
       <dt>Network</dt><dd id="rat">…</dd>
       <dt>Band</dt><dd id="band">…</dd>
       <dt>IP address</dt><dd id="ip">…</dd>
+    </dl>
+  </div>
+  <div class="card">
+    <h2>GPS</h2>
+    <dl>
+      <dt>Status</dt><dd id="gps_state">…</dd>
+      <dt>Position</dt><dd id="gps_pos">…</dd>
+      <dt>Altitude</dt><dd id="gps_alt">…</dd>
+      <dt>Speed</dt><dd id="gps_speed">…</dd>
+      <dt>Heading</dt><dd id="gps_course">…</dd>
+      <dt>Satellites</dt><dd id="gps_sats">…</dd>
+      <dt>HDOP</dt><dd id="gps_hdop">…</dd>
+      <dt>Fix time (UTC)</dt><dd id="gps_utc">…</dd>
     </dl>
   </div>
   <div class="card">
@@ -135,6 +149,29 @@ async function refresh() {
     for (const k of ['operator','rat','band','ip','model','fw_rev','imei','iccid'])
       $(k).textContent = s[k] || '—';
     if (!apnEdited && document.activeElement !== $('apn')) $('apn').value = s.apn || '';
+
+    const g = s.gnss || {};
+    if (!g.powered) pill($('gps_state'), 'off', 'bad');
+    else if (g.fix) pill($('gps_state'), 'fix', 'ok');
+    else pill($('gps_state'), g.lat !== undefined ? 'no fix (last known shown)' : 'searching', 'warn');
+    if (g.lat !== undefined) {
+      const lat = g.lat.toFixed(6), lon = g.lon.toFixed(6);
+      $('gps_pos').innerHTML = lat + ', ' + lon +
+        ' &middot; <a target="_blank" rel="noopener" href="https://www.openstreetmap.org/?mlat=' +
+        lat + '&mlon=' + lon + '#map=16/' + lat + '/' + lon + '">map</a>';
+      $('gps_alt').textContent = g.alt_m.toFixed(1) + ' m';
+      $('gps_speed').textContent = g.speed_kmh.toFixed(1) + ' km/h (' + (g.speed_kmh * 0.621371).toFixed(1) + ' mph)';
+      $('gps_course').textContent = g.course_deg.toFixed(0) + '°';
+      $('gps_utc').textContent = (g.utc || '—') +
+        (g.fix_age_s > 90 ? ' (' + Math.round(g.fix_age_s / 60) + ' min ago)' : '');
+    } else {
+      for (const k of ['gps_pos','gps_alt','gps_speed','gps_course','gps_utc'])
+        $(k).textContent = '—';
+    }
+    $('gps_sats').textContent = g.sats_used
+      ? g.sats_used + ' / ' + g.sats + ' in view'
+      : (g.sats ?? '—');
+    $('gps_hdop').textContent = g.hdop ? g.hdop.toFixed(1) : '—';
   } catch (e) { /* board busy; try again next tick */ }
 }
 

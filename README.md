@@ -15,8 +15,17 @@ web UI for monitoring/configuring the cellular connection.
   check after each connect.
 - **Status polling** — SIM state, registration, signal, operator, band
   every 5 s over AT. The UART carries either AT or PPP (see *CMUX* note
-  below), so while the data link is up, polling pauses and the web UI
-  shows the last values from before the dial plus live PPP state.
+  below); while the data link is up the firmware briefly pauses the PPP
+  stream every 30 s (`esp_modem_pause_net`: pause lwIP → `+++` → AT →
+  `ATO`) to refresh status and GPS, so the web UI stays live during a
+  connection at the cost of a ~2 s data stall per poll.
+- **GPS** (`main/modem.c` GNSS section) — the SIM7670G's GNSS receiver is
+  powered on at boot (`AT+CGNSSPWR=1`) and polled with `AT+CGNSSINFO`
+  (never the NMEA stream — see *GPS* note below). Position, speed,
+  course, satellites, HDOP and fix time show in the web UI with an
+  OpenStreetMap link, and are served as a `gnss` object in `/api/status`.
+  The GPS antenna must be connected and needs sky view; first fix after
+  cold start takes a couple of minutes outdoors.
 - **Status LED** (`main/led.c`) — onboard WS2812 on GPIO38, blinks as a
   heartbeat; color = modem state:
   - red: modem not responding
@@ -53,6 +62,19 @@ a CMUX experiment was active): connect to one of the modem's own USB
 serial ports (`/dev/cu.usbmodem00000000000xx`, the first one talks AT)
 and send `AT+CRESET`.
 
+### GPS: poll, never stream
+
+The GNSS engine runs inside the SIM7670G independently of the cellular
+stack, but its output shares the one UART. `AT+CGNSSTST=1` (the mode the
+vendor demo uses) streams NMEA sentences onto that UART, which would
+interleave with PPP frames and corrupt the data link — the firmware
+explicitly keeps it off and polls `AT+CGNSSINFO` instead. While PPP is
+up, GNSS polls ride the same paused-AT windows as status polling
+(every 30 s); with PPP down they run every 5 s poll cycle.
+`+CGNSSINFO` field layouts differ between SIMCom firmwares (some insert
+a Galileo SV count), so the parser anchors on the N/S hemisphere field
+rather than absolute positions.
+
 ## Build & flash
 
 ESP-IDF v5.5 (at `~/esp/v5.5/esp-idf`). Fish config pins
@@ -74,11 +96,15 @@ interfaces.
 
 ## API
 
-- `GET /api/status` — JSON snapshot of modem status
+- `GET /api/status` — JSON snapshot of modem status, including a `gnss`
+  object (`powered`, `fix`, `sats` (in view), `sats_used` (in the fix),
+  `hdop`, and — once there has been a
+  fix — `lat`, `lon`, `alt_m`, `speed_kmh`, `course_deg`, `utc`,
+  `fix_age_s`; position persists as last-known when the fix drops)
 - `POST /api/apn` — `{"apn":"..."}` save APN to NVS and reconnect
 - `POST /api/at` — `{"cmd":"AT+CSQ"}` raw AT passthrough; while the PPP
-  link is up the UART carries data, so this returns
-  `"unavailable: UART is carrying PPP data"`
+  link is up this pauses the data stream for the duration of the command
+  (~2 s extra latency)
 - `POST /api/ping` — `{"host":"google.com"}` DNS lookup + 4-packet ICMP
   ping using the ESP32's own lwIP stack, i.e. it exercises the PPP link
   itself; returns resolved IPs, RTT stats, and a ping-style transcript.
