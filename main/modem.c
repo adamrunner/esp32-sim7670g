@@ -74,6 +74,24 @@ static char s_ppp_ip[40];
 // wrap that dance; callers own the AT channel exclusively in between.
 static bool s_net_paused;   // guarded by s_at_mutex
 
+// While set, the modem task skips its periodic status/GNSS polls whenever
+// they would pause a live PPP session (OTA holds this during a download so
+// the transfer isn't stalled by "+++"/ATO windows). Polls with PPP down are
+// unaffected — the redial state machine keeps running, so a link that drops
+// mid-download still gets redialed. Single writer (the OTA task).
+static volatile bool s_polls_suspended;
+
+void modem_suspend_polls(bool suspend)
+{
+    s_polls_suspended = suspend;
+    ESP_LOGI(TAG, "status/GNSS polls %s", suspend ? "suspended" : "resumed");
+}
+
+esp_netif_t *modem_get_netif(void)
+{
+    return s_ppp_netif;
+}
+
 static bool ppp_is_up(void)
 {
     xSemaphoreTake(s_status_mutex, portMAX_DELAY);
@@ -898,6 +916,11 @@ static void modem_task(void *arg)
         bool poll_due = !ppp_up ||
                         (now - ppp_up_since_us > (int64_t)PPP_POLL_GRACE_MS * 1000 &&
                          now - last_poll_us > (int64_t)PPP_POLL_INTERVAL_MS * 1000);
+        if (s_polls_suspended && ppp_up) {
+            // OTA download in flight: don't pause the data stream (and don't
+            // let the pause-fail wedge guard below count skipped windows).
+            poll_due = false;
+        }
         if (st.at_ok && poll_due && at_channel_acquire()) {
             pause_fails = 0;
             last_poll_us = now;

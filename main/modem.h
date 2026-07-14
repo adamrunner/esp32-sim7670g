@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "esp_netif.h"
 
 #define MODEM_APN_MAX 64
 
@@ -76,6 +77,16 @@ typedef struct {
 // host). Returns ESP_ERR_INVALID_ARG for a malformed hostname; DNS/ping
 // failures are reported in `out`, not the return value.
 esp_err_t modem_ping_host(const char *host, modem_netdiag_t *out);
+
+// Suspend/resume the modem task's periodic status/GNSS polls. While
+// suspended, polls that would pause a live PPP session ("+++"/ATO windows)
+// are skipped so a long transfer over cellular isn't stalled; everything
+// else (redial, polls while PPP is down) keeps running. The caller must
+// guarantee resume on every exit path.
+void modem_suspend_polls(bool suspend);
+
+// The PPP network interface (for binding sockets to cellular explicitly).
+esp_netif_t *modem_get_netif(void);
 
 // Persist a new APN to NVS and re-run PDP context setup.
 esp_err_t modem_set_apn(const char *apn);

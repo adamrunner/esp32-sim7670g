@@ -83,6 +83,20 @@
     </dl>
   </div>
   <div class="card">
+    <h2>Firmware</h2>
+    <dl>
+      <dt>Version</dt><dd id="fw_version">…</dd>
+      <dt>Slot</dt><dd id="fw_slot">…</dd>
+      <dt>Status</dt><dd id="fw_state">…</dd>
+      <dt>Available</dt><dd id="fw_available">…</dd>
+      <dt>Last check</dt><dd id="fw_lastcheck">…</dd>
+    </dl>
+    <form id="otaform" style="margin-top: 0.75rem;">
+      <button type="submit" id="otabtn" style="flex: 1;">Check for update</button>
+    </form>
+    <div class="msg" id="otamsg"></div>
+  </div>
+  <div class="card">
     <h2>Home WiFi</h2>
     <dl>
       <dt>Mode</dt><dd id="wifi_state">…</dd>
@@ -200,6 +214,53 @@ async function refreshWifi() {
   } catch (e) { /* board busy; retry next tick */ }
 }
 
+const OTA_STATE = {
+  idle:        ['idle', 'ok'],
+  checking:    ['checking…', 'warn'],
+  downloading: ['downloading', 'warn'],
+  verifying:   ['verifying sha256…', 'warn'],
+  wait_reboot: ['installed — rebooting…', 'warn'],
+  error:       ['error', 'bad'],
+};
+
+async function refreshOta() {
+  if (pinging) return;
+  try {
+    const s = await (await fetch('/api/ota')).json();
+    $('fw_version').textContent = (s.version || '—') + (s.pending_verify ? ' (pending verify)' : '');
+    $('fw_slot').textContent = s.slot || '—';
+    let [txt, cls] = OTA_STATE[s.state] || [s.state, 'warn'];
+    if (s.state === 'downloading')
+      txt += ' ' + s.progress_pct + '% (' + Math.round(s.bytes_read / 1024) + '/' +
+             Math.round(s.image_size / 1024) + ' KB)';
+    pill($('fw_state'), txt, cls);
+    if (s.state === 'error') $('otamsg').textContent = s.error || 'update failed';
+    else if (!otaMsgLocal) $('otamsg').textContent = '';
+    $('fw_available').textContent = s.update_available ? s.available_version : 'none (up to date)';
+    $('fw_lastcheck').textContent = s.last_check_age_s === undefined ? 'never'
+      : s.last_check_age_s < 90 ? Math.round(s.last_check_age_s) + ' s ago'
+      : Math.round(s.last_check_age_s / 60) + ' min ago';
+    $('otabtn').disabled = ['checking', 'downloading', 'verifying', 'wait_reboot'].includes(s.state);
+  } catch (e) { /* board busy or rebooting mid-update; retry next tick */ }
+}
+
+let otaMsgLocal = false;
+$('otaform').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  otaMsgLocal = true;
+  $('otamsg').textContent = 'checking…';
+  try {
+    const r = await fetch('/api/ota/check', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: '{}'
+    });
+    $('otamsg').textContent = r.ok ? 'check started' : 'error: ' + (await r.text());
+  } catch (e) { $('otamsg').textContent = 'request failed'; }
+  setTimeout(() => { otaMsgLocal = false; }, 4000);
+  refreshOta();
+});
+
 $('wifiform').addEventListener('submit', async ev => {
   ev.preventDefault();
   $('wifimsg').textContent = 'saving…';
@@ -310,8 +371,10 @@ $('pingform').addEventListener('submit', async ev => {
 
 refresh();
 refreshWifi();
+refreshOta();
 setInterval(refresh, 3000);
 setInterval(refreshWifi, 3000);
+setInterval(refreshOta, 2000);
 </script>
 </body>
 </html>

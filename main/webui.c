@@ -3,10 +3,12 @@
 #include <string.h>
 
 #include "esp_http_server.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "cJSON.h"
 
 #include "modem.h"
+#include "ota.h"
 #include "wifi.h"
 
 extern const uint8_t index_html_start[] asm("_binary_index_html_start");
@@ -201,6 +203,87 @@ static esp_err_t ping_post_handler(httpd_req_t *req)
     return send_err;
 }
 
+static const char *ota_state_str(ota_state_t s)
+{
+    switch (s) {
+    case OTA_STATE_CHECKING:    return "checking";
+    case OTA_STATE_DOWNLOADING: return "downloading";
+    case OTA_STATE_VERIFYING:   return "verifying";
+    case OTA_STATE_WAIT_REBOOT: return "wait_reboot";
+    case OTA_STATE_ERROR:       return "error";
+    default:                    return "idle";
+    }
+}
+
+static esp_err_t ota_get_handler(httpd_req_t *req)
+{
+    ota_status_t st;
+    ota_get_status(&st);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "version", st.running_version);
+    cJSON_AddStringToObject(root, "slot", st.running_slot);
+    cJSON_AddStringToObject(root, "state", ota_state_str(st.state));
+    cJSON_AddBoolToObject(root, "pending_verify", st.pending_verify);
+    cJSON_AddBoolToObject(root, "update_available", st.update_available);
+    cJSON_AddStringToObject(root, "available_version", st.available_version);
+    cJSON_AddNumberToObject(root, "progress_pct", st.progress_pct);
+    cJSON_AddNumberToObject(root, "bytes_read", st.bytes_read);
+    cJSON_AddNumberToObject(root, "image_size", st.image_size);
+    cJSON_AddStringToObject(root, "error", st.error);
+    cJSON_AddBoolToObject(root, "last_check_ok", st.last_check_ok);
+    if (st.last_check_us) {
+        cJSON_AddNumberToObject(root, "last_check_age_s",
+                                (double)((esp_timer_get_time() - st.last_check_us) / 1000000));
+    }
+    cJSON_AddNumberToObject(root, "free_heap", (double)esp_get_free_heap_size());
+
+    char *json = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t err = httpd_resp_sendstr(req, json);
+    cJSON_free(json);
+    cJSON_Delete(root);
+    return err;
+}
+
+static esp_err_t ota_check_post_handler(httpd_req_t *req)
+{
+    char body[384];
+    if (read_body(req, body, sizeof(body)) != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    // Body optional: {} or {"url":"https://...","transport":"cell"}.
+    // url points the check at an alternate manifest; transport "cell" binds
+    // the transfer to the PPP interface (both mainly for testing).
+    ota_check_opts_t opts = {0};
+    cJSON *root = body[0] ? cJSON_Parse(body) : NULL;
+    if (root) {
+        const cJSON *url = cJSON_GetObjectItem(root, "url");
+        const cJSON *transport = cJSON_GetObjectItem(root, "transport");
+        if (cJSON_IsString(url) && url->valuestring[0]) {
+            if (strncmp(url->valuestring, "https://", 8) != 0 ||
+                strlen(url->valuestring) >= OTA_URL_MAX) {
+                cJSON_Delete(root);
+                return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                           "url must be https:// and short");
+            }
+            strlcpy(opts.url, url->valuestring, sizeof(opts.url));
+        }
+        if (cJSON_IsString(transport) && strcmp(transport->valuestring, "cell") == 0) {
+            opts.force_cellular = true;
+        }
+        cJSON_Delete(root);
+    }
+
+    if (ota_check_now(&opts) != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "a check or update is already running");
+    }
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
 static const char *wifi_state_str(wifi_ui_state_t s)
 {
     switch (s) {
@@ -268,6 +351,7 @@ void webui_init(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.lru_purge_enable = true;
+    cfg.max_uri_handlers = 16;  // default 8; we register 9 routes
     cfg.stack_size = 8192;  // ping/DNS handler keeps sizeable buffers on the stack
 
     httpd_handle_t server = NULL;
@@ -281,6 +365,8 @@ void webui_init(void)
         { .uri = "/api/apn",    .method = HTTP_POST, .handler = apn_post_handler },
         { .uri = "/api/at",     .method = HTTP_POST, .handler = at_post_handler },
         { .uri = "/api/ping",   .method = HTTP_POST, .handler = ping_post_handler },
+        { .uri = "/api/ota",       .method = HTTP_GET,  .handler = ota_get_handler },
+        { .uri = "/api/ota/check", .method = HTTP_POST, .handler = ota_check_post_handler },
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
         ESP_ERROR_CHECK(httpd_register_uri_handler(server, &routes[i]));

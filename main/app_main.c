@@ -5,6 +5,7 @@
 
 #include "led.h"
 #include "modem.h"
+#include "ota.h"
 #include "webui.h"
 #include "wifi.h"
 
@@ -28,6 +29,7 @@ void app_main(void)
     led_init();
     wifi_init();   // joins the stored home network, or falls back to SoftAP
     webui_init();
+    ota_init();    // confirms/rolls back a pending image, then polls hourly
 
     ESP_LOGI(TAG, "up — if no home WiFi is stored/reachable, join "
                   "\"ESP32-SIM7670G\" (pass \"waveshare\") and open "

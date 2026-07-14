@@ -25,3 +25,13 @@ CONFIG_UART_ISR_IN_IRAM=y
 # esp_modem C API copies AT responses through a bounded buffer; match the
 # web UI AT console's response size
 CONFIG_ESP_MODEM_C_API_STR_MAX=2048
+
+# OTA downloads over PPP: the IDF default receive window (4*MSS = 5760) caps
+# long-RTT cellular transfers at ~17 KB/s (5760 B / ~330 ms RTT). 8*MSS =
+# 11520 covers the link's bandwidth-delay product (~34 KB/s * ~330 ms ≈
+# 11 KB), i.e. the UART becomes the bottleneck again, without queueing more
+# than ~11 KB per socket. Bump the recv mailbox to match: 8 MSS-sized
+# segments in flight would overflow the default 6-slot mbox and force
+# retransmits (entries are pbuf pointers, so 16 is cheap).
+CONFIG_LWIP_TCP_WND_DEFAULT=11520
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=16
