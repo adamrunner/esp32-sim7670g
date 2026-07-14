@@ -94,6 +94,34 @@ The `/dev/cu.usbmodem5B9...` port is the ESP32-S3's native USB-Serial-JTAG
 `/dev/cu.usbmodem00000000000xx` ports are the SIM7670G's own USB
 interfaces.
 
+## OTA updates
+
+The device polls
+`https://adamrunner.com/downloads/esp32-sim7670g/manifest.json` 90 s
+after boot and hourly after that, over whichever link is up (WiFi wins
+the route when home; cellular otherwise). A version mismatch —
+inequality against the running image's `git describe` version, so a
+stale manifest is a downgrade order — triggers an automatic download
+(resumable 128 KB range requests, sha256 read-back before anything
+becomes bootable) into the passive slot and a reboot. The new image
+must reach the update server over HTTPS within 6 minutes of booting or
+the bootloader rolls back to the previous slot; a rolled-back version
+is never auto-retried.
+
+Publishing a release:
+
+```sh
+tools/release.sh            # build, upload .bin + manifest, verify from outside
+tools/release.sh --dry-run  # show what would be published
+```
+
+The script refuses dirty versions and refuses to reuse a published
+filename (Cloudflare edge-caches `.bin` files forever; `manifest.json`
+is never cached). Publish after every deploy: a device left running a
+newer local build than the manifest advertises will "update" backwards
+on its next check. Test builds can track a staging manifest via
+`idf.py -DOTA_MANIFEST_URL=... build`.
+
 ## API
 
 - `GET /api/status` — JSON snapshot of modem status, including a `gnss`
@@ -109,3 +137,10 @@ interfaces.
   ping using the ESP32's own lwIP stack, i.e. it exercises the PPP link
   itself; returns resolved IPs, RTT stats, and a ping-style transcript.
   Blocks up to ~20 s for an unreachable host.
+- `GET /api/ota` — running version/slot, OTA state (`idle`/`checking`/
+  `downloading`/`verifying`/`wait_reboot`/`error`), progress, last
+  check result
+- `POST /api/ota/check` — check for an update now; body optional:
+  `{"url":"https://.../manifest.json","transport":"cell"}` to target an
+  alternate manifest or pin the transfer to the cellular interface
+  (both mainly for testing)
