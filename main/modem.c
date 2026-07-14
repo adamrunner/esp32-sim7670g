@@ -28,7 +28,11 @@ static const char *TAG = "modem";
 #define MODEM_UART      UART_NUM_1
 #define MODEM_TX_PIN    18
 #define MODEM_RX_PIN    17
-#define MODEM_BAUD      115200
+// 460800 is the fastest rate this modem offers (AT+IPR=? — no 921600).
+// MODEM_BAUD_SAFE is its power-on default; we never persist IPR (AT&W), so
+// AT+CRESET or a power cycle always brings the modem back to 115200.
+#define MODEM_BAUD_TARGET   460800
+#define MODEM_BAUD_SAFE     115200
 #define AT_RESP_MAX     2048    // keep in sync with CONFIG_ESP_MODEM_C_API_STR_MAX
 
 // Blank = let the carrier assign the APN. The EIOTCLUB SIM roaming on
@@ -434,6 +438,8 @@ void modem_get_status(modem_status_t *out)
     *out = s_status;
     strlcpy(out->apn, s_apn, sizeof(out->apn));
     xSemaphoreGive(s_status_mutex);
+    uint32_t baud = 0;
+    out->uart_baud = uart_get_baudrate(MODEM_UART, &baud) == ESP_OK ? (int)baud : 0;
 }
 
 // One-time identity queries once the modem answers.
@@ -727,6 +733,63 @@ static void on_ppp_status(void *arg, esp_event_base_t base, int32_t event_id, vo
     }
 }
 
+// Get the modem answering at MODEM_BAUD_TARGET no matter what state a
+// previous boot left it in: it stays powered across ESP32 soft resets, so it
+// may already be at the target rate, still at its power-on default, and in
+// either case possibly stuck in PPP data mode. Probe the target rate first,
+// then the default; when it only answers at the default, bump it with
+// AT+IPR — the OK still arrives at the old rate, so the host UART switches
+// only after the command succeeds. Caller must hold the AT channel.
+// Returns true when the modem answers at whatever rate the host is now set
+// to (the target, or the default if the bump was refused).
+static bool baud_negotiate(void)
+{
+    static const uint32_t rates[] = { MODEM_BAUD_TARGET, MODEM_BAUD_SAFE };
+
+    for (size_t i = 0; i < sizeof(rates) / sizeof(rates[0]); i++) {
+        uart_set_baudrate(MODEM_UART, rates[i]);
+        uart_flush_input(MODEM_UART);
+        bool answering = esp_modem_sync(s_dce) == ESP_OK ||
+                         esp_modem_sync(s_dce) == ESP_OK;
+        if (!answering) {
+            // Maybe leftover PPP (or CMUX) state at this rate; detect it and
+            // drop back to plain command mode, then re-probe.
+            if (esp_modem_set_mode(s_dce, ESP_MODEM_MODE_DETECT) == ESP_OK) {
+                ESP_LOGI(TAG, "leftover modem state at %u baud; recovering to command mode",
+                         (unsigned)rates[i]);
+                esp_modem_set_mode(s_dce, ESP_MODEM_MODE_COMMAND);
+                answering = esp_modem_sync(s_dce) == ESP_OK;
+            }
+        }
+        if (!answering) {
+            continue;
+        }
+        if (rates[i] == MODEM_BAUD_TARGET) {
+            return true;
+        }
+
+        ESP_LOGI(TAG, "modem at %u baud; raising to %u",
+                 (unsigned)rates[i], (unsigned)MODEM_BAUD_TARGET);
+        if (esp_modem_set_baud(s_dce, MODEM_BAUD_TARGET) != ESP_OK) {
+            ESP_LOGW(TAG, "AT+IPR=%u refused; staying at %u",
+                     (unsigned)MODEM_BAUD_TARGET, (unsigned)rates[i]);
+            return true;    // usable, just slow
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));     // let the modem retune its UART
+        uart_set_baudrate(MODEM_UART, MODEM_BAUD_TARGET);
+        uart_flush_input(MODEM_UART);
+        if (esp_modem_sync(s_dce) == ESP_OK || esp_modem_sync(s_dce) == ESP_OK) {
+            return true;
+        }
+        // IPR was accepted but the modem went quiet at the new rate; the
+        // next negotiation round probes the target rate first anyway.
+        ESP_LOGW(TAG, "modem silent at %u after IPR; will retry",
+                 (unsigned)MODEM_BAUD_TARGET);
+        return false;
+    }
+    return false;
+}
+
 // After a failed mode transition esp_modem can be left in an undefined
 // state where every command fails instantly; force it back to command mode.
 static void restore_command_mode(void)
@@ -772,6 +835,7 @@ static void modem_task(void *arg)
     int denied_polls = 0;
     int dead_polls = 0;
     int healthy_polls = 0;
+    int pause_fails = 0;
 
     while (1) {
         xSemaphoreTake(s_status_mutex, portMAX_DELAY);
@@ -809,22 +873,19 @@ static void modem_task(void *arg)
         }
         was_up = ppp_up;
 
-        // Probe the modem until it answers AT
+        // Probe the modem until it answers AT (at the target baud; see
+        // baud_negotiate). Re-runs whenever the AT channel dies, which also
+        // re-bumps the baud after an unexpected modem reboot back to 115200.
         if (!st.at_ok && !ppp_up && at_channel_acquire()) {
-            if (esp_modem_sync(s_dce) == ESP_OK) {
+            if (baud_negotiate()) {
                 st.at_ok = true;
                 at_cmd("ATE0", NULL, 0, 2000);         // echo off simplifies parsing
                 at_cmd("AT+COPS=3,0", NULL, 0, 2000);  // long operator names
-                ESP_LOGI(TAG, "modem is responding");
+                uint32_t baud = 0;
+                uart_get_baudrate(MODEM_UART, &baud);
+                ESP_LOGI(TAG, "modem is responding at %u baud", (unsigned)baud);
             } else {
-                ESP_LOGW(TAG, "modem not responding to AT yet");
-                // A previous boot may have left the modem in CMUX or PPP mode
-                // (the modem doesn't reset when the ESP32 does). Detect the
-                // leftover state and drop back to plain command mode.
-                if (esp_modem_set_mode(s_dce, ESP_MODEM_MODE_DETECT) == ESP_OK) {
-                    ESP_LOGI(TAG, "detected leftover modem state; recovering to command mode");
-                    esp_modem_set_mode(s_dce, ESP_MODEM_MODE_COMMAND);
-                }
+                ESP_LOGW(TAG, "modem not responding to AT at any baud yet");
             }
             at_channel_release();
         }
@@ -838,6 +899,7 @@ static void modem_task(void *arg)
                         (now - ppp_up_since_us > (int64_t)PPP_POLL_GRACE_MS * 1000 &&
                          now - last_poll_us > (int64_t)PPP_POLL_INTERVAL_MS * 1000);
         if (st.at_ok && poll_due && at_channel_acquire()) {
+            pause_fails = 0;
             last_poll_us = now;
             if (!identity_read) {
                 read_identity(&st);
@@ -887,6 +949,20 @@ static void modem_task(void *arg)
             }
 
             at_channel_release();
+        } else if (st.at_ok && poll_due && ++pause_fails >= 2) {
+            // Consecutive pause failures with PPP nominally up: the modem
+            // stopped honoring "+++", most likely a reboot back to its
+            // power-on baud (no LCP echo is configured, so lwIP never
+            // notices the dead link on its own). Tear down and re-negotiate.
+            pause_fails = 0;
+            ESP_LOGW(TAG, "AT windows failing while PPP nominally up; forcing re-sync");
+            st.at_ok = false;
+            gnss_on = false;
+            healthy_polls = 0;
+            xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+            s_ppp_up = false;
+            s_ppp_ip[0] = '\0';
+            xSemaphoreGive(s_status_mutex);
         }
 
         if (apn_dirty && st.at_ok) {
@@ -963,10 +1039,14 @@ void modem_init(void)
     dte_cfg.uart_config.port_num = MODEM_UART;
     dte_cfg.uart_config.tx_io_num = MODEM_TX_PIN;
     dte_cfg.uart_config.rx_io_num = MODEM_RX_PIN;
-    dte_cfg.uart_config.baud_rate = MODEM_BAUD;
-    dte_cfg.uart_config.rx_buffer_size = 4096;
+    // Start at the target rate (the modem keeps it across ESP32 soft resets);
+    // baud_negotiate() retunes the port as needed. No hardware flow control
+    // on this board, so give the driver more headroom at 460800: ~46 KB/s
+    // means 4 KB buffered only ~90 ms of PPP downlink.
+    dte_cfg.uart_config.baud_rate = MODEM_BAUD_TARGET;
+    dte_cfg.uart_config.rx_buffer_size = 16384;
     dte_cfg.uart_config.tx_buffer_size = 2048;
-    dte_cfg.dte_buffer_size = 1024;
+    dte_cfg.dte_buffer_size = 2048;
     dte_cfg.task_stack_size = 6144;
 
     // SIM7670G speaks the same AT/PPP dialect as the SIM7600 family

@@ -56,6 +56,7 @@
       <dt>Operator</dt><dd id="operator">…</dd>
       <dt>Network</dt><dd id="rat">…</dd>
       <dt>Band</dt><dd id="band">…</dd>
+      <dt>Modem UART</dt><dd id="uart_baud">…</dd>
       <dt>IP address</dt><dd id="ip">…</dd>
     </dl>
   </div>
@@ -146,6 +147,7 @@ async function refresh() {
     pill($('reg_text'), s.reg_text, regOk ? 'ok' : (s.reg_status === 2 ? 'warn' : 'bad'));
     pill($('pdp_active'), s.pdp_active ? 'connected' : 'down', s.pdp_active ? 'ok' : 'warn');
     $('rssi').textContent = s.rssi_dbm ? s.rssi_dbm + ' dBm' : 'unknown';
+    $('uart_baud').textContent = s.uart_baud ? s.uart_baud.toLocaleString() + ' baud' : '—';
     for (const k of ['operator','rat','band','ip','model','fw_rev','imei','iccid'])
       $(k).textContent = s[k] || '—';
     if (!apnEdited && document.activeElement !== $('apn')) $('apn').value = s.apn || '';

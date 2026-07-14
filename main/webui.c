@@ -52,6 +52,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     cJSON_AddStringToObject(root, "operator", st.operator_name);
     cJSON_AddStringToObject(root, "rat", st.rat);
     cJSON_AddStringToObject(root, "band", st.band);
+    cJSON_AddNumberToObject(root, "uart_baud", st.uart_baud);
     cJSON_AddStringToObject(root, "ip", st.ip_addr);
     cJSON_AddStringToObject(root, "apn", st.apn);
 

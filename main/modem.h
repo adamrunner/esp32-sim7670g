@@ -21,6 +21,7 @@ typedef struct {
     char operator_name[48];
     char rat[16];           // e.g. "LTE" from +CPSI
     char band[24];          // e.g. "EUTRAN-BAND2"
+    int uart_baud;          // current host<->modem UART rate, 0 = unknown
     char ip_addr[40];
     char apn[MODEM_APN_MAX];
     int64_t last_update_us; // esp_timer time of last successful poll
