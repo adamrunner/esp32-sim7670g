@@ -6,6 +6,7 @@
 #include "led.h"
 #include "modem.h"
 #include "webui.h"
+#include "wifi.h"
 
 static const char *TAG = "app";
 
@@ -25,8 +26,10 @@ void app_main(void)
 
     modem_init();  // creates the status mutex the LED task reads through
     led_init();
+    wifi_init();   // joins the stored home network, or falls back to SoftAP
     webui_init();
 
-    ESP_LOGI(TAG, "up — join WiFi \"ESP32-SIM7670G\" (pass \"waveshare\") "
-                  "and open http://192.168.4.1/");
+    ESP_LOGI(TAG, "up — if no home WiFi is stored/reachable, join "
+                  "\"ESP32-SIM7670G\" (pass \"waveshare\") and open "
+                  "http://192.168.4.1/ to configure it");
 }

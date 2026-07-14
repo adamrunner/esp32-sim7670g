@@ -29,6 +29,8 @@
   }
   button { background: #1f4fd8; border: none; cursor: pointer; }
   button:hover { background: #2b5ceb; }
+  button.danger { background: #7f1d1d; }
+  button.danger:hover { background: #991b1b; }
   form { display: flex; gap: 0.5rem; }
   form input { flex: 1; min-width: 0; }
   #atlog, #pinglog {
@@ -64,6 +66,24 @@
       <dt>IMEI</dt><dd id="imei">…</dd>
       <dt>ICCID</dt><dd id="iccid">…</dd>
     </dl>
+  </div>
+  <div class="card">
+    <h2>Home WiFi</h2>
+    <dl>
+      <dt>Mode</dt><dd id="wifi_state">…</dd>
+      <dt>Network</dt><dd id="wifi_ssid">…</dd>
+      <dt>IP address</dt><dd id="wifi_ip">…</dd>
+      <dt>Signal</dt><dd id="wifi_rssi">…</dd>
+    </dl>
+    <form id="wifiform" style="flex-direction: column; margin-top: 0.75rem;">
+      <input id="wifi_set_ssid" placeholder="SSID" autocomplete="off" spellcheck="false">
+      <input id="wifi_set_pass" type="password" placeholder="password (blank = open network)" autocomplete="off">
+      <div style="display: flex; gap: 0.5rem;">
+        <button type="submit" style="flex: 1;">Save &amp; connect</button>
+        <button type="button" id="wifi_forget" class="danger">Forget</button>
+      </div>
+    </form>
+    <div class="msg" id="wifimsg"></div>
   </div>
   <div class="card">
     <h2>APN</h2>
@@ -117,6 +137,64 @@ async function refresh() {
     if (!apnEdited && document.activeElement !== $('apn')) $('apn').value = s.apn || '';
   } catch (e) { /* board busy; try again next tick */ }
 }
+
+const WIFI_STATE = {
+  connecting: ['joining home network…', 'warn'],
+  connected:  ['on home WiFi', 'ok'],
+  softap:     ['SoftAP (config mode)', 'warn'],
+  booting:    ['starting…', 'warn'],
+};
+
+let apSsid = 'ESP32-SIM7670G';
+async function refreshWifi() {
+  if (pinging) return;
+  try {
+    const s = await (await fetch('/api/wifi')).json();
+    apSsid = s.ap_ssid || apSsid;
+    const [txt, cls] = WIFI_STATE[s.state] || [s.state, 'warn'];
+    pill($('wifi_state'), txt, cls);
+    $('wifi_ssid').textContent = s.connected ? s.ssid
+                               : s.sta_configured ? s.ssid + ' (configured)'
+                               : (s.state === 'softap' ? 'AP: ' + s.ap_ssid : '—');
+    $('wifi_ip').textContent = s.ip || '—';
+    $('wifi_rssi').textContent = s.rssi_dbm ? s.rssi_dbm + ' dBm' : '—';
+  } catch (e) { /* board busy; retry next tick */ }
+}
+
+$('wifiform').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  $('wifimsg').textContent = 'saving…';
+  try {
+    const r = await fetch('/api/wifi', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        ssid: $('wifi_set_ssid').value.trim(),
+        password: $('wifi_set_pass').value
+      })
+    });
+    $('wifimsg').textContent = r.ok
+      ? 'saved — connecting (this page drops if the device leaves the AP)'
+      : 'error: ' + (await r.text());
+    if (r.ok) $('wifi_set_pass').value = '';
+  } catch (e) { $('wifimsg').textContent = 'request failed'; }
+});
+
+$('wifi_forget').addEventListener('click', async () => {
+  if (!confirm('Clear stored WiFi credentials and return to SoftAP mode?')) return;
+  $('wifimsg').textContent = 'clearing…';
+  try {
+    const r = await fetch('/api/wifi', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ssid: '', password: ''})
+    });
+    $('wifimsg').textContent = r.ok
+      ? 'cleared — returning to SoftAP "' + apSsid + '"'
+      : 'error: ' + (await r.text());
+    if (r.ok) { $('wifi_set_ssid').value = ''; $('wifi_set_pass').value = ''; }
+  } catch (e) { $('wifimsg').textContent = 'request failed'; }
+});
 
 $('apn').addEventListener('input', () => { apnEdited = true; });
 
@@ -192,7 +270,9 @@ $('pingform').addEventListener('submit', async ev => {
 });
 
 refresh();
+refreshWifi();
 setInterval(refresh, 3000);
+setInterval(refreshWifi, 3000);
 </script>
 </body>
 </html>

@@ -2,48 +2,14 @@
 
 #include <string.h>
 
-#include "esp_event.h"
 #include "esp_http_server.h"
-#include "esp_log.h"
-#include "esp_mac.h"
-#include "esp_netif.h"
-#include "esp_wifi.h"
 #include "cJSON.h"
 
 #include "modem.h"
-
-static const char *TAG = "webui";
-
-#define AP_SSID     "ESP32-SIM7670G"
-#define AP_PASSWORD "waveshare"
-#define AP_CHANNEL  6
-#define AP_MAX_CONN 4
+#include "wifi.h"
 
 extern const uint8_t index_html_start[] asm("_binary_index_html_start");
 extern const uint8_t index_html_end[]   asm("_binary_index_html_end");
-
-static void wifi_ap_init(void)
-{
-    esp_netif_create_default_wifi_ap();  // esp_netif/event loop init in app_main
-
-    wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
-
-    wifi_config_t ap_cfg = {
-        .ap = {
-            .ssid = AP_SSID,
-            .ssid_len = strlen(AP_SSID),
-            .password = AP_PASSWORD,
-            .channel = AP_CHANNEL,
-            .max_connection = AP_MAX_CONN,
-            .authmode = WIFI_AUTH_WPA2_PSK,
-        },
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI(TAG, "SoftAP \"%s\" up — http://192.168.4.1/", AP_SSID);
-}
 
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
@@ -214,10 +180,71 @@ static esp_err_t ping_post_handler(httpd_req_t *req)
     return send_err;
 }
 
+static const char *wifi_state_str(wifi_ui_state_t s)
+{
+    switch (s) {
+    case WIFI_UI_STA_CONNECTING: return "connecting";
+    case WIFI_UI_STA_CONNECTED:  return "connected";
+    case WIFI_UI_AP:             return "softap";
+    default:                     return "booting";
+    }
+}
+
+static esp_err_t wifi_get_handler(httpd_req_t *req)
+{
+    wifi_ui_status_t st;
+    wifi_get_status(&st);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "state", wifi_state_str(st.state));
+    cJSON_AddBoolToObject(root, "sta_configured", st.sta_configured);
+    cJSON_AddBoolToObject(root, "connected", st.state == WIFI_UI_STA_CONNECTED);
+    cJSON_AddStringToObject(root, "ssid", st.ssid);
+    cJSON_AddStringToObject(root, "ip", st.ip);
+    cJSON_AddNumberToObject(root, "rssi_dbm", st.rssi_dbm);
+    cJSON_AddStringToObject(root, "ap_ssid", st.ap_ssid);
+    cJSON_AddNumberToObject(root, "disconnects", st.disconnect_count);
+
+    char *json = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t err = httpd_resp_sendstr(req, json);
+    cJSON_free(json);
+    cJSON_Delete(root);
+    return err;
+}
+
+static esp_err_t wifi_post_handler(httpd_req_t *req)
+{
+    char body[256];
+    if (read_body(req, body, sizeof(body)) != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    cJSON *root = cJSON_Parse(body);
+    const cJSON *ssid = root ? cJSON_GetObjectItem(root, "ssid") : NULL;
+    const cJSON *pass = root ? cJSON_GetObjectItem(root, "password") : NULL;
+    // ssid required (empty string clears creds); password optional (open nets)
+    if (!cJSON_IsString(ssid) || (pass && !cJSON_IsString(pass))) {
+        cJSON_Delete(root);
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "expected {\"ssid\":\"...\",\"password\":\"...\"}");
+    }
+
+    esp_err_t err = wifi_set_credentials(ssid->valuestring,
+                                         pass ? pass->valuestring : "");
+    cJSON_Delete(root);
+    if (err == ESP_ERR_INVALID_ARG) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ssid/password too long");
+    }
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "NVS write failed");
+    }
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
 void webui_init(void)
 {
-    wifi_ap_init();
-
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.lru_purge_enable = true;
     cfg.stack_size = 8192;  // ping/DNS handler keeps sizeable buffers on the stack
@@ -228,6 +255,8 @@ void webui_init(void)
     static const httpd_uri_t routes[] = {
         { .uri = "/",           .method = HTTP_GET,  .handler = root_get_handler },
         { .uri = "/api/status", .method = HTTP_GET,  .handler = status_get_handler },
+        { .uri = "/api/wifi",   .method = HTTP_GET,  .handler = wifi_get_handler },
+        { .uri = "/api/wifi",   .method = HTTP_POST, .handler = wifi_post_handler },
         { .uri = "/api/apn",    .method = HTTP_POST, .handler = apn_post_handler },
         { .uri = "/api/at",     .method = HTTP_POST, .handler = at_post_handler },
         { .uri = "/api/ping",   .method = HTTP_POST, .handler = ping_post_handler },
