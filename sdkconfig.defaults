@@ -35,3 +35,7 @@ CONFIG_ESP_MODEM_C_API_STR_MAX=2048
 # retransmits (entries are pbuf pointers, so 16 is cheap).
 CONFIG_LWIP_TCP_WND_DEFAULT=11520
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=16
+
+# microSD data logging: FATFS long filenames (stored on the heap) so date- or
+# timestamp-based names like "2026-07-14.csv" aren't truncated to 8.3.
+CONFIG_FATFS_LFN_HEAP=y

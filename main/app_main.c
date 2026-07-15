@@ -6,6 +6,7 @@
 #include "led.h"
 #include "modem.h"
 #include "ota.h"
+#include "sdcard.h"
 #include "webui.h"
 #include "wifi.h"
 
@@ -25,6 +26,8 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
+    sdcard_init(); // mount the microSD at /sdcard for later data logging;
+                   // logs a warning and continues if no card is present
     modem_init();  // creates the status mutex the LED task reads through
     led_init();
     wifi_init();   // joins the stored home network, or falls back to SoftAP

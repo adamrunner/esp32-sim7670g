@@ -32,6 +32,12 @@ web UI for monitoring/configuring the cellular connection.
   - yellow: modem up, not registered yet
   - green: registered on the network
   - blue: data connection up (has an IP)
+- **microSD storage** (`main/sdcard.c`) — the onboard TF slot, mounted as a
+  FAT filesystem at `/sdcard` for data logging. Wired to the ESP32-S3 SDMMC
+  peripheral in 1-bit mode (CLK=GPIO5, CMD=GPIO4, D0=GPIO6). Mounts at boot;
+  if no card is inserted it logs a warning and the rest of the app runs
+  normally. Callers just `fopen("/sdcard/…")`; long filenames are enabled so
+  date-stamped names like `2026-07-14.csv` aren't truncated to 8.3.
 - **Web UI** (`main/webui.c`, `main/www/index.html`) — WiFi SoftAP
   **ESP32-SIM7670G** (password **waveshare**), then browse to
   <http://192.168.4.1/>. Shows live connection status, modem/SIM identity,
