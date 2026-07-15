@@ -86,6 +86,8 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     cJSON *bms = cJSON_AddObjectToObject(root, "bms");
     cJSON_AddBoolToObject(bms, "enabled", b.enabled);
     cJSON_AddBoolToObject(bms, "sim", b.sim);
+    cJSON_AddNumberToObject(bms, "tx_pin", b.tx_pin);
+    cJSON_AddNumberToObject(bms, "rx_pin", b.rx_pin);
     cJSON_AddBoolToObject(bms, "comm_ok", b.comm_ok);
     cJSON_AddBoolToObject(bms, "ever_ok", b.ever_ok);
     cJSON_AddNumberToObject(bms, "polls", b.poll_count);
@@ -439,7 +441,9 @@ static esp_err_t wifi_post_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
-// {"enabled":bool,"sim":bool} — both optional, missing keys keep their value.
+// {"enabled":bool,"sim":bool,"tx_pin":int,"rx_pin":int} — all optional, missing
+// keys keep their value. tx_pin/rx_pin let the UART be moved (or swapped, when
+// the BMS is wired backwards) from the web UI.
 static esp_err_t bms_post_handler(httpd_req_t *req)
 {
     char body[128];
@@ -457,11 +461,21 @@ static esp_err_t bms_post_handler(httpd_req_t *req)
     bms_get_status(&cur);
     const cJSON *enabled = cJSON_GetObjectItem(root, "enabled");
     const cJSON *sim = cJSON_GetObjectItem(root, "sim");
+    const cJSON *tx = cJSON_GetObjectItem(root, "tx_pin");
+    const cJSON *rx = cJSON_GetObjectItem(root, "rx_pin");
     bool new_enabled = cJSON_IsBool(enabled) ? cJSON_IsTrue(enabled) : cur.enabled;
     bool new_sim = cJSON_IsBool(sim) ? cJSON_IsTrue(sim) : cur.sim;
+    int new_tx = cJSON_IsNumber(tx) ? tx->valueint : cur.tx_pin;
+    int new_rx = cJSON_IsNumber(rx) ? rx->valueint : cur.rx_pin;
     cJSON_Delete(root);
 
-    if (bms_set_options(new_enabled, new_sim) != ESP_OK) {
+    // Valid GPIOs on the ESP32-S3 are 0-48; TX and RX must be distinct.
+    if (new_tx < 0 || new_tx > 48 || new_rx < 0 || new_rx > 48 || new_tx == new_rx) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "tx_pin/rx_pin must be distinct GPIOs in 0-48");
+    }
+
+    if (bms_set_options(new_enabled, new_sim, new_tx, new_rx) != ESP_OK) {
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "NVS write failed");
     }
     httpd_resp_set_type(req, "application/json");

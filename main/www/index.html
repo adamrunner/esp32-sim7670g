@@ -85,8 +85,13 @@
       <dt>Protection</dt><dd id="bms_prot">…</dd>
       <dt>Energy</dt><dd id="bms_energy">…</dd>
     </dl>
-    <form id="bmsform" style="margin-top: 0.75rem;">
-      <label style="font-size: 0.85rem;"><input type="checkbox" id="bms_sim"> simulate data (no BMS wired)</label>
+    <form id="bmsform" style="margin-top: 0.75rem; flex-wrap: wrap; align-items: center;">
+      <label style="font-size: 0.85rem; flex-basis: 100%;"><input type="checkbox" id="bms_sim"> simulate data (no BMS wired)</label>
+      <label style="font-size: 0.85rem; display: flex; align-items: center; gap: 0.35rem;">TX GPIO
+        <input type="number" id="bms_tx" min="0" max="48" step="1" style="flex: none; width: 4rem;"></label>
+      <label style="font-size: 0.85rem; display: flex; align-items: center; gap: 0.35rem;">RX GPIO
+        <input type="number" id="bms_rx" min="0" max="48" step="1" style="flex: none; width: 4rem;"></label>
+      <button type="button" id="bms_swap" title="Swap TX/RX for a backwards-wired BMS">Swap</button>
       <button type="submit">Apply</button>
     </form>
     <div class="msg" id="bmsmsg"></div>
@@ -235,7 +240,11 @@ async function refresh() {
     else if (b.comm_ok) pill($('bms_state'), 'online', 'ok');
     else if (b.ever_ok) pill($('bms_state'), 'not responding', 'bad');
     else pill($('bms_state'), 'not detected', 'warn');
-    if (!bmsEdited) $('bms_sim').checked = !!b.sim;
+    if (!bmsEdited) {
+      $('bms_sim').checked = !!b.sim;
+      if (b.tx_pin !== undefined) $('bms_tx').value = b.tx_pin;
+      if (b.rx_pin !== undefined) $('bms_rx').value = b.rx_pin;
+    }
     if (b.pack_v !== undefined) {
       $('bms_pack').textContent = b.pack_v.toFixed(2) + ' V · ' +
         b.current_a.toFixed(2) + ' A · ' + b.power_w.toFixed(1) + ' W';
@@ -414,15 +423,29 @@ $('atform').addEventListener('submit', async ev => {
 });
 
 let bmsEdited = false;
-$('bms_sim').addEventListener('change', () => { bmsEdited = true; });
+const bmsTouch = () => { bmsEdited = true; };
+$('bms_sim').addEventListener('change', bmsTouch);
+$('bms_tx').addEventListener('input', bmsTouch);
+$('bms_rx').addEventListener('input', bmsTouch);
+$('bms_swap').addEventListener('click', () => {
+  const tx = $('bms_tx').value;
+  $('bms_tx').value = $('bms_rx').value;
+  $('bms_rx').value = tx;
+  bmsEdited = true;
+});
 $('bmsform').addEventListener('submit', async ev => {
   ev.preventDefault();
+  const tx = parseInt($('bms_tx').value, 10), rx = parseInt($('bms_rx').value, 10);
+  if (!Number.isInteger(tx) || !Number.isInteger(rx) || tx === rx) {
+    $('bmsmsg').textContent = 'TX and RX must be distinct GPIO numbers';
+    return;
+  }
   $('bmsmsg').textContent = 'saving…';
   try {
     const r = await fetch('/api/bms', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({sim: $('bms_sim').checked})
+      body: JSON.stringify({sim: $('bms_sim').checked, tx_pin: tx, rx_pin: rx})
     });
     $('bmsmsg').textContent = r.ok ? 'saved' : 'error: ' + (await r.text());
   } catch (e) { $('bmsmsg').textContent = 'request failed'; }

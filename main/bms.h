@@ -17,6 +17,8 @@
 typedef struct {
     bool enabled;             // polling enabled (NVS bmscfg/enabled)
     bool sim;                 // synthetic data mode (NVS bmscfg/sim)
+    int tx_pin;               // UART TX GPIO (NVS bmscfg/tx, default BMS_TX_PIN)
+    int rx_pin;               // UART RX GPIO (NVS bmscfg/rx, default BMS_RX_PIN)
     bool comm_ok;             // most recent poll succeeded
     bool ever_ok;             // the BMS has answered at least once since boot
     uint32_t poll_count;
@@ -56,5 +58,7 @@ void bms_init(void);
 
 void bms_get_status(bms_status_t *out);
 
-// Persist enable/sim flags to NVS; takes effect within one poll cycle.
-esp_err_t bms_set_options(bool enabled, bool sim);
+// Persist enable/sim flags and the UART TX/RX GPIOs to NVS; takes effect within
+// one poll cycle. Changing the pins (e.g. to swap TX/RX when the BMS is wired
+// backwards) rebuilds the UART and re-probes from a clean "not detected" state.
+esp_err_t bms_set_options(bool enabled, bool sim, int tx_pin, int rx_pin);

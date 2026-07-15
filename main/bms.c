@@ -30,21 +30,29 @@ static const char *TAG = "bms";
 static SemaphoreHandle_t s_mutex;
 static bms_status_t s_status;
 static bms_interface_t *s_bms;
+// Set by bms_set_options() when the pins change; the bms_task tears down and
+// rebuilds the UART so all UART calls stay on the polling thread.
+static bool s_reconfig;
 
-static void load_options(bool *enabled, bool *sim)
+static void load_options(bms_status_t *st)
 {
     uint8_t en = 1, sm = 0;
+    int32_t tx = BMS_TX_PIN, rx = BMS_RX_PIN;
     nvs_handle_t nvs;
     if (nvs_open(NVS_NS, NVS_READONLY, &nvs) == ESP_OK) {
         nvs_get_u8(nvs, "enabled", &en);
         nvs_get_u8(nvs, "sim", &sm);
+        nvs_get_i32(nvs, "tx", &tx);
+        nvs_get_i32(nvs, "rx", &rx);
         nvs_close(nvs);
     }
-    *enabled = en != 0;
-    *sim = sm != 0;
+    st->enabled = en != 0;
+    st->sim = sm != 0;
+    st->tx_pin = tx;
+    st->rx_pin = rx;
 }
 
-esp_err_t bms_set_options(bool enabled, bool sim)
+esp_err_t bms_set_options(bool enabled, bool sim, int tx_pin, int rx_pin)
 {
     nvs_handle_t nvs;
     esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &nvs);
@@ -53,12 +61,26 @@ esp_err_t bms_set_options(bool enabled, bool sim)
     }
     nvs_set_u8(nvs, "enabled", enabled ? 1 : 0);
     nvs_set_u8(nvs, "sim", sim ? 1 : 0);
+    nvs_set_i32(nvs, "tx", tx_pin);
+    nvs_set_i32(nvs, "rx", rx_pin);
     err = nvs_commit(nvs);
     nvs_close(nvs);
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool pins_changed = tx_pin != s_status.tx_pin || rx_pin != s_status.rx_pin;
     s_status.enabled = enabled;
     s_status.sim = sim;
+    s_status.tx_pin = tx_pin;
+    s_status.rx_pin = rx_pin;
+    if (pins_changed) {
+        // Rebuild the UART on the new pins and forget prior comms, so the UI
+        // returns to "not detected" and flips to "online" only if the new
+        // wiring actually talks.
+        s_reconfig = true;
+        s_status.comm_ok = false;
+        s_status.ever_ok = false;
+        s_status.last_ok_us = 0;
+    }
     xSemaphoreGive(s_mutex);
     return err;
 }
@@ -219,11 +241,24 @@ static void bms_task(void *arg)
     int64_t last_fail_log_us = 0;
 
     while (true) {
-        bool enabled, sim;
+        bool enabled, sim, reconfig;
+        int tx_pin, rx_pin;
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         enabled = s_status.enabled;
         sim = s_status.sim;
+        tx_pin = s_status.tx_pin;
+        rx_pin = s_status.rx_pin;
+        reconfig = s_reconfig;
+        s_reconfig = false;
         xSemaphoreGive(s_mutex);
+
+        // Pins changed (or mode switched to sim): drop the UART so it gets
+        // rebuilt on the current pins next time real polling runs.
+        if ((reconfig || sim) && s_bms) {
+            jbd_bms_destroy(s_bms);
+            s_bms = NULL;
+            last_fail_log_us = 0;
+        }
 
         if (!enabled) {
             vTaskDelay(pdMS_TO_TICKS(5000));
@@ -242,7 +277,7 @@ static void bms_task(void *arg)
         }
 
         if (!s_bms) {
-            s_bms = jbd_bms_create_ex(BMS_UART_PORT, BMS_RX_PIN, BMS_TX_PIN, BMS_BAUD);
+            s_bms = jbd_bms_create_ex(BMS_UART_PORT, rx_pin, tx_pin, BMS_BAUD);
             if (!s_bms) {
                 ESP_LOGE(TAG, "UART setup failed; retrying in 30 s");
                 vTaskDelay(pdMS_TO_TICKS(POLL_PROBE_MS));
@@ -282,7 +317,7 @@ static void bms_task(void *arg)
             if (!last_fail_log_us ||
                 esp_timer_get_time() - last_fail_log_us > 300LL * 1000000) {
                 ESP_LOGI(TAG, "no BMS detected on UART%d (TX=%d RX=%d); probing every %d s",
-                         BMS_UART_PORT, BMS_TX_PIN, BMS_RX_PIN, POLL_PROBE_MS / 1000);
+                         BMS_UART_PORT, tx_pin, rx_pin, POLL_PROBE_MS / 1000);
                 last_fail_log_us = esp_timer_get_time();
             }
             delay_ms = POLL_PROBE_MS;
@@ -295,6 +330,6 @@ static void bms_task(void *arg)
 void bms_init(void)
 {
     s_mutex = xSemaphoreCreateMutex();
-    load_options(&s_status.enabled, &s_status.sim);
+    load_options(&s_status);
     xTaskCreate(bms_task, "bms", 5120, NULL, 4, NULL);
 }

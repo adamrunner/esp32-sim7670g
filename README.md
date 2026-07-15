@@ -39,8 +39,11 @@ web UI for monitoring/configuring the cellular connection.
   normally. Callers just `fopen("/sdcard/…")`; long filenames are enabled so
   date-stamped names like `2026-07-14.csv` aren't truncated to 8.3.
 - **JBD BMS monitor** (`main/bms.c`) — polls the JBD BMS on the 4S4P LiFePO4
-  house battery over UART2 (TX=GPIO1, RX=GPIO2, 9600 8N1; confirm against the
-  header before wiring). The protocol driver is the shared `jbd_bms` component
+  house battery over UART2 (TX=GPIO1, RX=GPIO2 by default, 9600 8N1; confirm
+  against the header before wiring). TX/RX are reconfigurable from the web UI
+  (NVS `bmscfg/tx` and `bmscfg/rx`) with a Swap button — handy when the BMS is
+  wired backwards; changing them rebuilds the UART and re-probes from scratch.
+  The protocol driver is the shared `jbd_bms` component
   from `../esp32-shared-components` (also used by `esp32-bms-monitor`).
   Adaptive polling: 1 s while charging/discharging, 10 s idle, quiet 30 s
   probes while no BMS has ever answered — the firmware runs fine with nothing
@@ -175,8 +178,9 @@ URL actually embedded in the binary before publishing.
   ping using the ESP32's own lwIP stack, i.e. it exercises the PPP link
   itself; returns resolved IPs, RTT stats, and a ping-style transcript.
   Blocks up to ~20 s for an unreachable host.
-- `POST /api/bms` — `{"enabled":true,"sim":false}` (both optional) toggle
-  BMS polling / simulated data; persisted in NVS
+- `POST /api/bms` — `{"enabled":true,"sim":false,"tx_pin":1,"rx_pin":2}` (all
+  optional) toggle BMS polling / simulated data and set the UART TX/RX GPIOs
+  (0-48, distinct); persisted in NVS
 - `GET /api/mqtt` — broker config (password never echoed, only
   `password_set`)
 - `POST /api/mqtt` — partial update of
