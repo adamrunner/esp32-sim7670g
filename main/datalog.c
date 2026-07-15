@@ -182,7 +182,10 @@ static void sd_flush(void)
     bool fresh = stat(path, &st) != 0;
     FILE *f = fopen(path, "a");
     if (!f) {
-        ESP_LOGW(TAG, "fopen(%s) failed: %d", path, errno);
+        // EINVAL on a date-stamped name usually means FATFS long filenames
+        // are off (stale sdkconfig missing CONFIG_FATFS_LFN_HEAP=y).
+        ESP_LOGW(TAG, "fopen(%s) failed: %d%s", path, errno,
+                 errno == EINVAL ? " (FATFS LFN disabled?)" : "");
         s_sd_buf_len = 0;
         return;
     }
