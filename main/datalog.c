@@ -22,6 +22,7 @@
 
 static const char *TAG = "datalog";
 
+#define NVS_NS             "logcfg"   // matches the NVS_NS convention in bms.c/mqtt.c
 #define QUEUE_DEPTH        8
 #define DL_LINE_MAX           640   // 23 cols + 16 cells + 8 temps fits well under this
 #define SD_DIR             SDCARD_MOUNT_POINT "/bms"
@@ -56,7 +57,7 @@ void datalog_device_id(char *out, size_t out_len)
     static char cached[48];
     if (!cached[0]) {
         nvs_handle_t nvs;
-        if (nvs_open("logcfg", NVS_READONLY, &nvs) == ESP_OK) {
+        if (nvs_open(NVS_NS, NVS_READONLY, &nvs) == ESP_OK) {
             size_t len = sizeof(cached);
             nvs_get_str(nvs, "device_id", cached, &len);
             nvs_close(nvs);

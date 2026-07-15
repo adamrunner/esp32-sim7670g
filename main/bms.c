@@ -181,7 +181,7 @@ static void publish_reading(const jbd_bms_data_t *d)
         s_status.peak_power_w = fabsf(d->power);
     }
 
-    s_status.cell_count = d->cellCount < 16 ? d->cellCount : 16;
+    s_status.cell_count = d->cellCount < BMS_MAX_CELLS ? d->cellCount : BMS_MAX_CELLS;
     for (int i = 0; i < s_status.cell_count; i++) {
         s_status.cell_v[i] = d->cellVoltages[i];
     }
@@ -190,7 +190,7 @@ static void publish_reading(const jbd_bms_data_t *d)
     s_status.min_cell_num = d->minCellNumber;
     s_status.max_cell_num = d->maxCellNumber;
 
-    s_status.temp_count = d->temperatureCount < 8 ? d->temperatureCount : 8;
+    s_status.temp_count = d->temperatureCount < BMS_MAX_TEMPS ? d->temperatureCount : BMS_MAX_TEMPS;
     for (int i = 0; i < s_status.temp_count; i++) {
         s_status.temp_c[i] = d->temperatures[i];
     }

@@ -25,6 +25,22 @@ static esp_err_t root_get_handler(httpd_req_t *req)
                            index_html_end - index_html_start);
 }
 
+// Serialize `root` as the JSON response, then free both the printed string and
+// the tree. Takes ownership of `root` (freed even on error), so no handler has
+// to repeat the print/send/free/delete dance or risk leaking a branch.
+static esp_err_t send_json(httpd_req_t *req, cJSON *root)
+{
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json encode failed");
+    }
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t err = httpd_resp_sendstr(req, json);
+    cJSON_free(json);
+    return err;
+}
+
 // Aggregate every module's status into one JSON document. Each module owns the
 // serialization of its own fields (and the domain knowledge behind them); this
 // handler just stitches the pieces together and ships the result.
@@ -36,13 +52,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     mqtt_status_json(root);       // "mqtt"
     datalog_status_json(root);    // "datalog"
     timesync_status_json(root);   // "time"
-
-    char *json = cJSON_PrintUnformatted(root);
-    httpd_resp_set_type(req, "application/json");
-    esp_err_t err = httpd_resp_sendstr(req, json);
-    cJSON_free(json);
-    cJSON_Delete(root);
-    return err;
+    return send_json(req, root);
 }
 
 // Read and null-terminate a small JSON request body.
@@ -110,12 +120,7 @@ static esp_err_t at_post_handler(httpd_req_t *req)
     cJSON_AddBoolToObject(out, "ok", at_err == ESP_OK);
     cJSON_AddBoolToObject(out, "timeout", at_err == ESP_ERR_TIMEOUT);
     cJSON_AddStringToObject(out, "response", resp);
-    char *json = cJSON_PrintUnformatted(out);
-    httpd_resp_set_type(req, "application/json");
-    esp_err_t err = httpd_resp_sendstr(req, json);
-    cJSON_free(json);
-    cJSON_Delete(out);
-    return err;
+    return send_json(req, out);
 }
 
 static esp_err_t ping_post_handler(httpd_req_t *req)
@@ -154,13 +159,7 @@ static esp_err_t ping_post_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(out, "max_ms", diag.max_ms);
     cJSON_AddNumberToObject(out, "avg_ms", diag.avg_ms);
     cJSON_AddStringToObject(out, "raw", diag.raw);
-
-    char *json = cJSON_PrintUnformatted(out);
-    httpd_resp_set_type(req, "application/json");
-    esp_err_t send_err = httpd_resp_sendstr(req, json);
-    cJSON_free(json);
-    cJSON_Delete(out);
-    return send_err;
+    return send_json(req, out);
 }
 
 static const char *ota_state_str(ota_state_t s)
@@ -197,13 +196,7 @@ static esp_err_t ota_get_handler(httpd_req_t *req)
                                 (double)((esp_timer_get_time() - st.last_check_us) / 1000000));
     }
     cJSON_AddNumberToObject(root, "free_heap", (double)esp_get_free_heap_size());
-
-    char *json = cJSON_PrintUnformatted(root);
-    httpd_resp_set_type(req, "application/json");
-    esp_err_t err = httpd_resp_sendstr(req, json);
-    cJSON_free(json);
-    cJSON_Delete(root);
-    return err;
+    return send_json(req, root);
 }
 
 static esp_err_t ota_check_post_handler(httpd_req_t *req)
@@ -268,13 +261,7 @@ static esp_err_t wifi_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "rssi_dbm", st.rssi_dbm);
     cJSON_AddStringToObject(root, "ap_ssid", st.ap_ssid);
     cJSON_AddNumberToObject(root, "disconnects", st.disconnect_count);
-
-    char *json = cJSON_PrintUnformatted(root);
-    httpd_resp_set_type(req, "application/json");
-    esp_err_t err = httpd_resp_sendstr(req, json);
-    cJSON_free(json);
-    cJSON_Delete(root);
-    return err;
+    return send_json(req, root);
 }
 
 static esp_err_t wifi_post_handler(httpd_req_t *req)
@@ -320,7 +307,7 @@ static esp_err_t bms_post_handler(httpd_req_t *req)
     cJSON *root = cJSON_Parse(body);
     if (!root) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                                   "expected {\"enabled\":true,\"sim\":false}");
+                                   "expected {\"enabled\":true,\"sim\":false,\"tx_pin\":1,\"rx_pin\":2}");
     }
 
     bms_status_t cur;
@@ -359,13 +346,7 @@ static esp_err_t mqtt_get_handler(httpd_req_t *req)
     cJSON_AddStringToObject(root, "username", cfg.username);
     cJSON_AddBoolToObject(root, "password_set", cfg.password[0] != '\0');
     cJSON_AddStringToObject(root, "base_topic", cfg.base_topic);
-
-    char *json = cJSON_PrintUnformatted(root);
-    httpd_resp_set_type(req, "application/json");
-    esp_err_t err = httpd_resp_sendstr(req, json);
-    cJSON_free(json);
-    cJSON_Delete(root);
-    return err;
+    return send_json(req, root);
 }
 
 // Partial update: only the keys present change; omitting "password" keeps

@@ -15,6 +15,11 @@
 #define BMS_RX_PIN     2
 #define BMS_BAUD       9600
 
+// Status-snapshot widths (not a JBD limit — the driver reports more; these
+// cap what the web UI / telemetry carry).
+#define BMS_MAX_CELLS  16
+#define BMS_MAX_TEMPS  8
+
 typedef struct {
     bool enabled;             // polling enabled (NVS bmscfg/enabled)
     bool sim;                 // synthetic data mode (NVS bmscfg/sim)
@@ -38,12 +43,12 @@ typedef struct {
     float peak_power_w;
 
     int cell_count;
-    float cell_v[16];
+    float cell_v[BMS_MAX_CELLS];
     float min_cell_v, max_cell_v;
     int min_cell_num, max_cell_num;
 
     int temp_count;
-    float temp_c[8];
+    float temp_c[BMS_MAX_TEMPS];
     float min_temp_c, max_temp_c;
 
     bool charging_enabled;    // charge FET on
