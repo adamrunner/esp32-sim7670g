@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "cJSON.h"
 
 // MQTT telemetry reporting over whichever link is up (WiFi STA or cellular
 // PPP — plain sockets on the default route, so no AT/PPP contention). The
@@ -47,6 +48,9 @@ esp_err_t mqtt_set_config(const mqtt_config_t *cfg);
 
 void mqtt_get_config(mqtt_config_t *out);
 void mqtt_get_status(mqtt_status_t *out);
+
+// Append the "mqtt" runtime-status object to the shared /api/status response.
+void mqtt_status_json(cJSON *root);
 bool mqtt_connected(void);
 
 // Publish one telemetry payload to "<base_topic>/<device_id>" at QoS 1 and

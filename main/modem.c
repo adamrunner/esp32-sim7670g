@@ -16,6 +16,7 @@
 #include "esp_netif.h"
 #include "esp_netif_ppp.h"
 #include "esp_timer.h"
+#include "cJSON.h"
 #include "lwip/inet.h"
 #include "lwip/ip_addr.h"
 #include "lwip/netdb.h"
@@ -458,6 +459,62 @@ void modem_get_status(modem_status_t *out)
     xSemaphoreGive(s_status_mutex);
     uint32_t baud = 0;
     out->uart_baud = uart_get_baudrate(MODEM_UART, &baud) == ESP_OK ? (int)baud : 0;
+}
+
+static const char *reg_status_str(int stat)
+{
+    switch (stat) {
+    case 0: return "not registered";
+    case 1: return "registered (home)";
+    case 2: return "searching";
+    case 3: return "registration denied";
+    case 4: return "unknown";
+    case 5: return "registered (roaming)";
+    default: return "?";
+    }
+}
+
+// Append the modem + GNSS status to the shared /api/status object.
+void modem_status_json(cJSON *root)
+{
+    modem_status_t st;
+    modem_get_status(&st);
+    cJSON_AddBoolToObject(root, "modem_ok", st.at_ok);
+    cJSON_AddBoolToObject(root, "sim_ready", st.sim_ready);
+    cJSON_AddNumberToObject(root, "reg_status", st.reg_status);
+    cJSON_AddStringToObject(root, "reg_text", reg_status_str(st.reg_status));
+    cJSON_AddBoolToObject(root, "pdp_active", st.pdp_active);
+    cJSON_AddBoolToObject(root, "ppp_up", st.ppp_up);
+    cJSON_AddNumberToObject(root, "rssi_dbm", st.rssi_dbm);
+    cJSON_AddStringToObject(root, "model", st.model);
+    cJSON_AddStringToObject(root, "fw_rev", st.fw_rev);
+    cJSON_AddStringToObject(root, "imei", st.imei);
+    cJSON_AddStringToObject(root, "iccid", st.iccid);
+    cJSON_AddStringToObject(root, "operator", st.operator_name);
+    cJSON_AddStringToObject(root, "rat", st.rat);
+    cJSON_AddStringToObject(root, "band", st.band);
+    cJSON_AddNumberToObject(root, "uart_baud", st.uart_baud);
+    cJSON_AddStringToObject(root, "ip", st.ip_addr);
+    cJSON_AddStringToObject(root, "apn", st.apn);
+
+    modem_gnss_t g;
+    modem_get_gnss(&g);
+    cJSON *gnss = cJSON_AddObjectToObject(root, "gnss");
+    cJSON_AddBoolToObject(gnss, "powered", g.powered);
+    cJSON_AddBoolToObject(gnss, "fix", g.has_fix);
+    cJSON_AddNumberToObject(gnss, "sats", g.sats);
+    cJSON_AddNumberToObject(gnss, "sats_used", g.sats_used);
+    cJSON_AddNumberToObject(gnss, "hdop", g.hdop);
+    if (g.fix_time_us) {    // last known position, even if the current poll lost the fix
+        cJSON_AddNumberToObject(gnss, "lat", g.lat);
+        cJSON_AddNumberToObject(gnss, "lon", g.lon);
+        cJSON_AddNumberToObject(gnss, "alt_m", g.alt_m);
+        cJSON_AddNumberToObject(gnss, "speed_kmh", g.speed_kmh);
+        cJSON_AddNumberToObject(gnss, "course_deg", g.course_deg);
+        cJSON_AddStringToObject(gnss, "utc", g.utc);
+        int64_t fix_age_s = (esp_timer_get_time() - g.fix_time_us) / 1000000;
+        cJSON_AddNumberToObject(gnss, "fix_age_s", (double)fix_age_s);
+    }
 }
 
 // One-time identity queries once the modem answers.

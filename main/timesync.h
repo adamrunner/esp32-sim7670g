@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <time.h>
+#include "cJSON.h"
 
 // Wall-clock time for timestamped telemetry. Two sources, best wins:
 //  - SNTP over whichever link is up (WiFi STA or cellular PPP), started as
@@ -31,3 +32,6 @@ void timesync_init(void);
 bool timesync_valid(void);
 
 void timesync_get_status(timesync_status_t *out);
+
+// Append the "time" object to the shared /api/status response.
+void timesync_status_json(cJSON *root);

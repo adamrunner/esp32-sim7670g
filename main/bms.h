@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "cJSON.h"
 #include "jbd_bms.h"
 
 // JBD BMS on the 4S4P LiFePO4 house battery, polled over UART2 at 9600.
@@ -57,6 +58,9 @@ typedef struct {
 void bms_init(void);
 
 void bms_get_status(bms_status_t *out);
+
+// Append the "bms" object to the shared /api/status response.
+void bms_status_json(cJSON *root);
 
 // Persist enable/sim flags and the UART TX/RX GPIOs to NVS; takes effect within
 // one poll cycle. Changing the pins (e.g. to swap TX/RX when the BMS is wired

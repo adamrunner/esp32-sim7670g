@@ -25,151 +25,17 @@ static esp_err_t root_get_handler(httpd_req_t *req)
                            index_html_end - index_html_start);
 }
 
-static const char *reg_status_str(int stat)
-{
-    switch (stat) {
-    case 0: return "not registered";
-    case 1: return "registered (home)";
-    case 2: return "searching";
-    case 3: return "registration denied";
-    case 4: return "unknown";
-    case 5: return "registered (roaming)";
-    default: return "?";
-    }
-}
-
+// Aggregate every module's status into one JSON document. Each module owns the
+// serialization of its own fields (and the domain knowledge behind them); this
+// handler just stitches the pieces together and ships the result.
 static esp_err_t status_get_handler(httpd_req_t *req)
 {
-    modem_status_t st;
-    modem_get_status(&st);
-
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddBoolToObject(root, "modem_ok", st.at_ok);
-    cJSON_AddBoolToObject(root, "sim_ready", st.sim_ready);
-    cJSON_AddNumberToObject(root, "reg_status", st.reg_status);
-    cJSON_AddStringToObject(root, "reg_text", reg_status_str(st.reg_status));
-    cJSON_AddBoolToObject(root, "pdp_active", st.pdp_active);
-    cJSON_AddBoolToObject(root, "ppp_up", st.ppp_up);
-    cJSON_AddNumberToObject(root, "rssi_dbm", st.rssi_dbm);
-    cJSON_AddStringToObject(root, "model", st.model);
-    cJSON_AddStringToObject(root, "fw_rev", st.fw_rev);
-    cJSON_AddStringToObject(root, "imei", st.imei);
-    cJSON_AddStringToObject(root, "iccid", st.iccid);
-    cJSON_AddStringToObject(root, "operator", st.operator_name);
-    cJSON_AddStringToObject(root, "rat", st.rat);
-    cJSON_AddStringToObject(root, "band", st.band);
-    cJSON_AddNumberToObject(root, "uart_baud", st.uart_baud);
-    cJSON_AddStringToObject(root, "ip", st.ip_addr);
-    cJSON_AddStringToObject(root, "apn", st.apn);
-
-    modem_gnss_t g;
-    modem_get_gnss(&g);
-    cJSON *gnss = cJSON_AddObjectToObject(root, "gnss");
-    cJSON_AddBoolToObject(gnss, "powered", g.powered);
-    cJSON_AddBoolToObject(gnss, "fix", g.has_fix);
-    cJSON_AddNumberToObject(gnss, "sats", g.sats);
-    cJSON_AddNumberToObject(gnss, "sats_used", g.sats_used);
-    cJSON_AddNumberToObject(gnss, "hdop", g.hdop);
-    if (g.fix_time_us) {    // last known position, even if the current poll lost the fix
-        cJSON_AddNumberToObject(gnss, "lat", g.lat);
-        cJSON_AddNumberToObject(gnss, "lon", g.lon);
-        cJSON_AddNumberToObject(gnss, "alt_m", g.alt_m);
-        cJSON_AddNumberToObject(gnss, "speed_kmh", g.speed_kmh);
-        cJSON_AddNumberToObject(gnss, "course_deg", g.course_deg);
-        cJSON_AddStringToObject(gnss, "utc", g.utc);
-        int64_t fix_age_s = (esp_timer_get_time() - g.fix_time_us) / 1000000;
-        cJSON_AddNumberToObject(gnss, "fix_age_s", (double)fix_age_s);
-    }
-
-    bms_status_t b;
-    bms_get_status(&b);
-    cJSON *bms = cJSON_AddObjectToObject(root, "bms");
-    cJSON_AddBoolToObject(bms, "enabled", b.enabled);
-    cJSON_AddBoolToObject(bms, "sim", b.sim);
-    cJSON_AddNumberToObject(bms, "tx_pin", b.tx_pin);
-    cJSON_AddNumberToObject(bms, "rx_pin", b.rx_pin);
-    cJSON_AddBoolToObject(bms, "comm_ok", b.comm_ok);
-    cJSON_AddBoolToObject(bms, "ever_ok", b.ever_ok);
-    cJSON_AddNumberToObject(bms, "polls", b.poll_count);
-    cJSON_AddNumberToObject(bms, "fails", b.fail_count);
-    if (b.ever_ok || b.sim) {
-        cJSON_AddNumberToObject(bms, "pack_v", b.pack_voltage_v);
-        cJSON_AddNumberToObject(bms, "current_a", b.pack_current_a);
-        cJSON_AddNumberToObject(bms, "soc_pct", b.soc_pct);
-        cJSON_AddNumberToObject(bms, "power_w", b.power_w);
-        cJSON_AddNumberToObject(bms, "capacity_ah", b.capacity_ah);
-        cJSON_AddNumberToObject(bms, "full_capacity_ah", b.full_capacity_ah);
-        cJSON_AddNumberToObject(bms, "energy_wh", b.total_energy_wh);
-        cJSON *cells = cJSON_AddArrayToObject(bms, "cells");
-        for (int i = 0; i < b.cell_count; i++) {
-            cJSON_AddItemToArray(cells, cJSON_CreateNumber(b.cell_v[i]));
-        }
-        cJSON *temps = cJSON_AddArrayToObject(bms, "temps");
-        for (int i = 0; i < b.temp_count; i++) {
-            cJSON_AddItemToArray(temps, cJSON_CreateNumber(b.temp_c[i]));
-        }
-        cJSON_AddBoolToObject(bms, "charge_fet", b.charging_enabled);
-        cJSON_AddBoolToObject(bms, "discharge_fet", b.discharging_enabled);
-        cJSON_AddBoolToObject(bms, "balancing", b.balancing);
-        // Active protection flags only; an empty array means all clear.
-        cJSON *prot = cJSON_AddArrayToObject(bms, "protection");
-        const struct { const char *name; unsigned set; } flags[] = {
-            {"cell_overvolt", b.protection.sover}, {"cell_undervolt", b.protection.sunder},
-            {"pack_overvolt", b.protection.gover}, {"pack_undervolt", b.protection.gunder},
-            {"charge_overtemp", b.protection.chitemp}, {"charge_undertemp", b.protection.clowtemp},
-            {"discharge_overtemp", b.protection.dhitemp}, {"discharge_undertemp", b.protection.dlowtemp},
-            {"charge_overcurrent", b.protection.cover}, {"discharge_overcurrent", b.protection.cunder},
-            {"short_circuit", b.protection.shorted}, {"ic_error", b.protection.ic},
-            {"mos_lock", b.protection.mos},
-        };
-        for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
-            if (flags[i].set) {
-                cJSON_AddItemToArray(prot, cJSON_CreateString(flags[i].name));
-            }
-        }
-        if (b.last_ok_us) {
-            cJSON_AddNumberToObject(bms, "age_s",
-                                    (double)((esp_timer_get_time() - b.last_ok_us) / 1000000));
-        }
-    }
-
-    mqtt_status_t m;
-    mqtt_get_status(&m);
-    cJSON *mq = cJSON_AddObjectToObject(root, "mqtt");
-    cJSON_AddStringToObject(mq, "state", m.state == MQTT_UI_CONNECTED  ? "connected"
-                                       : m.state == MQTT_UI_CONNECTING ? "connecting"
-                                                                       : "disabled");
-    cJSON_AddStringToObject(mq, "uri", m.uri);
-    cJSON_AddStringToObject(mq, "base_topic", m.base_topic);
-    cJSON_AddNumberToObject(mq, "published", m.published);
-    cJSON_AddNumberToObject(mq, "publish_fails", m.publish_fails);
-    cJSON_AddStringToObject(mq, "last_error", m.last_error);
-
-    datalog_status_t d;
-    datalog_get_status(&d);
-    char device_id[48];
-    datalog_device_id(device_id, sizeof(device_id));
-    cJSON *dl = cJSON_AddObjectToObject(root, "datalog");
-    cJSON_AddStringToObject(dl, "device_id", device_id);
-    cJSON_AddNumberToObject(dl, "rows", d.rows);
-    cJSON_AddNumberToObject(dl, "dropped", d.dropped);
-    cJSON_AddBoolToObject(dl, "sd_ok", d.sd_ok);
-    cJSON_AddStringToObject(dl, "sd_file", d.sd_file);
-    cJSON_AddNumberToObject(dl, "sd_rows", d.sd_rows);
-    cJSON_AddNumberToObject(dl, "mqtt_rows", d.mqtt_rows);
-    cJSON_AddNumberToObject(dl, "spool_pending", d.spool_pending);
-    cJSON_AddNumberToObject(dl, "spool_replayed", d.spool_replayed);
-
-    timesync_status_t ts;
-    timesync_get_status(&ts);
-    cJSON *tm = cJSON_AddObjectToObject(root, "time");
-    cJSON_AddBoolToObject(tm, "valid", ts.source != TIMESYNC_NONE);
-    cJSON_AddStringToObject(tm, "source", ts.source == TIMESYNC_SNTP ? "sntp"
-                                        : ts.source == TIMESYNC_GNSS ? "gnss"
-                                                                     : "none");
-    if (ts.source != TIMESYNC_NONE) {
-        cJSON_AddNumberToObject(tm, "epoch", (double)time(NULL));
-    }
+    modem_status_json(root);      // modem fields + "gnss"
+    bms_status_json(root);        // "bms"
+    mqtt_status_json(root);       // "mqtt"
+    datalog_status_json(root);    // "datalog"
+    timesync_status_json(root);   // "time"
 
     char *json = cJSON_PrintUnformatted(root);
     httpd_resp_set_type(req, "application/json");

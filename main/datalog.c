@@ -13,6 +13,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
+#include "cJSON.h"
 #include "nvs.h"
 
 #include "mqtt.h"
@@ -416,4 +417,24 @@ void datalog_get_status(datalog_status_t *out)
     out->sd_ok = sdcard_mounted() && !s_sd_full;
     out->spool_pending = s_spool_size > s_spool_cursor
                        ? (uint32_t)(s_spool_size - s_spool_cursor) : 0;
+}
+
+// Append the "datalog" object (plus the node's device_id) to /api/status.
+void datalog_status_json(cJSON *root)
+{
+    datalog_status_t d;
+    datalog_get_status(&d);
+    char device_id[48];
+    datalog_device_id(device_id, sizeof(device_id));
+
+    cJSON *dl = cJSON_AddObjectToObject(root, "datalog");
+    cJSON_AddStringToObject(dl, "device_id", device_id);
+    cJSON_AddNumberToObject(dl, "rows", d.rows);
+    cJSON_AddNumberToObject(dl, "dropped", d.dropped);
+    cJSON_AddBoolToObject(dl, "sd_ok", d.sd_ok);
+    cJSON_AddStringToObject(dl, "sd_file", d.sd_file);
+    cJSON_AddNumberToObject(dl, "sd_rows", d.sd_rows);
+    cJSON_AddNumberToObject(dl, "mqtt_rows", d.mqtt_rows);
+    cJSON_AddNumberToObject(dl, "spool_pending", d.spool_pending);
+    cJSON_AddNumberToObject(dl, "spool_replayed", d.spool_replayed);
 }

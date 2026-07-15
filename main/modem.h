@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include "esp_err.h"
 #include "esp_netif.h"
+#include "cJSON.h"
 
 #define MODEM_APN_MAX 64
 
@@ -54,6 +55,10 @@ void modem_get_gnss(modem_gnss_t *out);
 
 // Thread-safe snapshot of the latest modem status.
 void modem_get_status(modem_status_t *out);
+
+// Append modem + GNSS status (top-level fields plus a "gnss" object) to the
+// shared /api/status response object.
+void modem_status_json(cJSON *root);
 
 // Send a raw AT command and capture the response (thread-safe).
 // resp receives everything read until OK/ERROR or timeout.

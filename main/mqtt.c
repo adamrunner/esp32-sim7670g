@@ -8,6 +8,7 @@
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
 #include "mqtt_client.h"
+#include "cJSON.h"
 #include "nvs.h"
 
 #include "datalog.h"
@@ -197,6 +198,22 @@ void mqtt_get_status(mqtt_status_t *out)
                : s_connected                            ? MQTT_UI_CONNECTED
                                                         : MQTT_UI_CONNECTING;
     xSemaphoreGive(s_mutex);
+}
+
+// Append the "mqtt" runtime-status object to the shared /api/status response.
+void mqtt_status_json(cJSON *root)
+{
+    mqtt_status_t m;
+    mqtt_get_status(&m);
+    cJSON *mq = cJSON_AddObjectToObject(root, "mqtt");
+    cJSON_AddStringToObject(mq, "state", m.state == MQTT_UI_CONNECTED  ? "connected"
+                                       : m.state == MQTT_UI_CONNECTING ? "connecting"
+                                                                       : "disabled");
+    cJSON_AddStringToObject(mq, "uri", m.uri);
+    cJSON_AddStringToObject(mq, "base_topic", m.base_topic);
+    cJSON_AddNumberToObject(mq, "published", m.published);
+    cJSON_AddNumberToObject(mq, "publish_fails", m.publish_fails);
+    cJSON_AddStringToObject(mq, "last_error", m.last_error);
 }
 
 esp_err_t mqtt_publish_telemetry(const char *payload)

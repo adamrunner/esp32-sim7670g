@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <time.h>
+#include "cJSON.h"
 
 // Telemetry pipeline: producers hand in snapshots, a background task fans
 // them out to sinks so sampling never blocks on I/O. Sinks today:
@@ -69,6 +70,9 @@ void datalog_init(void);
 void datalog_submit(const bms_snapshot_t *snap);
 
 void datalog_get_status(datalog_status_t *out);
+
+// Append the "datalog" object (plus the node's device_id) to /api/status.
+void datalog_status_json(cJSON *root);
 
 // This node's telemetry identity: NVS logcfg/device_id if set, else
 // "gw-" + the last three MAC octets. Used as CSV column 1 and MQTT topic

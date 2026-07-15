@@ -9,6 +9,7 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "cJSON.h"
 #include "nvs.h"
 
 #include "datalog.h"
@@ -90,6 +91,65 @@ void bms_get_status(bms_status_t *out)
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     *out = s_status;
     xSemaphoreGive(s_mutex);
+}
+
+// Append the "bms" object to the shared /api/status response.
+void bms_status_json(cJSON *root)
+{
+    bms_status_t b;
+    bms_get_status(&b);
+
+    cJSON *bms = cJSON_AddObjectToObject(root, "bms");
+    cJSON_AddBoolToObject(bms, "enabled", b.enabled);
+    cJSON_AddBoolToObject(bms, "sim", b.sim);
+    cJSON_AddNumberToObject(bms, "tx_pin", b.tx_pin);
+    cJSON_AddNumberToObject(bms, "rx_pin", b.rx_pin);
+    cJSON_AddBoolToObject(bms, "comm_ok", b.comm_ok);
+    cJSON_AddBoolToObject(bms, "ever_ok", b.ever_ok);
+    cJSON_AddNumberToObject(bms, "polls", b.poll_count);
+    cJSON_AddNumberToObject(bms, "fails", b.fail_count);
+    if (b.ever_ok || b.sim) {
+        cJSON_AddNumberToObject(bms, "pack_v", b.pack_voltage_v);
+        cJSON_AddNumberToObject(bms, "current_a", b.pack_current_a);
+        cJSON_AddNumberToObject(bms, "soc_pct", b.soc_pct);
+        cJSON_AddNumberToObject(bms, "power_w", b.power_w);
+        cJSON_AddNumberToObject(bms, "capacity_ah", b.capacity_ah);
+        cJSON_AddNumberToObject(bms, "full_capacity_ah", b.full_capacity_ah);
+        cJSON_AddNumberToObject(bms, "energy_wh", b.total_energy_wh);
+        cJSON *cells = cJSON_AddArrayToObject(bms, "cells");
+        for (int i = 0; i < b.cell_count; i++) {
+            cJSON_AddItemToArray(cells, cJSON_CreateNumber(b.cell_v[i]));
+        }
+        cJSON *temps = cJSON_AddArrayToObject(bms, "temps");
+        for (int i = 0; i < b.temp_count; i++) {
+            cJSON_AddItemToArray(temps, cJSON_CreateNumber(b.temp_c[i]));
+        }
+        cJSON_AddBoolToObject(bms, "charge_fet", b.charging_enabled);
+        cJSON_AddBoolToObject(bms, "discharge_fet", b.discharging_enabled);
+        cJSON_AddBoolToObject(bms, "balancing", b.balancing);
+        // Active protection flags only; an empty array means all clear. The
+        // name↔bit mapping lives here, next to the jbd_protect_t definition it
+        // describes, rather than in the web layer.
+        cJSON *prot = cJSON_AddArrayToObject(bms, "protection");
+        const struct { const char *name; unsigned set; } flags[] = {
+            {"cell_overvolt", b.protection.sover}, {"cell_undervolt", b.protection.sunder},
+            {"pack_overvolt", b.protection.gover}, {"pack_undervolt", b.protection.gunder},
+            {"charge_overtemp", b.protection.chitemp}, {"charge_undertemp", b.protection.clowtemp},
+            {"discharge_overtemp", b.protection.dhitemp}, {"discharge_undertemp", b.protection.dlowtemp},
+            {"charge_overcurrent", b.protection.cover}, {"discharge_overcurrent", b.protection.cunder},
+            {"short_circuit", b.protection.shorted}, {"ic_error", b.protection.ic},
+            {"mos_lock", b.protection.mos},
+        };
+        for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
+            if (flags[i].set) {
+                cJSON_AddItemToArray(prot, cJSON_CreateString(flags[i].name));
+            }
+        }
+        if (b.last_ok_us) {
+            cJSON_AddNumberToObject(bms, "age_s",
+                                    (double)((esp_timer_get_time() - b.last_ok_us) / 1000000));
+        }
+    }
 }
 
 // Copy the driver's parsed data into the shared status snapshot and

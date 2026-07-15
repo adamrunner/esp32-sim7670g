@@ -12,6 +12,7 @@
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
 #include "esp_timer.h"
+#include "cJSON.h"
 
 #include "modem.h"
 
@@ -49,6 +50,21 @@ void timesync_get_status(timesync_status_t *out)
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     *out = s_status;
     xSemaphoreGive(s_mutex);
+}
+
+// Append the "time" object to the shared /api/status response.
+void timesync_status_json(cJSON *root)
+{
+    timesync_status_t ts;
+    timesync_get_status(&ts);
+    cJSON *tm = cJSON_AddObjectToObject(root, "time");
+    cJSON_AddBoolToObject(tm, "valid", ts.source != TIMESYNC_NONE);
+    cJSON_AddStringToObject(tm, "source", ts.source == TIMESYNC_SNTP ? "sntp"
+                                        : ts.source == TIMESYNC_GNSS ? "gnss"
+                                                                     : "none");
+    if (ts.source != TIMESYNC_NONE) {
+        cJSON_AddNumberToObject(tm, "epoch", (double)time(NULL));
+    }
 }
 
 static void on_sntp_sync(struct timeval *tv)
