@@ -73,27 +73,63 @@ void datalog_device_id(char *out, size_t out_len)
 // ---------------------------------------------------------------------------
 // CSV serialization — byte-compatible with esp32-bms-monitor / bms-dashboard.
 
+// The fixed CSV columns, defined once so the header and every data row are
+// generated from this single list and can never drift out of column alignment.
+// Each entry is (header label, printf spec, value expression); the value
+// expressions read `s` (the snapshot) plus the `device_id`/`hms` locals that
+// serialize_csv sets up. write_csv_header expands the same list but uses only
+// the label. The variable-width cell/temp columns follow, handled separately.
+// This layout is byte-compatible with esp32-bms-monitor / bms-dashboard: only
+// append new columns (with their value here), never reorder or insert.
+#define BMS_CSV_FIXED_COLUMNS(X) \
+    X("device_id",             "%s",   device_id) \
+    X("timestamp",             "%lld", (long long)s->real_timestamp) \
+    X("elapsed_sec",           "%u",   (unsigned)s->elapsed_sec) \
+    X("hours:minutes:seconds", "%s",   hms) \
+    X("total_energy_wh",       "%.3f", s->total_energy_wh) \
+    X("pack_voltage_v",        "%.2f", s->pack_voltage_v) \
+    X("pack_current_a",        "%.2f", s->pack_current_a) \
+    X("soc_pct",               "%.1f", s->soc_pct) \
+    X("power_w",               "%.2f", s->power_w) \
+    X("full_capacity_ah",      "%.2f", s->full_capacity_ah) \
+    X("peak_current_a",        "%.2f", s->peak_current_a) \
+    X("peak_power_w",          "%.2f", s->peak_power_w) \
+    X("cell_count",            "%d",   s->cell_count) \
+    X("min_cell_voltage_v",    "%.3f", s->min_cell_voltage_v) \
+    X("min_cell_num",          "%d",   s->min_cell_num) \
+    X("max_cell_voltage_v",    "%.3f", s->max_cell_voltage_v) \
+    X("max_cell_num",          "%d",   s->max_cell_num) \
+    X("cell_voltage_delta_v",  "%.3f", s->cell_voltage_delta_v) \
+    X("temp_count",            "%d",   s->temp_count) \
+    X("min_temp_c",            "%.1f", s->min_temp_c) \
+    X("max_temp_c",            "%.1f", s->max_temp_c) \
+    X("charging_enabled",      "%d",   s->charging_enabled ? 1 : 0) \
+    X("discharging_enabled",   "%d",   s->discharging_enabled ? 1 : 0)
+
 static int serialize_csv(const bms_snapshot_t *s, char *out, size_t out_len)
 {
     char device_id[48];
     datalog_device_id(device_id, sizeof(device_id));
 
-    unsigned hours = s->elapsed_sec / 3600;
-    unsigned minutes = (s->elapsed_sec % 3600) / 60;
-    unsigned seconds = s->elapsed_sec % 60;
+    char hms[16];
+    snprintf(hms, sizeof(hms), "%02u:%02u:%02u",
+             (unsigned)(s->elapsed_sec / 3600),
+             (unsigned)(s->elapsed_sec % 3600 / 60),
+             (unsigned)(s->elapsed_sec % 60));
 
-    int n = snprintf(out, out_len,
-        "%s,%lld,%u,%02u:%02u:%02u,%.3f,%.2f,%.2f,%.1f,%.2f,%.2f,%.2f,%.2f,%d,%.3f,%d,%.3f,%d,%.3f,%d,%.1f,%.1f,%d,%d",
-        device_id,
-        (long long)s->real_timestamp,
-        (unsigned)s->elapsed_sec, hours, minutes, seconds,
-        s->total_energy_wh,
-        s->pack_voltage_v, s->pack_current_a, s->soc_pct, s->power_w,
-        s->full_capacity_ah, s->peak_current_a, s->peak_power_w, s->cell_count,
-        s->min_cell_voltage_v, s->min_cell_num, s->max_cell_voltage_v,
-        s->max_cell_num, s->cell_voltage_delta_v, s->temp_count,
-        s->min_temp_c, s->max_temp_c, s->charging_enabled ? 1 : 0,
-        s->discharging_enabled ? 1 : 0);
+    // Accumulate the would-be length like a single snprintf would, so an
+    // overflow still returns >= out_len and the caller drops the row; never
+    // write past the buffer (dst=NULL / rem=0 once full).
+    int n = 0, col = 0;
+    #define X(label, spec, val) do { \
+        if (col++ && (size_t)n < out_len) out[n] = ','; \
+        if (col > 1) n++; \
+        size_t rem = (size_t)n < out_len ? out_len - (size_t)n : 0; \
+        char *dst = (size_t)n < out_len ? out + n : NULL; \
+        n += snprintf(dst, rem, spec, val); \
+    } while (0);
+    BMS_CSV_FIXED_COLUMNS(X)
+    #undef X
 
     int cells = s->cell_count < DATALOG_MAX_CELLS ? s->cell_count : DATALOG_MAX_CELLS;
     for (int i = 0; i < cells && n < (int)out_len; i++) {
@@ -110,11 +146,10 @@ static int serialize_csv(const bms_snapshot_t *s, char *out, size_t out_len)
 // reference); data rows carry only cell_count/temp_count value columns.
 static void write_csv_header(FILE *f)
 {
-    fputs("device_id,timestamp,elapsed_sec,hours:minutes:seconds,total_energy_wh,"
-          "pack_voltage_v,pack_current_a,soc_pct,power_w,full_capacity_ah,"
-          "peak_current_a,peak_power_w,cell_count,min_cell_voltage_v,min_cell_num,"
-          "max_cell_voltage_v,max_cell_num,cell_voltage_delta_v,temp_count,"
-          "min_temp_c,max_temp_c,charging_enabled,discharging_enabled", f);
+    int col = 0;
+    #define X(label, spec, val) fputs(col++ ? "," label : label, f);
+    BMS_CSV_FIXED_COLUMNS(X)
+    #undef X
     for (int i = 1; i <= DATALOG_MAX_CELLS; i++) {
         fprintf(f, ",cell_v_%d", i);
     }
