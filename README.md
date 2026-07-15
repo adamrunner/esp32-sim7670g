@@ -194,3 +194,24 @@ URL actually embedded in the binary before publishing.
   `{"url":"https://.../manifest.json","transport":"cell"}` to target an
   alternate manifest or pin the transfer to the cellular interface
   (both mainly for testing)
+
+## Deferred cleanups
+
+- **Factor out the NVS get/set boilerplate.** Every config module
+  (`bms.c`, `mqtt.c`, `datalog.c`, `modem.c`, `ota.c`, `wifi.c`) hand-rolls
+  the same `nvs_open` → read-with-defaults and `nvs_open` →
+  set → `nvs_commit` → `nvs_close` dance, plus the "namespace missing = use
+  defaults" fallback. A couple of thin helpers would remove ~40 lines and put
+  that fallback behavior in one place, e.g.:
+  - `nvs_get_str_default(ns, key, out, len, default)` and matching
+    `_u8`/`_i32` readers that swallow "not found" and return the default;
+  - a small scoped-write helper (open READWRITE, run a callback of
+    `nvs_set_*` calls, commit, close) so call sites can't forget the commit.
+
+  Deferred because it's low-urgency (idiomatic ESP-IDF as-is) and touches
+  `modem.c`/`ota.c`/`wifi.c` — stable modules outside recent feature work —
+  so the churn/risk isn't worth it until a new config module lands. There's
+  no shared util component yet; a new one (or a `nvsutil.[ch]` in `main/`)
+  would be the home for these. Note the NVS namespace macro is `NVS_NS` in
+  `bms.c`/`mqtt.c`/`datalog.c` but `NVS_NAMESPACE` in `modem.c`/`ota.c`/
+  `wifi.c`; standardize on one name in the same pass.
