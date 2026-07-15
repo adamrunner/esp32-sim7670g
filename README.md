@@ -38,6 +38,31 @@ web UI for monitoring/configuring the cellular connection.
   if no card is inserted it logs a warning and the rest of the app runs
   normally. Callers just `fopen("/sdcard/…")`; long filenames are enabled so
   date-stamped names like `2026-07-14.csv` aren't truncated to 8.3.
+- **JBD BMS monitor** (`main/bms.c`) — polls the JBD BMS on the 4S4P LiFePO4
+  house battery over UART2 (TX=GPIO1, RX=GPIO2, 9600 8N1; confirm against the
+  header before wiring). The protocol driver is the shared `jbd_bms` component
+  from `../esp32-shared-components` (also used by `esp32-bms-monitor`).
+  Adaptive polling: 1 s while charging/discharging, 10 s idle, quiet 30 s
+  probes while no BMS has ever answered — the firmware runs fine with nothing
+  wired. A sim mode (web UI toggle, NVS `bmscfg/sim`) generates a plausible
+  fridge-compressor duty cycle to exercise the telemetry pipeline end-to-end.
+- **Telemetry pipeline** (`main/datalog.c`) — every BMS reading becomes a CSV
+  row byte-compatible with the `esp32-bms-monitor`/`bms-dashboard` schema
+  (23 fixed columns + per-cell voltages + per-temp readings). Rows fan out
+  from a queue to: (a) the SD card, `/sdcard/bms/YYYY-MM-DD.csv` with daily
+  rotation, header-on-create, 30 s flush and a free-space guard; and (b) MQTT.
+  Rows that can't be published (no broker, coverage gap) spool to
+  `/sdcard/spool/bms.csv` and replay in order — rate-limited, cursor-tracked,
+  resumable across reboots — when the broker returns.
+- **MQTT** (`main/mqtt.c`) — IDF esp-mqtt over plain sockets on whichever
+  link is up (WiFi at home, cellular PPP otherwise; no AT/PPP contention).
+  Publishes to `<base_topic>/<device_id>` (default `bms/telemetry/gw-xxxxxx`)
+  at QoS 1, success counted only on PUBACK. Broker URI/credentials/topic are
+  set from the web UI and persist in NVS (`mqttcfg`); `mqtts://` uses the
+  bundled CA store. Unconfigured = module stays idle.
+- **Time sync** (`main/timesync.c`) — SNTP once any link is up, seeded
+  earlier by GNSS UTC when there's a fix, so telemetry timestamps are real
+  even off-WiFi. Rows before first sync carry timestamp 0.
 - **Web UI** (`main/webui.c`, `main/www/index.html`) — WiFi SoftAP
   **ESP32-SIM7670G** (password **waveshare**), then browse to
   <http://192.168.4.1/>. Shows live connection status, modem/SIM identity,
@@ -82,6 +107,11 @@ a Galileo SV count), so the parser anchors on the N/S hemisphere field
 rather than absolute positions.
 
 ## Build & flash
+
+Requires a sibling checkout of
+[`esp32-shared-components`](../esp32-shared-components) — the `jbd_bms` and
+`bms_interface` components are pulled from `../../esp32-shared-components/…`
+as component-manager path dependencies (see `main/idf_component.yml`).
 
 ESP-IDF v5.5 (at `~/esp/v5.5/esp-idf`). Fish config pins
 `IDF_PYTHON_ENV_PATH` to the py3.13 virtualenv and defines `get_idf`
@@ -145,6 +175,14 @@ URL actually embedded in the binary before publishing.
   ping using the ESP32's own lwIP stack, i.e. it exercises the PPP link
   itself; returns resolved IPs, RTT stats, and a ping-style transcript.
   Blocks up to ~20 s for an unreachable host.
+- `POST /api/bms` — `{"enabled":true,"sim":false}` (both optional) toggle
+  BMS polling / simulated data; persisted in NVS
+- `GET /api/mqtt` — broker config (password never echoed, only
+  `password_set`)
+- `POST /api/mqtt` — partial update of
+  `{"enabled":..,"uri":"mqtt(s)://..","username":..,"password":..,"base_topic":..}`;
+  saves to NVS and reconnects. `/api/status` gains `bms`, `mqtt`, `datalog`
+  (device id, row/spool counters, current SD file) and `time` objects
 - `GET /api/ota` — running version/slot, OTA state (`idle`/`checking`/
   `downloading`/`verifying`/`wait_reboot`/`error`), progress, last
   check result

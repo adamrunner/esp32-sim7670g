@@ -7,8 +7,12 @@
 #include "esp_timer.h"
 #include "cJSON.h"
 
+#include "bms.h"
+#include "datalog.h"
 #include "modem.h"
+#include "mqtt.h"
 #include "ota.h"
+#include "timesync.h"
 #include "wifi.h"
 
 extern const uint8_t index_html_start[] asm("_binary_index_html_start");
@@ -75,6 +79,94 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         cJSON_AddStringToObject(gnss, "utc", g.utc);
         int64_t fix_age_s = (esp_timer_get_time() - g.fix_time_us) / 1000000;
         cJSON_AddNumberToObject(gnss, "fix_age_s", (double)fix_age_s);
+    }
+
+    bms_status_t b;
+    bms_get_status(&b);
+    cJSON *bms = cJSON_AddObjectToObject(root, "bms");
+    cJSON_AddBoolToObject(bms, "enabled", b.enabled);
+    cJSON_AddBoolToObject(bms, "sim", b.sim);
+    cJSON_AddBoolToObject(bms, "comm_ok", b.comm_ok);
+    cJSON_AddBoolToObject(bms, "ever_ok", b.ever_ok);
+    cJSON_AddNumberToObject(bms, "polls", b.poll_count);
+    cJSON_AddNumberToObject(bms, "fails", b.fail_count);
+    if (b.ever_ok || b.sim) {
+        cJSON_AddNumberToObject(bms, "pack_v", b.pack_voltage_v);
+        cJSON_AddNumberToObject(bms, "current_a", b.pack_current_a);
+        cJSON_AddNumberToObject(bms, "soc_pct", b.soc_pct);
+        cJSON_AddNumberToObject(bms, "power_w", b.power_w);
+        cJSON_AddNumberToObject(bms, "capacity_ah", b.capacity_ah);
+        cJSON_AddNumberToObject(bms, "full_capacity_ah", b.full_capacity_ah);
+        cJSON_AddNumberToObject(bms, "energy_wh", b.total_energy_wh);
+        cJSON *cells = cJSON_AddArrayToObject(bms, "cells");
+        for (int i = 0; i < b.cell_count; i++) {
+            cJSON_AddItemToArray(cells, cJSON_CreateNumber(b.cell_v[i]));
+        }
+        cJSON *temps = cJSON_AddArrayToObject(bms, "temps");
+        for (int i = 0; i < b.temp_count; i++) {
+            cJSON_AddItemToArray(temps, cJSON_CreateNumber(b.temp_c[i]));
+        }
+        cJSON_AddBoolToObject(bms, "charge_fet", b.charging_enabled);
+        cJSON_AddBoolToObject(bms, "discharge_fet", b.discharging_enabled);
+        cJSON_AddBoolToObject(bms, "balancing", b.balancing);
+        // Active protection flags only; an empty array means all clear.
+        cJSON *prot = cJSON_AddArrayToObject(bms, "protection");
+        const struct { const char *name; unsigned set; } flags[] = {
+            {"cell_overvolt", b.protection.sover}, {"cell_undervolt", b.protection.sunder},
+            {"pack_overvolt", b.protection.gover}, {"pack_undervolt", b.protection.gunder},
+            {"charge_overtemp", b.protection.chitemp}, {"charge_undertemp", b.protection.clowtemp},
+            {"discharge_overtemp", b.protection.dhitemp}, {"discharge_undertemp", b.protection.dlowtemp},
+            {"charge_overcurrent", b.protection.cover}, {"discharge_overcurrent", b.protection.cunder},
+            {"short_circuit", b.protection.shorted}, {"ic_error", b.protection.ic},
+            {"mos_lock", b.protection.mos},
+        };
+        for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
+            if (flags[i].set) {
+                cJSON_AddItemToArray(prot, cJSON_CreateString(flags[i].name));
+            }
+        }
+        if (b.last_ok_us) {
+            cJSON_AddNumberToObject(bms, "age_s",
+                                    (double)((esp_timer_get_time() - b.last_ok_us) / 1000000));
+        }
+    }
+
+    mqtt_status_t m;
+    mqtt_get_status(&m);
+    cJSON *mq = cJSON_AddObjectToObject(root, "mqtt");
+    cJSON_AddStringToObject(mq, "state", m.state == MQTT_UI_CONNECTED  ? "connected"
+                                       : m.state == MQTT_UI_CONNECTING ? "connecting"
+                                                                       : "disabled");
+    cJSON_AddStringToObject(mq, "uri", m.uri);
+    cJSON_AddStringToObject(mq, "base_topic", m.base_topic);
+    cJSON_AddNumberToObject(mq, "published", m.published);
+    cJSON_AddNumberToObject(mq, "publish_fails", m.publish_fails);
+    cJSON_AddStringToObject(mq, "last_error", m.last_error);
+
+    datalog_status_t d;
+    datalog_get_status(&d);
+    char device_id[48];
+    datalog_device_id(device_id, sizeof(device_id));
+    cJSON *dl = cJSON_AddObjectToObject(root, "datalog");
+    cJSON_AddStringToObject(dl, "device_id", device_id);
+    cJSON_AddNumberToObject(dl, "rows", d.rows);
+    cJSON_AddNumberToObject(dl, "dropped", d.dropped);
+    cJSON_AddBoolToObject(dl, "sd_ok", d.sd_ok);
+    cJSON_AddStringToObject(dl, "sd_file", d.sd_file);
+    cJSON_AddNumberToObject(dl, "sd_rows", d.sd_rows);
+    cJSON_AddNumberToObject(dl, "mqtt_rows", d.mqtt_rows);
+    cJSON_AddNumberToObject(dl, "spool_pending", d.spool_pending);
+    cJSON_AddNumberToObject(dl, "spool_replayed", d.spool_replayed);
+
+    timesync_status_t ts;
+    timesync_get_status(&ts);
+    cJSON *tm = cJSON_AddObjectToObject(root, "time");
+    cJSON_AddBoolToObject(tm, "valid", ts.source != TIMESYNC_NONE);
+    cJSON_AddStringToObject(tm, "source", ts.source == TIMESYNC_SNTP ? "sntp"
+                                        : ts.source == TIMESYNC_GNSS ? "gnss"
+                                                                     : "none");
+    if (ts.source != TIMESYNC_NONE) {
+        cJSON_AddNumberToObject(tm, "epoch", (double)time(NULL));
     }
 
     char *json = cJSON_PrintUnformatted(root);
@@ -347,11 +439,115 @@ static esp_err_t wifi_post_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
+// {"enabled":bool,"sim":bool} — both optional, missing keys keep their value.
+static esp_err_t bms_post_handler(httpd_req_t *req)
+{
+    char body[128];
+    if (read_body(req, body, sizeof(body)) != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "expected {\"enabled\":true,\"sim\":false}");
+    }
+
+    bms_status_t cur;
+    bms_get_status(&cur);
+    const cJSON *enabled = cJSON_GetObjectItem(root, "enabled");
+    const cJSON *sim = cJSON_GetObjectItem(root, "sim");
+    bool new_enabled = cJSON_IsBool(enabled) ? cJSON_IsTrue(enabled) : cur.enabled;
+    bool new_sim = cJSON_IsBool(sim) ? cJSON_IsTrue(sim) : cur.sim;
+    cJSON_Delete(root);
+
+    if (bms_set_options(new_enabled, new_sim) != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "NVS write failed");
+    }
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
+static esp_err_t mqtt_get_handler(httpd_req_t *req)
+{
+    mqtt_config_t cfg;
+    mqtt_get_config(&cfg);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "enabled", cfg.enabled);
+    cJSON_AddStringToObject(root, "uri", cfg.uri);
+    cJSON_AddStringToObject(root, "username", cfg.username);
+    cJSON_AddBoolToObject(root, "password_set", cfg.password[0] != '\0');
+    cJSON_AddStringToObject(root, "base_topic", cfg.base_topic);
+
+    char *json = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t err = httpd_resp_sendstr(req, json);
+    cJSON_free(json);
+    cJSON_Delete(root);
+    return err;
+}
+
+// Partial update: only the keys present change; omitting "password" keeps
+// the stored one (the GET never echoes it back).
+static esp_err_t mqtt_post_handler(httpd_req_t *req)
+{
+    char body[384];
+    if (read_body(req, body, sizeof(body)) != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON");
+    }
+
+    mqtt_config_t cfg;
+    mqtt_get_config(&cfg);
+
+    const cJSON *enabled = cJSON_GetObjectItem(root, "enabled");
+    const cJSON *uri = cJSON_GetObjectItem(root, "uri");
+    const cJSON *user = cJSON_GetObjectItem(root, "username");
+    const cJSON *pass = cJSON_GetObjectItem(root, "password");
+    const cJSON *base = cJSON_GetObjectItem(root, "base_topic");
+
+    if (cJSON_IsString(uri)) {
+        if (strlen(uri->valuestring) >= MQTT_URI_MAX ||
+            (uri->valuestring[0] && strncmp(uri->valuestring, "mqtt://", 7) != 0 &&
+             strncmp(uri->valuestring, "mqtts://", 8) != 0)) {
+            cJSON_Delete(root);
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                       "uri must be mqtt:// or mqtts://");
+        }
+        strlcpy(cfg.uri, uri->valuestring, sizeof(cfg.uri));
+    }
+    if (cJSON_IsString(user) && strlen(user->valuestring) < MQTT_USER_MAX) {
+        strlcpy(cfg.username, user->valuestring, sizeof(cfg.username));
+    }
+    if (cJSON_IsString(pass) && strlen(pass->valuestring) < MQTT_PASS_MAX) {
+        strlcpy(cfg.password, pass->valuestring, sizeof(cfg.password));
+    }
+    if (cJSON_IsString(base) && base->valuestring[0] &&
+        strlen(base->valuestring) < MQTT_TOPIC_MAX) {
+        strlcpy(cfg.base_topic, base->valuestring, sizeof(cfg.base_topic));
+    }
+    if (cJSON_IsBool(enabled)) {
+        cfg.enabled = cJSON_IsTrue(enabled);
+    }
+    cJSON_Delete(root);
+
+    if (mqtt_set_config(&cfg) != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "NVS write failed");
+    }
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
 void webui_init(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.lru_purge_enable = true;
-    cfg.max_uri_handlers = 16;  // default 8; we register 9 routes
+    cfg.max_uri_handlers = 16;  // default 8; we register 12 routes
     cfg.stack_size = 8192;  // ping/DNS handler keeps sizeable buffers on the stack
 
     httpd_handle_t server = NULL;
@@ -367,6 +563,9 @@ void webui_init(void)
         { .uri = "/api/ping",   .method = HTTP_POST, .handler = ping_post_handler },
         { .uri = "/api/ota",       .method = HTTP_GET,  .handler = ota_get_handler },
         { .uri = "/api/ota/check", .method = HTTP_POST, .handler = ota_check_post_handler },
+        { .uri = "/api/bms",    .method = HTTP_POST, .handler = bms_post_handler },
+        { .uri = "/api/mqtt",   .method = HTTP_GET,  .handler = mqtt_get_handler },
+        { .uri = "/api/mqtt",   .method = HTTP_POST, .handler = mqtt_post_handler },
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
         ESP_ERROR_CHECK(httpd_register_uri_handler(server, &routes[i]));

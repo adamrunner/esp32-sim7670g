@@ -3,10 +3,14 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 
+#include "bms.h"
+#include "datalog.h"
 #include "led.h"
 #include "modem.h"
+#include "mqtt.h"
 #include "ota.h"
 #include "sdcard.h"
+#include "timesync.h"
 #include "webui.h"
 #include "wifi.h"
 
@@ -33,6 +37,12 @@ void app_main(void)
     wifi_init();   // joins the stored home network, or falls back to SoftAP
     webui_init();
     ota_init();    // confirms/rolls back a pending image, then polls hourly
+
+    // Telemetry: wall clock, broker link, fan-out pipeline, then producers.
+    timesync_init();
+    mqtt_init();
+    datalog_init();
+    bms_init();
 
     ESP_LOGI(TAG, "up — if no home WiFi is stored/reachable, join "
                   "\"ESP32-SIM7670G\" (pass \"waveshare\") and open "

@@ -74,6 +74,46 @@
     </dl>
   </div>
   <div class="card">
+    <h2>House battery</h2>
+    <dl>
+      <dt>BMS</dt><dd id="bms_state">…</dd>
+      <dt>Pack</dt><dd id="bms_pack">…</dd>
+      <dt>Charge</dt><dd id="bms_soc">…</dd>
+      <dt>Cells</dt><dd id="bms_cells">…</dd>
+      <dt>Temps</dt><dd id="bms_temps">…</dd>
+      <dt>FETs</dt><dd id="bms_fets">…</dd>
+      <dt>Protection</dt><dd id="bms_prot">…</dd>
+      <dt>Energy</dt><dd id="bms_energy">…</dd>
+    </dl>
+    <form id="bmsform" style="margin-top: 0.75rem;">
+      <label style="font-size: 0.85rem;"><input type="checkbox" id="bms_sim"> simulate data (no BMS wired)</label>
+      <button type="submit">Apply</button>
+    </form>
+    <div class="msg" id="bmsmsg"></div>
+  </div>
+  <div class="card">
+    <h2>Telemetry</h2>
+    <dl>
+      <dt>MQTT</dt><dd id="mq_state">…</dd>
+      <dt>Delivered</dt><dd id="mq_stats">…</dd>
+      <dt>SD log</dt><dd id="dl_sd">…</dd>
+      <dt>Spool</dt><dd id="dl_spool">…</dd>
+      <dt>Device ID</dt><dd id="dl_devid">…</dd>
+      <dt>Clock</dt><dd id="time_state">…</dd>
+    </dl>
+    <form id="mqttform" style="flex-direction: column; margin-top: 0.75rem;">
+      <input id="mq_uri" placeholder="mqtt://broker:1883 or mqtts://broker:8883" autocomplete="off" spellcheck="false">
+      <input id="mq_user" placeholder="username (blank = anonymous)" autocomplete="off" spellcheck="false">
+      <input id="mq_pass" type="password" placeholder="password (blank = keep current)" autocomplete="off">
+      <input id="mq_base" placeholder="base topic (bms/telemetry)" autocomplete="off" spellcheck="false">
+      <div style="display: flex; gap: 0.5rem; align-items: center;">
+        <label style="font-size: 0.85rem;"><input type="checkbox" id="mq_enabled"> enabled</label>
+        <button type="submit" style="flex: 1;">Save &amp; reconnect</button>
+      </div>
+    </form>
+    <div class="msg" id="mqttmsg"></div>
+  </div>
+  <div class="card">
     <h2>Modem / SIM</h2>
     <dl>
       <dt>Model</dt><dd id="model">…</dd>
@@ -188,6 +228,49 @@ async function refresh() {
       ? g.sats_used + ' / ' + g.sats + ' in view'
       : (g.sats ?? '—');
     $('gps_hdop').textContent = g.hdop ? g.hdop.toFixed(1) : '—';
+
+    const b = s.bms || {};
+    if (b.sim) pill($('bms_state'), 'simulated', 'warn');
+    else if (!b.enabled) pill($('bms_state'), 'disabled', 'warn');
+    else if (b.comm_ok) pill($('bms_state'), 'online', 'ok');
+    else if (b.ever_ok) pill($('bms_state'), 'not responding', 'bad');
+    else pill($('bms_state'), 'not detected', 'warn');
+    if (!bmsEdited) $('bms_sim').checked = !!b.sim;
+    if (b.pack_v !== undefined) {
+      $('bms_pack').textContent = b.pack_v.toFixed(2) + ' V · ' +
+        b.current_a.toFixed(2) + ' A · ' + b.power_w.toFixed(1) + ' W';
+      $('bms_soc').textContent = b.soc_pct.toFixed(0) + '% (' +
+        b.capacity_ah.toFixed(1) + ' / ' + b.full_capacity_ah.toFixed(1) + ' Ah)';
+      $('bms_cells').textContent = (b.cells || []).map(v => v.toFixed(3)).join(' / ') + ' V';
+      $('bms_temps').textContent = (b.temps || []).map(t => t.toFixed(1) + '°C').join(' · ') || '—';
+      $('bms_fets').textContent = 'charge ' + (b.charge_fet ? 'on' : 'OFF') +
+        ' · discharge ' + (b.discharge_fet ? 'on' : 'OFF') + (b.balancing ? ' · balancing' : '');
+      if ((b.protection || []).length) pill($('bms_prot'), b.protection.join(', '), 'bad');
+      else $('bms_prot').textContent = 'all clear';
+      $('bms_energy').textContent = b.energy_wh.toFixed(1) + ' Wh since boot';
+    } else {
+      for (const k of ['bms_pack','bms_soc','bms_cells','bms_temps','bms_fets','bms_prot','bms_energy'])
+        $(k).textContent = '—';
+    }
+
+    const m = s.mqtt || {};
+    if (m.state === 'connected') pill($('mq_state'), 'connected', 'ok');
+    else if (m.state === 'connecting') pill($('mq_state'), 'connecting…', 'warn');
+    else pill($('mq_state'), 'disabled', 'warn');
+    if (m.last_error) $('mqttmsg').textContent = m.last_error;
+
+    const d = s.datalog || {};
+    $('mq_stats').textContent = (m.published ?? 0) + ' live · ' +
+      (d.spool_replayed ?? 0) + ' replayed · ' + (d.dropped ?? 0) + ' dropped';
+    $('dl_sd').textContent = d.sd_ok ? (d.sd_rows + ' rows → ' + (d.sd_file || '(pending)'))
+                                     : 'no card / full';
+    $('dl_spool').textContent = d.spool_pending
+      ? Math.round(d.spool_pending / 1024) + ' KB waiting for broker' : 'empty';
+    $('dl_devid').textContent = d.device_id || '—';
+    const t = s.time || {};
+    $('time_state').textContent = t.valid
+      ? new Date(t.epoch * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' UTC (' + t.source + ')'
+      : 'not set (rows carry timestamp 0)';
   } catch (e) { /* board busy; try again next tick */ }
 }
 
@@ -328,6 +411,55 @@ $('atform').addEventListener('submit', async ev => {
   } catch (e) { $('atlog').value += '[request failed]\n'; }
   $('atlog').scrollTop = $('atlog').scrollHeight;
   $('atcmd').value = '';
+});
+
+let bmsEdited = false;
+$('bms_sim').addEventListener('change', () => { bmsEdited = true; });
+$('bmsform').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  $('bmsmsg').textContent = 'saving…';
+  try {
+    const r = await fetch('/api/bms', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({sim: $('bms_sim').checked})
+    });
+    $('bmsmsg').textContent = r.ok ? 'saved' : 'error: ' + (await r.text());
+  } catch (e) { $('bmsmsg').textContent = 'request failed'; }
+  bmsEdited = false;
+});
+
+// Populate the MQTT form once at load; live status comes via /api/status.
+(async () => {
+  try {
+    const c = await (await fetch('/api/mqtt')).json();
+    $('mq_uri').value = c.uri || '';
+    $('mq_user').value = c.username || '';
+    $('mq_base').value = c.base_topic || '';
+    $('mq_enabled').checked = !!c.enabled;
+    if (c.password_set) $('mq_pass').placeholder = 'password (blank = keep current)';
+  } catch (e) { /* board busy */ }
+})();
+
+$('mqttform').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  $('mqttmsg').textContent = 'saving…';
+  const body = {
+    enabled: $('mq_enabled').checked,
+    uri: $('mq_uri').value.trim(),
+    username: $('mq_user').value.trim(),
+    base_topic: $('mq_base').value.trim() || 'bms/telemetry'
+  };
+  if ($('mq_pass').value) body.password = $('mq_pass').value;
+  try {
+    const r = await fetch('/api/mqtt', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)
+    });
+    $('mqttmsg').textContent = r.ok ? 'saved — reconnecting' : 'error: ' + (await r.text());
+    if (r.ok) $('mq_pass').value = '';
+  } catch (e) { $('mqttmsg').textContent = 'request failed'; }
 });
 
 let pinging = false;

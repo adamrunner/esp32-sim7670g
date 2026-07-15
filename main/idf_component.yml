@@ -2,3 +2,8 @@ dependencies:
   idf: ">=5.0"
   espressif/led_strip: "^3.0.0"
   espressif/esp_modem: "^1.4.0"
+  # Local shared components (sibling checkout of esp32-shared-components)
+  jbd_bms:
+    path: ../../esp32-shared-components/jbd_bms
+  bms_interface:
+    path: ../../esp32-shared-components/bms_interface
