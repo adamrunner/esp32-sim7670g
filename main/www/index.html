@@ -117,10 +117,17 @@
       <dt>Clock</dt><dd id="time_state">…</dd>
     </dl>
     <form id="mqttform" style="flex-direction: column; margin-top: 0.75rem;">
-      <input id="mq_uri" placeholder="mqtt://broker:1883 or mqtts://broker:8883" autocomplete="off" spellcheck="false">
-      <input id="mq_user" placeholder="username (blank = anonymous)" autocomplete="off" spellcheck="false">
-      <input id="mq_pass" type="password" placeholder="password (blank = keep current)" autocomplete="off">
-      <input id="mq_base" placeholder="base topic (bms/telemetry)" autocomplete="off" spellcheck="false">
+      <input id="mq_uri" maxlength="127"
+             placeholder="mqtt://broker:1883 or mqtts://broker:8883"
+             autocomplete="off" spellcheck="false">
+      <input id="mq_user" maxlength="63"
+             placeholder="username (blank = anonymous)"
+             autocomplete="off" spellcheck="false">
+      <input id="mq_pass" maxlength="63" type="password"
+             placeholder="password (blank = keep current)" autocomplete="off">
+      <input id="mq_base" maxlength="63"
+             placeholder="base topic (bms/telemetry)"
+             autocomplete="off" spellcheck="false">
       <div style="display: flex; gap: 0.5rem; align-items: center;">
         <label style="font-size: 0.85rem;"><input type="checkbox" id="mq_enabled"> enabled</label>
         <button type="submit" style="flex: 1;">Save &amp; reconnect</button>

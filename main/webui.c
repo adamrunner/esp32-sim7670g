@@ -384,10 +384,20 @@ static esp_err_t mqtt_post_handler(httpd_req_t *req)
         }
         strlcpy(cfg.uri, uri->valuestring, sizeof(cfg.uri));
     }
-    if (cJSON_IsString(user) && strlen(user->valuestring) < MQTT_USER_MAX) {
+    if (cJSON_IsString(user) && strlen(user->valuestring) >= MQTT_USER_MAX) {
+        cJSON_Delete(root);
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "username must be at most 63 characters");
+    }
+    if (cJSON_IsString(user)) {
         strlcpy(cfg.username, user->valuestring, sizeof(cfg.username));
     }
-    if (cJSON_IsString(pass) && strlen(pass->valuestring) < MQTT_PASS_MAX) {
+    if (cJSON_IsString(pass) && strlen(pass->valuestring) >= MQTT_PASS_MAX) {
+        cJSON_Delete(root);
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "password must be at most 63 characters");
+    }
+    if (cJSON_IsString(pass)) {
         strlcpy(cfg.password, pass->valuestring, sizeof(cfg.password));
     }
     if (cJSON_IsString(base) && base->valuestring[0] &&
