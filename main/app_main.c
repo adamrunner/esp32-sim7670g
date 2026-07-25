@@ -4,6 +4,7 @@
 #include "nvs_flash.h"
 
 #include "bms.h"
+#include "board_battery.h"
 #include "datalog.h"
 #include "led.h"
 #include "modem.h"
@@ -33,6 +34,7 @@ void app_main(void)
     sdcard_init(); // mount the microSD at /sdcard for later data logging;
                    // logs a warning and continues if no card is present
     modem_init();  // creates the status mutex the LED task reads through
+    board_battery_init(); // V2.0 MAX17048; rejects USB-forced SOC readings
     led_init();
     wifi_init();   // joins the stored home network, or falls back to SoftAP
     webui_init();

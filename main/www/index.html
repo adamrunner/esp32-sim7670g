@@ -97,6 +97,16 @@
     <div class="msg" id="bmsmsg"></div>
   </div>
   <div class="card">
+    <h2>Internal battery</h2>
+    <dl>
+      <dt>Gauge</dt><dd id="ib_state">…</dd>
+      <dt>Charge</dt><dd id="ib_soc">…</dd>
+      <dt>VBAT rail</dt><dd id="ib_voltage">…</dd>
+      <dt>Power</dt><dd id="ib_power">…</dd>
+    </dl>
+    <div class="msg" id="ib_note"></div>
+  </div>
+  <div class="card">
     <h2>Telemetry</h2>
     <dl>
       <dt>MQTT</dt><dd id="mq_state">…</dd>
@@ -261,6 +271,33 @@ async function refresh() {
       for (const k of ['bms_pack','bms_soc','bms_cells','bms_temps','bms_fets','bms_prot','bms_energy'])
         $(k).textContent = '—';
     }
+
+    const ib = s.internal_battery || {};
+    if (ib.comm_ok) pill($('ib_state'), 'MAX17048 online', 'ok');
+    else if (ib.ever_ok) pill($('ib_state'), 'not responding', 'bad');
+    else pill($('ib_state'), 'not detected', 'warn');
+    $('ib_voltage').textContent = ib.voltage_v !== undefined
+      ? ib.voltage_v.toFixed(3) + ' V' : '—';
+    if (ib.soc_valid) {
+      $('ib_soc').textContent = ib.soc_pct.toFixed(0) + '%';
+      $('ib_note').textContent = 'Fuel-gauge estimate is valid.';
+    } else if (ib.power_source === 'external_rail') {
+      $('ib_soc').textContent = 'unavailable (' + ib.soc_pct.toFixed(0) + '% raw)';
+      $('ib_note').textContent =
+        'External power is holding VBAT above the cell range; the raw percentage is not battery capacity.';
+    } else if (ib.settling) {
+      $('ib_soc').textContent = 'recalculating…';
+      $('ib_note').textContent = 'External power was removed; waiting for the fuel gauge to settle.';
+    } else if (ib.comm_ok && ib.soc_in_range === false) {
+      $('ib_soc').textContent = 'unavailable (' + ib.raw_soc_pct.toFixed(1) + '% raw)';
+      $('ib_note').textContent = 'Fuel-gauge SOC is outside its valid range.';
+    } else {
+      $('ib_soc').textContent = '—';
+      $('ib_note').textContent = ib.ever_ok ? 'Latest gauge read failed.' : 'Waiting for the onboard gauge.';
+    }
+    $('ib_power').textContent = ib.power_source === 'external_rail' ? 'external / regulated rail'
+      : ib.power_source === 'battery_or_solar' ? 'battery or solar charging'
+      : 'unknown';
 
     const m = s.mqtt || {};
     if (m.state === 'connected') pill($('mq_state'), 'connected', 'ok');

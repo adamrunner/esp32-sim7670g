@@ -8,6 +8,7 @@
 #include "cJSON.h"
 
 #include "bms.h"
+#include "board_battery.h"
 #include "datalog.h"
 #include "modem.h"
 #include "mqtt.h"
@@ -48,6 +49,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
 {
     cJSON *root = cJSON_CreateObject();
     modem_status_json(root);      // modem fields + "gnss"
+    board_battery_status_json(root); // "internal_battery"
     bms_status_json(root);        // "bms"
     mqtt_status_json(root);       // "mqtt"
     datalog_status_json(root);    // "datalog"

@@ -32,6 +32,17 @@ web UI for monitoring/configuring the cellular connection.
   - yellow: modem up, not registered yet
   - green: registered on the network
   - blue: data connection up (has an IP)
+- **Internal battery gauge** (`main/board_battery.c`) — reads the onboard
+  MAX17048 on the V2.0 board over I2C (SDA=GPIO15, SCL=GPIO16, address `0x36`).
+  Reports the raw VBAT rail voltage and fuel-gauge state of charge in
+  `/api/status` and the web UI. The USB buck regulator holds VBAT near 4.27 V,
+  so firmware infers external power above 4.23 V and marks SOC invalid instead
+  of presenting the resulting stuck/high percentage as real battery capacity.
+  After external power is removed it applies hysteresis and waits until the
+  gauge output has genuinely recovered before declaring SOC valid again; it
+  deliberately avoids MAX17048 quick-start under load. Solar charging still
+  appears as `battery_or_solar` because the board has no routed digital input
+  that distinguishes those two cases.
 - **microSD storage** (`main/sdcard.c`) — the onboard TF slot, mounted as a
   FAT filesystem at `/sdcard` for data logging. Wired to the ESP32-S3 SDMMC
   peripheral in 1-bit mode (CLK=GPIO5, CMD=GPIO4, D0=GPIO6). Mounts at boot;
