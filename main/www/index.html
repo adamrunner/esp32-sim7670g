@@ -310,7 +310,7 @@ async function refresh() {
     if (m.state === 'connected') pill($('mq_state'), 'connected', 'ok');
     else if (m.state === 'connecting') pill($('mq_state'), 'connecting…', 'warn');
     else pill($('mq_state'), 'disabled', 'warn');
-    if (m.last_error) $('mqttmsg').textContent = m.last_error;
+    $('mqttmsg').textContent = m.last_error || '';
 
     const d = s.datalog || {};
     $('mq_stats').textContent = (m.published ?? 0) + ' live · ' +
