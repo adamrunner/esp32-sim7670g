@@ -40,6 +40,9 @@ typedef struct {
 
 // Load config from NVS and start the client if enabled. Requires the default
 // event loop. Safe to call with no config stored (module stays disabled).
+// Each broker session has a retained offline last will on
+// "bms/availability/<device_id>" and publishes retained online state after
+// connecting.
 void mqtt_init(void);
 
 // Persist config to NVS and restart the client to apply it. An empty URI or

@@ -25,6 +25,8 @@ static const char *TAG = "mqtt";
 #define NVS_NS "mqttcfg"
 #define PUBACK_TIMEOUT_MS 8000
 #define STATUS_TOPIC_PREFIX "bms/status"
+#define AVAILABILITY_TOPIC_PREFIX "bms/availability"
+#define AVAILABILITY_PAYLOAD_MAX 160
 #define STATUS_TIME_POLL_MS 1000
 // The SD spool is the durability layer, so a failed/slow session shouldn't
 // hoard RAM: keep esp-mqtt's own outbox small and let publishes fail fast.
@@ -75,7 +77,21 @@ static const char *time_source_str(timesync_source_t source)
 }
 
 static esp_err_t publish_status_event(status_reason_t reason);
+static esp_err_t publish_availability(bool online, bool wait_for_ack);
 static void status_task(void *arg);
+
+static void availability_document(bool online,
+                                  char *topic, size_t topic_len,
+                                  char *payload, size_t payload_len)
+{
+    char device_id[48];
+    datalog_device_id(device_id, sizeof(device_id));
+    snprintf(topic, topic_len, "%s/%s", AVAILABILITY_TOPIC_PREFIX, device_id);
+    snprintf(payload, payload_len,
+             "{\"schema_version\":1,\"device_id\":\"%s\","
+             "\"online\":%s,\"boot_id\":\"%s\"}",
+             device_id, online ? "true" : "false", s_boot_id);
+}
 
 static const char *reset_reason_str(esp_reset_reason_t reason)
 {
@@ -152,6 +168,7 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
         s_connected = true;
         set_last_error("");
         ESP_LOGI(TAG, "connected to broker");
+        publish_availability(true, false);
         bool time_already_valid = timesync_valid();
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         bool first_connection = !s_ever_connected;
@@ -214,11 +231,19 @@ static void restart_client_locked(void)
     }
 
     char client_id[48];
+    char will_topic[sizeof(AVAILABILITY_TOPIC_PREFIX) + sizeof(client_id)];
+    char will_payload[AVAILABILITY_PAYLOAD_MAX];
     datalog_device_id(client_id, sizeof(client_id));
+    availability_document(false, will_topic, sizeof(will_topic),
+                          will_payload, sizeof(will_payload));
 
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = s_cfg.uri,
         .credentials.client_id = client_id,
+        .session.last_will.topic = will_topic,
+        .session.last_will.msg = will_payload,
+        .session.last_will.qos = 1,
+        .session.last_will.retain = true,
         .outbox.limit = OUTBOX_LIMIT_BYTES,
         .network.disable_auto_reconnect = false,
     };
@@ -261,6 +286,9 @@ esp_err_t mqtt_set_config(const mqtt_config_t *cfg)
     esp_err_t err = save_config(cfg);
     if (err != ESP_OK) {
         return err;
+    }
+    if (publish_availability(false, true) != ESP_OK && s_connected) {
+        ESP_LOGW(TAG, "could not publish offline state before MQTT reconfiguration");
     }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_cfg = *cfg;
@@ -307,6 +335,56 @@ void mqtt_status_json(cJSON *root)
     cJSON_AddNumberToObject(mq, "published", m.published);
     cJSON_AddNumberToObject(mq, "publish_fails", m.publish_fails);
     cJSON_AddStringToObject(mq, "last_error", m.last_error);
+}
+
+static esp_err_t publish_availability(bool online, bool wait_for_ack)
+{
+    char topic[sizeof(AVAILABILITY_TOPIC_PREFIX) + 48];
+    char payload[AVAILABILITY_PAYLOAD_MAX];
+    availability_document(online, topic, sizeof(topic),
+                          payload, sizeof(payload));
+
+    xSemaphoreTake(s_pub_mutex, portMAX_DELAY);
+    if (wait_for_ack) {
+        xEventGroupClearBits(s_events, EV_PUBACK);
+    }
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int msg_id;
+    if (!s_client || !s_connected) {
+        msg_id = -1;
+    } else if (wait_for_ack) {
+        msg_id = esp_mqtt_client_publish(s_client, topic, payload, 0, 1, 1);
+        s_pending_msg_id = msg_id;
+    } else {
+        msg_id = esp_mqtt_client_enqueue(s_client, topic, payload, 0, 1, 1, true);
+    }
+    xSemaphoreGive(s_mutex);
+
+    if (msg_id < 0) {
+        s_pending_msg_id = -1;
+        xSemaphoreGive(s_pub_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (wait_for_ack) {
+        EventBits_t bits = xEventGroupWaitBits(
+            s_events, EV_PUBACK, pdTRUE, pdTRUE,
+            pdMS_TO_TICKS(PUBACK_TIMEOUT_MS)
+        );
+        s_pending_msg_id = -1;
+        xSemaphoreGive(s_pub_mutex);
+        if (!(bits & EV_PUBACK)) {
+            return ESP_ERR_TIMEOUT;
+        }
+    } else {
+        xSemaphoreGive(s_pub_mutex);
+    }
+
+    ESP_LOGI(TAG, "%s retained %s state on %s",
+             wait_for_ack ? "published" : "queued",
+             online ? "online" : "offline", topic);
+    return ESP_OK;
 }
 
 static esp_err_t publish_status_event(status_reason_t reason)

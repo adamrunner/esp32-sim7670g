@@ -168,6 +168,13 @@ device that connected before synchronization publishes a distinct
 self-test clears `pending_verify`, so the retained record can remotely confirm
 both the running version and successful rollback validation.
 
+MQTT connection availability is published separately as retained QoS 1 JSON
+on `bms/availability/<device_id>`. Each successful connection publishes
+`online: true`; the broker publishes the configured `online: false` last will
+if the session disappears unexpectedly. Intentional MQTT reconfiguration
+publishes offline and waits for its acknowledgement before replacing the
+client. This state describes the broker session, not vehicle power.
+
 Publishing a release:
 
 ```sh
