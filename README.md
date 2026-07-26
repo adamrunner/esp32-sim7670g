@@ -158,6 +158,15 @@ must reach the update server over HTTPS within 6 minutes of booting or
 the bootloader rolls back to the previous slot; a rolled-back version
 is never auto-retried.
 
+The OTA task waits for an active WiFi or PPP route before checking. On
+cellular it suppresses the modem's periodic AT/GNSS polling from the
+manifest request through the binary transfer, because entering command
+mode briefly pauses PPP. If a download attempt fails, firmware performs
+a clean PPP redial and waits for the route to return before resuming the
+range download. Automatic failures retry after 5 minutes rather than
+waiting for the normal hourly poll. HTTP operations allow 60 seconds so
+the modem can tolerate transient cellular latency.
+
 After each MQTT connection, the device publishes a retained QoS 1 schema-v2
 JSON document to `bms/status/<device_id>`. It includes `firmware_version`,
 `ota_slot`, `pending_verify`, a per-boot `boot_id`, boot-scoped `status_seq`,
@@ -226,7 +235,9 @@ URL actually embedded in the binary before publishing.
   (device id, row/spool counters, current SD file) and `time` objects
 - `GET /api/ota` — running version/slot, OTA state (`idle`/`checking`/
   `downloading`/`verifying`/`wait_reboot`/`error`), progress, last
-  check result
+  check result, and heap diagnostics (`free_heap`, `largest_free_block`,
+  `minimum_free_heap`) for distinguishing total-memory pressure from
+  fragmentation after a failed transfer
 - `POST /api/ota/check` — check for an update now; body optional:
   `{"url":"https://.../manifest.json","transport":"cell"}` to target an
   alternate manifest or pin the transfer to the cellular interface

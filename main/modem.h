@@ -90,6 +90,11 @@ esp_err_t modem_ping_host(const char *host, modem_netdiag_t *out);
 // guarantee resume on every exit path.
 void modem_suspend_polls(bool suspend);
 
+// Ask the modem task to tear down and redial PPP. This is asynchronous and
+// safe to call from another task after a transport-level failure; callers can
+// observe completion through modem_get_status().ppp_up.
+void modem_request_redial(void);
+
 // The PPP network interface (for binding sockets to cellular explicitly).
 esp_netif_t *modem_get_netif(void);
 

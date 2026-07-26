@@ -12,6 +12,7 @@
 
 #include "esp_app_desc.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_https_ota.h"
 #include "esp_log.h"
@@ -27,6 +28,7 @@
 
 #include "modem.h"
 #include "mqtt.h"
+#include "wifi.h"
 
 static const char *TAG = "ota";
 
@@ -52,11 +54,13 @@ static const char *TAG = "ota";
 // Download tuning. Timeouts are generous for cellular: PPP at 460800 moves
 // ~25-34 KB/s, so a 1 MB image takes ~40 s in the best case and each 128 KB
 // range request ~4-6 s.
-#define HTTP_TIMEOUT_MS         30000
+#define HTTP_TIMEOUT_MS         60000
 #define RANGE_REQUEST_SIZE      (128 * 1024)
 #define DOWNLOAD_ATTEMPTS       4
 #define RETRY_DELAY_MS          20000
 #define RESUME_SAVE_INTERVAL    (128 * 1024)
+#define TRANSPORT_READY_MS      (3 * 60 * 1000)
+#define TRANSPORT_DROP_MS       (30 * 1000)
 
 #define NVS_NAMESPACE           "otares"    // download-resume state
 #define NVS_KEY_VERSION         "ver"
@@ -161,6 +165,62 @@ static bool cellular_ifreq(struct ifreq *ifr)
         return false;
     }
     return true;
+}
+
+static bool transport_ready(bool force_cellular)
+{
+    modem_status_t modem;
+    modem_get_status(&modem);
+    if (force_cellular) {
+        return modem.ppp_up;
+    }
+
+    wifi_ui_status_t wifi;
+    wifi_get_status(&wifi);
+    return wifi.state == WIFI_UI_STA_CONNECTED || modem.ppp_up;
+}
+
+static bool wait_for_transport(bool force_cellular, uint32_t timeout_ms)
+{
+    int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    while (esp_timer_get_time() < deadline) {
+        if (transport_ready(force_cellular)) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    return false;
+}
+
+static void log_heap_state(const char *stage)
+{
+    ESP_LOGI(TAG, "%s: heap free=%u largest=%u minimum=%u", stage,
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+             (unsigned)esp_get_minimum_free_heap_size());
+}
+
+static bool recover_transport(bool force_cellular)
+{
+    wifi_ui_status_t wifi;
+    wifi_get_status(&wifi);
+    if (!force_cellular && wifi.state == WIFI_UI_STA_CONNECTED) {
+        vTaskDelay(pdMS_TO_TICKS(RETRY_DELAY_MS));
+        return true;
+    }
+
+    modem_request_redial();
+
+    int64_t drop_deadline = esp_timer_get_time() + (int64_t)TRANSPORT_DROP_MS * 1000;
+    while (esp_timer_get_time() < drop_deadline) {
+        modem_status_t modem;
+        modem_get_status(&modem);
+        if (!modem.ppp_up) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    return wait_for_transport(true, TRANSPORT_READY_MS);
 }
 
 // ---------------------------------------------------------------------------
@@ -526,31 +586,29 @@ static void run_update(const manifest_t *m, bool force_cellular)
 {
     ESP_LOGI(TAG, "updating %s -> %s (%d bytes) over %s", s_st.running_version,
              m->version, m->size, force_cellular ? "cellular (bound)" : "default route");
-    ESP_LOGI(TAG, "free heap before download: %u", (unsigned)esp_get_free_heap_size());
-
-    // Hold off the modem task's status/GNSS polls: each one pauses PPP for
-    // ~2 s ("+++"/ATO), which would stall — or in the worst case drop — a
-    // multi-minute download running over the cellular link.
-    modem_suspend_polls(true);
+    log_heap_state("before download");
     set_state(OTA_STATE_DOWNLOADING);
 
     char errbuf[OTA_ERRMSG_MAX] = "";
     esp_err_t err = ESP_FAIL;
     for (int attempt = 1; attempt <= DOWNLOAD_ATTEMPTS; attempt++) {
         if (attempt > 1) {
-            ESP_LOGW(TAG, "retrying download (attempt %d/%d) in %d s: %s",
-                     attempt, DOWNLOAD_ATTEMPTS, RETRY_DELAY_MS / 1000, errbuf);
-            vTaskDelay(pdMS_TO_TICKS(RETRY_DELAY_MS));
+            ESP_LOGW(TAG, "recovering transport before download attempt %d/%d: %s",
+                     attempt, DOWNLOAD_ATTEMPTS, errbuf);
+            if (!recover_transport(force_cellular)) {
+                snprintf(errbuf, sizeof(errbuf),
+                         "transport did not recover before attempt %d", attempt);
+                err = ESP_ERR_TIMEOUT;
+                break;
+            }
             set_state(OTA_STATE_DOWNLOADING);
         }
         err = attempt_update(m, force_cellular, errbuf, sizeof(errbuf));
         if (err == ESP_OK) {
             break;
         }
-        ESP_LOGI(TAG, "free heap after failed attempt: %u", (unsigned)esp_get_free_heap_size());
+        log_heap_state("after failed download attempt");
     }
-
-    modem_suspend_polls(false);     // resumes on every exit path
 
     if (err != ESP_OK) {
         set_error("%s", errbuf[0] ? errbuf : "update failed");
@@ -567,7 +625,7 @@ static void run_update(const manifest_t *m, bool force_cellular)
         return;
     }
 
-    ESP_LOGI(TAG, "free heap after download: %u", (unsigned)esp_get_free_heap_size());
+    log_heap_state("after download");
     ESP_LOGI(TAG, "update installed; rebooting into %s in 3 s", m->version);
     set_state(OTA_STATE_WAIT_REBOOT);
     vTaskDelay(pdMS_TO_TICKS(3000));
@@ -652,8 +710,17 @@ static void rollback_selftest(void)
     char errbuf[OTA_ERRMSG_MAX];
 
     while (esp_timer_get_time() < deadline) {
-        if (fetch_manifest(OTA_MANIFEST_URL, false, true, NULL,
-                           errbuf, sizeof(errbuf)) == ESP_OK) {
+        bool ready = wait_for_transport(false, SELFTEST_RETRY_MS);
+        modem_suspend_polls(true);
+        esp_err_t fetch_err = ready
+                                  ? fetch_manifest(OTA_MANIFEST_URL, false, true, NULL,
+                                                   errbuf, sizeof(errbuf))
+                                  : ESP_ERR_TIMEOUT;
+        modem_suspend_polls(false);
+        if (!ready) {
+            snprintf(errbuf, sizeof(errbuf), "network not ready");
+        }
+        if (fetch_err == ESP_OK) {
             esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
             if (err == ESP_OK) {
                 ESP_LOGI(TAG, "self-test passed (HTTPS reachable); image marked valid");
@@ -702,15 +769,29 @@ static void ota_task(void *arg)
         s_busy = true;
         st_unlock();
 
-        run_check(&req);
+        if (!wait_for_transport(req.opts.force_cellular, TRANSPORT_READY_MS)) {
+            set_error("network not ready for OTA check");
+        } else {
+            // Cover the manifest request as well as the binary transfer.
+            // Otherwise a periodic SIM7670G AT/GNSS window can pause PPP
+            // between those two HTTPS connections and leave the HTTP client
+            // in a failed state while MQTT later recovers independently.
+            modem_suspend_polls(true);
+            run_check(&req);
+            modem_suspend_polls(false);
+        }
 
         st_lock();
         s_busy = false;
         bool ok = s_st.last_check_ok;
+        bool failed = s_st.state == OTA_STATE_ERROR;
         st_unlock();
 
-        // Unreachable server on an automatic check: retry sooner than hourly.
-        wait_ms = (!ok && !req.manual) ? CHECK_RETRY_MS : CHECK_INTERVAL_MS;
+        // Transport or download failures get another automatic chance sooner
+        // than the normal hourly cadence.
+        wait_ms = ((!ok || failed) && !req.manual)
+                      ? CHECK_RETRY_MS
+                      : CHECK_INTERVAL_MS;
     }
 }
 

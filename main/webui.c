@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "esp_http_server.h"
+#include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "cJSON.h"
@@ -198,6 +199,10 @@ static esp_err_t ota_get_handler(httpd_req_t *req)
                                 (double)((esp_timer_get_time() - st.last_check_us) / 1000000));
     }
     cJSON_AddNumberToObject(root, "free_heap", (double)esp_get_free_heap_size());
+    cJSON_AddNumberToObject(root, "largest_free_block",
+                            (double)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    cJSON_AddNumberToObject(root, "minimum_free_heap",
+                            (double)esp_get_minimum_free_heap_size());
     return send_json(req, root);
 }
 

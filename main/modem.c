@@ -66,6 +66,7 @@ static bool s_apn_dirty;
 // Written by esp_event handlers, read by the modem task (s_status_mutex).
 static bool s_ppp_up;
 static char s_ppp_ip[40];
+static bool s_redial_requested;
 
 // The UART carries either AT commands or PPP data, never both, and CMUX is
 // off the table (a failed negotiation wedges this modem until a reset — see
@@ -86,6 +87,14 @@ void modem_suspend_polls(bool suspend)
 {
     s_polls_suspended = suspend;
     ESP_LOGI(TAG, "status/GNSS polls %s", suspend ? "suspended" : "resumed");
+}
+
+void modem_request_redial(void)
+{
+    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+    s_redial_requested = true;
+    xSemaphoreGive(s_status_mutex);
+    ESP_LOGW(TAG, "PPP redial requested");
 }
 
 esp_netif_t *modem_get_netif(void)
@@ -919,10 +928,30 @@ static void modem_task(void *arg)
         char apn[MODEM_APN_MAX];
         strlcpy(apn, s_apn, sizeof(apn));
         bool apn_dirty = s_apn_dirty;
+        bool redial_requested = s_redial_requested;
+        s_redial_requested = false;
         xSemaphoreGive(s_status_mutex);
 
         st.ppp_up = ppp_up;
         st.pdp_active = ppp_up;  // LED turns blue when the data link is up
+
+        if (redial_requested) {
+            ESP_LOGW(TAG, "forcing a clean PPP redial");
+            if (ppp_up) {
+                data_disconnect();
+            }
+            xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+            s_ppp_up = false;
+            s_ppp_ip[0] = '\0';
+            xSemaphoreGive(s_status_mutex);
+            ppp_up = false;
+            st.ppp_up = false;
+            st.pdp_active = false;
+            st.ip_addr[0] = '\0';
+            was_up = false;
+            healthy_polls = 0;
+            last_dial_us = 0;
+        }
 
         // PPP just dropped (carrier hangup, LCP failure): leave data mode so
         // the AT channel comes back, then the loop below polls and redials.
