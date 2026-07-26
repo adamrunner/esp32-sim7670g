@@ -55,12 +55,11 @@ done
 # --- build ------------------------------------------------------------------
 
 if [[ $DO_BUILD -eq 1 ]]; then
-    if ! command -v idf.py >/dev/null 2>&1; then
-        # ESP-IDF venv is py3.13 on this machine; export.sh picks the wrong
-        # one without IDF_PYTHON_ENV_PATH.
-        export IDF_PYTHON_ENV_PATH="$HOME/.espressif/python_env/idf5.5_py3.13_env"
-        source "$HOME/esp/v5.5/esp-idf/export.sh"
-    fi
+    # Pin the known-good IDF environment rather than inheriting whichever
+    # idf.py happens to be on PATH. The py3.13 environment intentionally has
+    # an esptool development build that IDF's stable constraints reject.
+    export IDF_PYTHON_ENV_PATH="${RELEASE_IDF_PYTHON_ENV_PATH:-$HOME/.espressif/python_env/idf5.5_py3.10_env}"
+    source "$HOME/esp/v5.5/esp-idf/export.sh"
     (cd "$REPO_ROOT" && idf.py build)
 fi
 

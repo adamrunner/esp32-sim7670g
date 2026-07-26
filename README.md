@@ -127,16 +127,16 @@ Requires a sibling checkout of
 `bms_interface` components are pulled from `../../esp32-shared-components/…`
 as component-manager path dependencies (see `main/idf_component.yml`).
 
-ESP-IDF v5.5 (at `~/esp/v5.5/esp-idf`). Fish config pins
-`IDF_PYTHON_ENV_PATH` to the py3.13 virtualenv and defines `get_idf`
-(PATH's `python3` is PlatformIO's 3.11, which has no IDF env):
+ESP-IDF v5.5 (at `~/esp/v5.5/esp-idf`). Use the py3.10 IDF virtualenv;
+it carries the stable tool versions accepted by IDF's dependency constraints:
 
 ```sh
-get_idf   # fish: sources ~/esp/v5.5/esp-idf/export.fish
+set -gx IDF_PYTHON_ENV_PATH $HOME/.espressif/python_env/idf5.5_py3.10_env
+source ~/esp/v5.5/esp-idf/export.fish
 idf.py -p /dev/cu.usbmodem5B910478111 build flash
 ```
 
-From bash, set `IDF_PYTHON_ENV_PATH=$HOME/.espressif/python_env/idf5.5_py3.13_env`
+From bash, set `IDF_PYTHON_ENV_PATH=$HOME/.espressif/python_env/idf5.5_py3.10_env`
 and source `export.sh` instead.
 
 The `/dev/cu.usbmodem5B9...` port is the ESP32-S3's native USB-Serial-JTAG
