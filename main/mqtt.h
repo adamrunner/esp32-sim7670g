@@ -35,6 +35,10 @@ typedef struct {
     char base_topic[MQTT_TOPIC_MAX];
     uint32_t published;      // PUBACK-confirmed telemetry messages since boot
     uint32_t publish_fails;  // publish attempts that timed out or errored
+    bool availability_confirmed;  // retained online state received a PUBACK
+    uint32_t availability_attempts;
+    uint32_t availability_failures;
+    char availability_last_error[64];
     char last_error[64];
 } mqtt_status_t;
 
