@@ -48,6 +48,7 @@ static uint32_t s_status_seq;
 static bool s_ever_connected;
 static bool s_time_status_published;
 static bool s_availability_requested;
+static TickType_t s_availability_last_attempt;
 
 typedef enum {
     STATUS_REASON_BOOT = 0,
@@ -496,33 +497,8 @@ static void status_task(void *arg)
 {
     while (true) {
         xSemaphoreTake(s_mutex, portMAX_DELAY);
-        bool should_publish_availability =
-            s_connected && s_availability_requested;
         bool should_publish = s_ever_connected && !s_time_status_published;
-        if (should_publish_availability) {
-            s_status.availability_attempts++;
-        }
         xSemaphoreGive(s_mutex);
-
-        if (should_publish_availability) {
-            esp_err_t err = publish_availability(true);
-            xSemaphoreTake(s_mutex, portMAX_DELAY);
-            if (err == ESP_OK) {
-                s_status.availability_confirmed = true;
-                s_status.availability_last_error[0] = '\0';
-                s_availability_requested = false;
-            } else {
-                s_status.availability_failures++;
-                strlcpy(s_status.availability_last_error,
-                        esp_err_to_name(err),
-                        sizeof(s_status.availability_last_error));
-            }
-            xSemaphoreGive(s_mutex);
-            if (err != ESP_OK) {
-                ESP_LOGW(TAG, "retained online publish failed: %s; retrying",
-                         esp_err_to_name(err));
-            }
-        }
 
         if (should_publish && timesync_valid() &&
             publish_status_event(STATUS_REASON_TIME_SYNCHRONIZED) == ESP_OK) {
@@ -531,6 +507,44 @@ static void status_task(void *arg)
             xSemaphoreGive(s_mutex);
         }
         vTaskDelay(pdMS_TO_TICKS(STATUS_TIME_POLL_MS));
+    }
+}
+
+void mqtt_maintenance_tick(void)
+{
+    TickType_t now = xTaskGetTickCount();
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool should_publish =
+        s_connected && s_availability_requested &&
+        (s_availability_last_attempt == 0 ||
+         now - s_availability_last_attempt >= pdMS_TO_TICKS(2000));
+    if (should_publish) {
+        s_availability_last_attempt = now;
+        s_status.availability_attempts++;
+    }
+    xSemaphoreGive(s_mutex);
+
+    if (!should_publish) {
+        return;
+    }
+
+    esp_err_t err = publish_availability(true);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (err == ESP_OK) {
+        s_status.availability_confirmed = true;
+        s_status.availability_last_error[0] = '\0';
+        s_availability_requested = false;
+    } else {
+        s_status.availability_failures++;
+        strlcpy(s_status.availability_last_error,
+                esp_err_to_name(err),
+                sizeof(s_status.availability_last_error));
+    }
+    xSemaphoreGive(s_mutex);
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "retained online publish failed: %s; retrying",
+                 esp_err_to_name(err));
     }
 }
 

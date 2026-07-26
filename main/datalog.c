@@ -422,6 +422,7 @@ static void datalog_task(void *arg)
             sd_flush();
         }
         spool_replay_tick();
+        mqtt_maintenance_tick();
     }
 }
 

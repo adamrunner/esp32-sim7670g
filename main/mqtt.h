@@ -60,6 +60,11 @@ void mqtt_get_status(mqtt_status_t *out);
 void mqtt_status_json(cJSON *root);
 bool mqtt_connected(void);
 
+// Retry retained online availability from the existing datalog task. This
+// avoids allocating another task during the constrained post-boot window.
+// Call from one task only; the function may wait for a bounded QoS 1 PUBACK.
+void mqtt_maintenance_tick(void);
+
 // Publish a retained schema-v2 OTA-verified status event to
 // "bms/status/<device_id>". Boot, reconnect, pending-verify, and first-time-
 // synchronization events are sent automatically. Each logical event receives
