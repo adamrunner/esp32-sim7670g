@@ -194,9 +194,41 @@ static esp_err_t ota_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "image_size", st.image_size);
     cJSON_AddStringToObject(root, "error", st.error);
     cJSON_AddBoolToObject(root, "last_check_ok", st.last_check_ok);
+    cJSON_AddNumberToObject(root, "manifest_attempts", st.manifest_attempts);
+    cJSON_AddNumberToObject(root, "download_attempts", st.download_attempts);
     if (st.last_check_us) {
         cJSON_AddNumberToObject(root, "last_check_age_s",
                                 (double)((esp_timer_get_time() - st.last_check_us) / 1000000));
+    }
+    if (st.next_check_us) {
+        int64_t remaining_us = st.next_check_us - esp_timer_get_time();
+        cJSON_AddNumberToObject(root, "next_check_in_s",
+                                remaining_us > 0 ? (double)((remaining_us + 999999) / 1000000)
+                                                 : 0);
+    } else {
+        cJSON_AddNullToObject(root, "next_check_in_s");
+    }
+    if (st.failure.stage[0]) {
+        cJSON *failure = cJSON_AddObjectToObject(root, "failure");
+        cJSON_AddStringToObject(failure, "stage", st.failure.stage);
+        cJSON_AddNumberToObject(failure, "esp_err", st.failure.esp_err);
+        cJSON_AddStringToObject(failure, "esp_err_name",
+                               esp_err_to_name((esp_err_t)st.failure.esp_err));
+        cJSON_AddNumberToObject(failure, "tls_err", st.failure.tls_err);
+        cJSON_AddStringToObject(failure, "tls_err_name",
+                               st.failure.tls_err
+                                   ? esp_err_to_name((esp_err_t)st.failure.tls_err)
+                                   : "");
+        cJSON_AddNumberToObject(failure, "mbedtls_err", st.failure.mbedtls_err);
+        cJSON_AddNumberToObject(failure, "tls_flags", st.failure.tls_flags);
+        cJSON_AddNumberToObject(failure, "sock_errno", st.failure.sock_errno);
+        cJSON_AddNumberToObject(failure, "free_heap", st.failure.free_heap);
+        cJSON_AddNumberToObject(failure, "largest_free_block",
+                               st.failure.largest_free_block);
+        cJSON_AddNumberToObject(failure, "minimum_free_heap",
+                               st.failure.minimum_free_heap);
+    } else {
+        cJSON_AddNullToObject(root, "failure");
     }
     cJSON_AddNumberToObject(root, "free_heap", (double)esp_get_free_heap_size());
     cJSON_AddNumberToObject(root, "largest_free_block",

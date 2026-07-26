@@ -56,6 +56,7 @@ static const char *TAG = "ota";
 // range request ~4-6 s.
 #define HTTP_TIMEOUT_MS         60000
 #define RANGE_REQUEST_SIZE      (128 * 1024)
+#define MANIFEST_ATTEMPTS       4
 #define DOWNLOAD_ATTEMPTS       4
 #define RETRY_DELAY_MS          20000
 #define RESUME_SAVE_INTERVAL    (128 * 1024)
@@ -78,7 +79,6 @@ typedef struct {
 } manifest_t;
 
 typedef struct {
-    bool manual;
     ota_check_opts_t opts;
 } check_req_t;
 
@@ -134,6 +134,118 @@ static void set_progress(int bytes_read, int image_size)
     st_unlock();
 }
 
+static void failure_snapshot(ota_failure_t *failure, const char *stage, esp_err_t err)
+{
+    if (!failure) {
+        return;
+    }
+    memset(failure, 0, sizeof(*failure));
+    strlcpy(failure->stage, stage, sizeof(failure->stage));
+    failure->esp_err = err;
+    failure->free_heap = esp_get_free_heap_size();
+    failure->largest_free_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    failure->minimum_free_heap = esp_get_minimum_free_heap_size();
+}
+
+static void failure_capture_http(ota_failure_t *failure, const char *stage,
+                                 esp_err_t err, esp_http_client_handle_t client)
+{
+    failure_snapshot(failure, stage, err);
+    if (!failure || !client) {
+        return;
+    }
+
+    int sock_errno = esp_http_client_get_errno(client);
+    failure->sock_errno = sock_errno > 0 ? sock_errno : 0;
+
+    int mbedtls_err = 0;
+    int tls_flags = 0;
+    esp_err_t tls_err =
+        esp_http_client_get_and_clear_last_tls_error(client, &mbedtls_err, &tls_flags);
+    failure->tls_err = tls_err == ESP_OK ? 0 : tls_err;
+    failure->mbedtls_err = mbedtls_err;
+    failure->tls_flags = tls_flags;
+}
+
+static void failure_restage(ota_failure_t *failure, const char *stage, esp_err_t err)
+{
+    if (!failure) {
+        return;
+    }
+    strlcpy(failure->stage, stage, sizeof(failure->stage));
+    failure->esp_err = err;
+    failure->free_heap = esp_get_free_heap_size();
+    failure->largest_free_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    failure->minimum_free_heap = esp_get_minimum_free_heap_size();
+}
+
+static void record_failure(const ota_failure_t *failure)
+{
+    if (!failure) {
+        return;
+    }
+    st_lock();
+    s_st.failure = *failure;
+    st_unlock();
+    ESP_LOGE(TAG,
+             "%s failed: esp=%s tls=%s mbedtls=0x%x flags=0x%x errno=%d "
+             "heap=%u largest=%u minimum=%u",
+             failure->stage,
+             esp_err_to_name(failure->esp_err),
+             failure->tls_err ? esp_err_to_name(failure->tls_err) : "none",
+             (unsigned)failure->mbedtls_err, (unsigned)failure->tls_flags,
+             failure->sock_errno,
+             (unsigned)failure->free_heap,
+             (unsigned)failure->largest_free_block,
+             (unsigned)failure->minimum_free_heap);
+}
+
+static void clear_failure(void)
+{
+    st_lock();
+    memset(&s_st.failure, 0, sizeof(s_st.failure));
+    st_unlock();
+}
+
+static void begin_cycle(void)
+{
+    st_lock();
+    memset(&s_st.failure, 0, sizeof(s_st.failure));
+    s_st.manifest_attempts = 0;
+    s_st.download_attempts = 0;
+    s_st.next_check_us = 0;
+    s_st.last_check_ok = false;
+    s_st.bytes_read = 0;
+    s_st.image_size = 0;
+    s_st.progress_pct = 0;
+    st_unlock();
+    set_state(OTA_STATE_CHECKING);
+}
+
+static void set_manifest_attempt(int attempt)
+{
+    st_lock();
+    s_st.manifest_attempts = attempt;
+    st_unlock();
+}
+
+static void set_download_attempt(int attempt)
+{
+    st_lock();
+    s_st.download_attempts = attempt;
+    st_unlock();
+}
+
+static esp_err_t ota_http_event(esp_http_client_event_t *event)
+{
+    ota_failure_t *failure = event->user_data;
+    if (event->event_id == HTTP_EVENT_ERROR && failure && !failure->stage[0]) {
+        failure_capture_http(failure, "download_http",
+                             ESP_ERR_HTTP_CONNECT, event->client);
+    }
+    return ESP_OK;
+}
+
 esp_err_t ota_check_now(const ota_check_opts_t *opts)
 {
     if (!s_trigger) {
@@ -145,7 +257,7 @@ esp_err_t ota_check_now(const ota_check_opts_t *opts)
     if (busy) {
         return ESP_ERR_INVALID_STATE;
     }
-    check_req_t req = { .manual = true };
+    check_req_t req = {0};
     if (opts) {
         req.opts = *opts;
     }
@@ -230,9 +342,17 @@ static bool recover_transport(bool force_cellular)
 // short description in errbuf. reach_only skips the body/parse and succeeds
 // as soon as any HTTP response arrives (rollback self-test).
 static esp_err_t fetch_manifest(const char *url, bool force_cellular, bool reach_only,
-                                manifest_t *m, char *errbuf, size_t errlen)
+                                manifest_t *m, char *errbuf, size_t errlen,
+                                ota_failure_t *failure, bool *retryable)
 {
     static char body[1024];    // single OTA task; manifest is ~200 bytes
+
+    if (failure) {
+        memset(failure, 0, sizeof(*failure));
+    }
+    if (retryable) {
+        *retryable = false;
+    }
 
     struct ifreq ifr = {0};
     esp_http_client_config_t cfg = {
@@ -244,6 +364,10 @@ static esp_err_t fetch_manifest(const char *url, bool force_cellular, bool reach
     if (force_cellular) {
         if (!cellular_ifreq(&ifr)) {
             snprintf(errbuf, errlen, "cellular interface unavailable");
+            failure_snapshot(failure, "manifest_transport", ESP_ERR_INVALID_STATE);
+            if (retryable) {
+                *retryable = true;
+            }
             return ESP_ERR_INVALID_STATE;
         }
         cfg.if_name = &ifr;
@@ -252,17 +376,29 @@ static esp_err_t fetch_manifest(const char *url, bool force_cellular, bool reach
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) {
         snprintf(errbuf, errlen, "http client init failed");
-        return ESP_FAIL;
+        failure_snapshot(failure, "manifest_init", ESP_ERR_NO_MEM);
+        if (retryable) {
+            *retryable = true;
+        }
+        return ESP_ERR_NO_MEM;
     }
 
     esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
         snprintf(errbuf, errlen, "connect failed: %s", esp_err_to_name(err));
+        failure_capture_http(failure, "manifest_connect", err, client);
+        if (retryable) {
+            *retryable = true;
+        }
         goto out;
     }
     if (esp_http_client_fetch_headers(client) < 0) {
         snprintf(errbuf, errlen, "no HTTP response");
-        err = ESP_FAIL;
+        err = ESP_ERR_HTTP_FETCH_HEADER;
+        failure_capture_http(failure, "manifest_headers", err, client);
+        if (retryable) {
+            *retryable = true;
+        }
         goto out;
     }
     int status = esp_http_client_get_status_code(client);
@@ -273,7 +409,8 @@ static esp_err_t fetch_manifest(const char *url, bool force_cellular, bool reach
     }
     if (status != 200) {
         snprintf(errbuf, errlen, "manifest HTTP %d", status);
-        err = ESP_FAIL;
+        err = ESP_ERR_INVALID_RESPONSE;
+        failure_snapshot(failure, "manifest_http", err);
         goto out;
     }
 
@@ -285,7 +422,11 @@ static esp_err_t fetch_manifest(const char *url, bool force_cellular, bool reach
     body[total] = '\0';
     if (total <= 0) {
         snprintf(errbuf, errlen, "empty manifest body");
-        err = ESP_FAIL;
+        err = ESP_ERR_INVALID_RESPONSE;
+        failure_capture_http(failure, "manifest_empty", err, client);
+        if (retryable) {
+            *retryable = true;
+        }
         goto out;
     }
 
@@ -303,7 +444,8 @@ static esp_err_t fetch_manifest(const char *url, bool force_cellular, bool reach
         size->valueint <= 0) {
         snprintf(errbuf, errlen, "manifest malformed");
         cJSON_Delete(root);
-        err = ESP_FAIL;
+        err = ESP_ERR_INVALID_RESPONSE;
+        failure_snapshot(failure, "manifest_parse", err);
         goto out;
     }
     strlcpy(m->version, ver->valuestring, sizeof(m->version));
@@ -475,8 +617,12 @@ static bool sha256_matches(const uint8_t digest[32], const char *hex)
 // One esp_https_ota attempt. Returns ESP_OK when the image is written,
 // verified and marked bootable (caller reboots).
 static esp_err_t attempt_update(const manifest_t *m, bool force_cellular,
-                                char *errbuf, size_t errlen)
+                                char *errbuf, size_t errlen, ota_failure_t *failure)
 {
+    if (failure) {
+        memset(failure, 0, sizeof(*failure));
+    }
+
     struct ifreq ifr = {0};
     esp_http_client_config_t http = {
         .url = m->url,
@@ -484,10 +630,13 @@ static esp_err_t attempt_update(const manifest_t *m, bool force_cellular,
         .timeout_ms = HTTP_TIMEOUT_MS,
         .buffer_size = 4096,
         .keep_alive_enable = true,
+        .event_handler = ota_http_event,
+        .user_data = failure,
     };
     if (force_cellular) {
         if (!cellular_ifreq(&ifr)) {
             snprintf(errbuf, errlen, "cellular interface unavailable");
+            failure_snapshot(failure, "download_transport", ESP_ERR_INVALID_STATE);
             return ESP_ERR_INVALID_STATE;
         }
         http.if_name = &ifr;
@@ -509,12 +658,18 @@ static esp_err_t attempt_update(const manifest_t *m, bool force_cellular,
     esp_err_t err = esp_https_ota_begin(&cfg, &handle);
     if (err != ESP_OK) {
         snprintf(errbuf, errlen, "ota begin failed: %s", esp_err_to_name(err));
+        if (failure && failure->stage[0]) {
+            failure_restage(failure, "download_begin", err);
+        } else {
+            failure_snapshot(failure, "download_begin", err);
+        }
         return err;
     }
 
     int image_size = esp_https_ota_get_image_size(handle);
     if (image_size != m->size) {
         snprintf(errbuf, errlen, "size mismatch: server %d, manifest %d", image_size, m->size);
+        failure_snapshot(failure, "download_size", ESP_ERR_INVALID_RESPONSE);
         esp_https_ota_abort(handle);
         resume_clear();     // server content changed; partial data is stale
         return ESP_FAIL;
@@ -542,6 +697,13 @@ static esp_err_t attempt_update(const manifest_t *m, bool force_cellular,
     if (err != ESP_OK || !esp_https_ota_is_complete_data_received(handle)) {
         snprintf(errbuf, errlen, "download failed at %d/%d: %s",
                  total, image_size, esp_err_to_name(err));
+        if (failure && failure->stage[0]) {
+            failure_restage(failure, "download_transfer",
+                            err != ESP_OK ? err : ESP_FAIL);
+        } else {
+            failure_snapshot(failure, "download_transfer",
+                             err != ESP_OK ? err : ESP_FAIL);
+        }
         esp_https_ota_abort(handle);
         if (total > 0) {
             resume_save(m, total);  // next attempt continues from here
@@ -562,11 +724,13 @@ static esp_err_t attempt_update(const manifest_t *m, bool force_cellular,
     uint8_t digest[32];
     if (!slot || slot_sha256(slot, m->size, digest) != ESP_OK) {
         snprintf(errbuf, errlen, "sha256 read-back failed");
+        failure_snapshot(failure, "download_verify", ESP_FAIL);
         esp_https_ota_abort(handle);
         return ESP_FAIL;
     }
     if (!sha256_matches(digest, m->sha256)) {
         snprintf(errbuf, errlen, "sha256 mismatch — rejecting image");
+        failure_snapshot(failure, "download_verify", ESP_ERR_INVALID_CRC);
         esp_https_ota_abort(handle);
         resume_clear();     // written data is not the manifest's image
         return ESP_FAIL;
@@ -576,6 +740,7 @@ static esp_err_t attempt_update(const manifest_t *m, bool force_cellular,
     err = esp_https_ota_finish(handle);     // validates structure, sets boot partition
     if (err != ESP_OK) {
         snprintf(errbuf, errlen, "ota finish failed: %s", esp_err_to_name(err));
+        failure_snapshot(failure, "download_finish", err);
         return err;
     }
     resume_clear();
@@ -590,8 +755,10 @@ static void run_update(const manifest_t *m, bool force_cellular)
     set_state(OTA_STATE_DOWNLOADING);
 
     char errbuf[OTA_ERRMSG_MAX] = "";
+    ota_failure_t failure = {0};
     esp_err_t err = ESP_FAIL;
     for (int attempt = 1; attempt <= DOWNLOAD_ATTEMPTS; attempt++) {
+        set_download_attempt(attempt);
         if (attempt > 1) {
             ESP_LOGW(TAG, "recovering transport before download attempt %d/%d: %s",
                      attempt, DOWNLOAD_ATTEMPTS, errbuf);
@@ -599,14 +766,18 @@ static void run_update(const manifest_t *m, bool force_cellular)
                 snprintf(errbuf, sizeof(errbuf),
                          "transport did not recover before attempt %d", attempt);
                 err = ESP_ERR_TIMEOUT;
+                failure_snapshot(&failure, "download_recovery", err);
+                record_failure(&failure);
                 break;
             }
             set_state(OTA_STATE_DOWNLOADING);
         }
-        err = attempt_update(m, force_cellular, errbuf, sizeof(errbuf));
+        err = attempt_update(m, force_cellular, errbuf, sizeof(errbuf), &failure);
         if (err == ESP_OK) {
+            clear_failure();
             break;
         }
+        record_failure(&failure);
         log_heap_state("after failed download attempt");
     }
 
@@ -621,6 +792,8 @@ static void run_update(const manifest_t *m, bool force_cellular)
         if (running) {
             esp_ota_set_boot_partition(running);
         }
+        failure_snapshot(&failure, "attempt_persist", err);
+        record_failure(&failure);
         set_error("could not persist OTA attempt: %s", esp_err_to_name(err));
         return;
     }
@@ -642,8 +815,37 @@ static void run_check(const check_req_t *req)
     ESP_LOGI(TAG, "checking %s%s", url, cell ? " (bound to cellular)" : "");
 
     manifest_t m;
-    char errbuf[OTA_ERRMSG_MAX];
-    esp_err_t err = fetch_manifest(url, cell, false, &m, errbuf, sizeof(errbuf));
+    char errbuf[OTA_ERRMSG_MAX] = "";
+    ota_failure_t failure = {0};
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 1; attempt <= MANIFEST_ATTEMPTS; attempt++) {
+        set_manifest_attempt(attempt);
+        bool retryable = false;
+        err = fetch_manifest(url, cell, false, &m, errbuf, sizeof(errbuf),
+                             &failure, &retryable);
+        if (err == ESP_OK) {
+            clear_failure();
+            break;
+        }
+
+        record_failure(&failure);
+        if (!retryable || attempt == MANIFEST_ATTEMPTS) {
+            break;
+        }
+
+        ESP_LOGW(TAG, "recovering transport before manifest attempt %d/%d: %s",
+                 attempt + 1, MANIFEST_ATTEMPTS, errbuf);
+        if (!recover_transport(cell)) {
+            err = ESP_ERR_TIMEOUT;
+            snprintf(errbuf, sizeof(errbuf),
+                     "transport did not recover before manifest attempt %d",
+                     attempt + 1);
+            failure_snapshot(&failure, "manifest_recovery", err);
+            record_failure(&failure);
+            break;
+        }
+        set_state(OTA_STATE_CHECKING);
+    }
 
     st_lock();
     s_st.last_check_us = esp_timer_get_time();
@@ -714,7 +916,7 @@ static void rollback_selftest(void)
         modem_suspend_polls(true);
         esp_err_t fetch_err = ready
                                   ? fetch_manifest(OTA_MANIFEST_URL, false, true, NULL,
-                                                   errbuf, sizeof(errbuf))
+                                                   errbuf, sizeof(errbuf), NULL, NULL)
                                   : ESP_ERR_TIMEOUT;
         modem_suspend_polls(false);
         if (!ready) {
@@ -760,16 +962,24 @@ static void ota_task(void *arg)
 
     uint32_t wait_ms = FIRST_CHECK_DELAY_MS;
     while (1) {
+        st_lock();
+        s_st.next_check_us = esp_timer_get_time() + (int64_t)wait_ms * 1000;
+        st_unlock();
+
         check_req_t req = {0};
         if (xQueueReceive(s_trigger, &req, pdMS_TO_TICKS(wait_ms)) != pdTRUE) {
-            req.manual = false;     // timer-driven check, defaults
+            memset(&req, 0, sizeof(req));  // timer-driven check, defaults
         }
 
         st_lock();
         s_busy = true;
         st_unlock();
 
+        begin_cycle();
         if (!wait_for_transport(req.opts.force_cellular, TRANSPORT_READY_MS)) {
+            ota_failure_t failure;
+            failure_snapshot(&failure, "transport_ready", ESP_ERR_TIMEOUT);
+            record_failure(&failure);
             set_error("network not ready for OTA check");
         } else {
             // Cover the manifest request as well as the binary transfer.
@@ -787,11 +997,9 @@ static void ota_task(void *arg)
         bool failed = s_st.state == OTA_STATE_ERROR;
         st_unlock();
 
-        // Transport or download failures get another automatic chance sooner
-        // than the normal hourly cadence.
-        wait_ms = ((!ok || failed) && !req.manual)
-                      ? CHECK_RETRY_MS
-                      : CHECK_INTERVAL_MS;
+        // Any failed cycle gets another automatic chance sooner than the
+        // normal hourly cadence, including a manually requested check.
+        wait_ms = (!ok || failed) ? CHECK_RETRY_MS : CHECK_INTERVAL_MS;
     }
 }
 

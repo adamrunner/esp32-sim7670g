@@ -8,6 +8,7 @@
 #define OTA_VERSION_MAX 32      // matches esp_app_desc_t.version
 #define OTA_ERRMSG_MAX  96
 #define OTA_URL_MAX     256
+#define OTA_FAILURE_STAGE_MAX 24
 
 typedef enum {
     OTA_STATE_IDLE = 0,
@@ -17,6 +18,18 @@ typedef enum {
     OTA_STATE_WAIT_REBOOT,  // image installed, restarting shortly
     OTA_STATE_ERROR,        // last check/update failed (see error)
 } ota_state_t;
+
+typedef struct {
+    char stage[OTA_FAILURE_STAGE_MAX]; // e.g. "manifest_connect"
+    int esp_err;                       // top-level ESP-IDF error
+    int tls_err;                       // ESP-TLS error, 0 when unavailable
+    int mbedtls_err;                   // underlying mbedTLS error
+    int tls_flags;                     // certificate verification flags
+    int sock_errno;                    // socket errno, 0 when unavailable
+    uint32_t free_heap;                // heap snapshot at failure
+    uint32_t largest_free_block;
+    uint32_t minimum_free_heap;
+} ota_failure_t;
 
 typedef struct {
     ota_state_t state;
@@ -34,6 +47,10 @@ typedef struct {
     char error[OTA_ERRMSG_MAX];             // valid when state == OTA_STATE_ERROR
     int64_t last_check_us;                  // esp_timer time of last manifest fetch, 0 = never
     bool last_check_ok;
+    int manifest_attempts;                  // attempts used by the current/last cycle
+    int download_attempts;
+    int64_t next_check_us;                  // scheduled monotonic time, 0 while active
+    ota_failure_t failure;                  // structured details for the last failure
 } ota_status_t;
 
 // Optional overrides for a manually triggered check (web UI / testing).

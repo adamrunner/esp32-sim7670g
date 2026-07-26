@@ -379,7 +379,22 @@ async function refreshOta() {
       txt += ' ' + s.progress_pct + '% (' + Math.round(s.bytes_read / 1024) + '/' +
              Math.round(s.image_size / 1024) + ' KB)';
     pill($('fw_state'), txt, cls);
-    if (s.state === 'error') $('otamsg').textContent = s.error || 'update failed';
+    if (s.state === 'error') {
+      const details = [];
+      if (s.failure) {
+        details.push(s.failure.stage);
+        if (s.failure.tls_err_name) details.push(s.failure.tls_err_name);
+        if (s.failure.mbedtls_err)
+          details.push('mbedTLS 0x' + Math.abs(s.failure.mbedtls_err).toString(16));
+        if (s.failure.sock_errno) details.push('errno ' + s.failure.sock_errno);
+        details.push('heap ' + Math.round(s.failure.free_heap / 1024) + ' KB, largest ' +
+                     Math.round(s.failure.largest_free_block / 1024) + ' KB');
+      }
+      if (s.next_check_in_s)
+        details.push('retry in ' + Math.max(1, Math.round(s.next_check_in_s / 60)) + ' min');
+      $('otamsg').textContent = (s.error || 'update failed') +
+        (details.length ? ' · ' + details.join(' · ') : '');
+    }
     else if (!otaMsgLocal) $('otamsg').textContent = '';
     $('fw_available').textContent = s.update_available ? s.available_version : 'none (up to date)';
     $('fw_lastcheck').textContent = s.last_check_age_s === undefined ? 'never'
