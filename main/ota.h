@@ -23,6 +23,9 @@ typedef struct {
     char running_version[OTA_VERSION_MAX];  // esp_app_get_description()
     char running_slot[17];                  // partition label, e.g. "ota_0"
     bool pending_verify;                    // running image not yet confirmed
+    bool rollback_detected;                 // prior OTA target failed verification
+    char rollback_from_version[OTA_VERSION_MAX];   // failed target version
+    char rollback_target_version[OTA_VERSION_MAX]; // restored version
     bool update_available;                  // manifest version != running
     char available_version[OTA_VERSION_MAX];
     int progress_pct;                       // 0-100 while downloading
@@ -47,6 +50,11 @@ void ota_init(void);
 
 // Thread-safe snapshot of the OTA state for the web UI.
 void ota_get_status(ota_status_t *out);
+
+// Clear persisted rollback evidence only after its MQTT status event has been
+// acknowledged by the broker. Returns an NVS error so the evidence survives
+// retry when persistence cannot be updated.
+esp_err_t ota_acknowledge_rollback_evidence(void);
 
 // Trigger an immediate manifest check (and update, on version mismatch).
 // opts may be NULL for defaults. Returns ESP_ERR_INVALID_STATE if a check or

@@ -62,6 +62,9 @@ static const char *TAG = "ota";
 #define NVS_KEY_VERSION         "ver"
 #define NVS_KEY_SHA             "sha"
 #define NVS_KEY_LEN             "len"
+#define ATTEMPT_NVS_NAMESPACE   "otaattempt"
+#define ATTEMPT_NVS_SOURCE      "source"
+#define ATTEMPT_NVS_TARGET      "target"
 
 typedef struct {
     char version[OTA_VERSION_MAX];
@@ -311,6 +314,60 @@ static uint32_t resume_load(const manifest_t *m)
 }
 
 // ---------------------------------------------------------------------------
+// OTA attempt evidence is separate from resumable-download state. It is
+// written only after a complete image becomes bootable, survives the
+// pending-verify boot, and is cleared after successful verification or after
+// a rollback status event is acknowledged by the broker.
+
+static esp_err_t attempt_clear(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(ATTEMPT_NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_erase_all(h);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+static esp_err_t attempt_save(const char *source, const char *target)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(ATTEMPT_NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_str(h, ATTEMPT_NVS_SOURCE, source);
+    if (err == ESP_OK) {
+        err = nvs_set_str(h, ATTEMPT_NVS_TARGET, target);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+static bool attempt_load(char source[OTA_VERSION_MAX],
+                         char target[OTA_VERSION_MAX])
+{
+    nvs_handle_t h;
+    size_t source_len = OTA_VERSION_MAX;
+    size_t target_len = OTA_VERSION_MAX;
+    if (nvs_open(ATTEMPT_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+    bool found = nvs_get_str(h, ATTEMPT_NVS_SOURCE, source, &source_len) == ESP_OK &&
+                 nvs_get_str(h, ATTEMPT_NVS_TARGET, target, &target_len) == ESP_OK;
+    nvs_close(h);
+    return found;
+}
+
+// ---------------------------------------------------------------------------
 // sha256 read-back of the written slot. esp_https_ota validates the image
 // structure but not the manifest hash; reading the flash back verifies what
 // was actually written end to end.
@@ -500,6 +557,16 @@ static void run_update(const manifest_t *m, bool force_cellular)
         return;
     }
 
+    err = attempt_save(s_st.running_version, m->version);
+    if (err != ESP_OK) {
+        const esp_partition_t *running = esp_ota_get_running_partition();
+        if (running) {
+            esp_ota_set_boot_partition(running);
+        }
+        set_error("could not persist OTA attempt: %s", esp_err_to_name(err));
+        return;
+    }
+
     ESP_LOGI(TAG, "free heap after download: %u", (unsigned)esp_get_free_heap_size());
     ESP_LOGI(TAG, "update installed; rebooting into %s in 3 s", m->version);
     set_state(OTA_STATE_WAIT_REBOOT);
@@ -590,6 +657,11 @@ static void rollback_selftest(void)
             esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
             if (err == ESP_OK) {
                 ESP_LOGI(TAG, "self-test passed (HTTPS reachable); image marked valid");
+                esp_err_t clear_err = attempt_clear();
+                if (clear_err != ESP_OK) {
+                    ESP_LOGW(TAG, "could not clear verified OTA attempt marker: %s",
+                             esp_err_to_name(clear_err));
+                }
                 st_lock();
                 s_st.pending_verify = false;
                 st_unlock();
@@ -658,9 +730,49 @@ void ota_init(void)
         s_st.pending_verify = true;
     }
 
+    char attempt_source[OTA_VERSION_MAX] = "";
+    char attempt_target[OTA_VERSION_MAX] = "";
+    if (attempt_load(attempt_source, attempt_target)) {
+        if (s_st.pending_verify &&
+            strcmp(s_st.running_version, attempt_target) == 0) {
+            ESP_LOGI(TAG, "OTA attempt %s -> %s is pending verification",
+                     attempt_source, attempt_target);
+        } else if (!s_st.pending_verify &&
+                   strcmp(s_st.running_version, attempt_source) == 0 &&
+                   strcmp(attempt_source, attempt_target) != 0) {
+            s_st.rollback_detected = true;
+            strlcpy(s_st.rollback_from_version, attempt_target,
+                    sizeof(s_st.rollback_from_version));
+            strlcpy(s_st.rollback_target_version, attempt_source,
+                    sizeof(s_st.rollback_target_version));
+            ESP_LOGE(TAG, "detected OTA rollback %s -> %s",
+                     attempt_target, attempt_source);
+        } else {
+            ESP_LOGW(TAG, "discarding stale OTA attempt marker %s -> %s "
+                          "(running %s%s)",
+                     attempt_source, attempt_target, s_st.running_version,
+                     s_st.pending_verify ? ", pending verify" : "");
+            attempt_clear();
+        }
+    }
+
     ESP_LOGI(TAG, "running %s from %s%s", s_st.running_version, s_st.running_slot,
              s_st.pending_verify ? " (pending verify)" : "");
 
     // TLS handshake + esp_https_ota want real stack: 12 KB is comfortable.
     xTaskCreate(ota_task, "ota", 12288, NULL, 4, NULL);
+}
+
+esp_err_t ota_acknowledge_rollback_evidence(void)
+{
+    esp_err_t err = attempt_clear();
+    if (err != ESP_OK) {
+        return err;
+    }
+    st_lock();
+    s_st.rollback_detected = false;
+    s_st.rollback_from_version[0] = '\0';
+    s_st.rollback_target_version[0] = '\0';
+    st_unlock();
+    return ESP_OK;
 }

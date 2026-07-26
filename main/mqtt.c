@@ -42,6 +42,7 @@ static mqtt_config_t s_cfg;
 static mqtt_status_t s_status;
 static volatile bool s_connected;
 static volatile int s_pending_msg_id = -1;
+static volatile int s_rollback_msg_id = -1;
 static char s_boot_id[17];
 static uint32_t s_status_seq;
 static bool s_ever_connected;
@@ -53,6 +54,7 @@ typedef enum {
     STATUS_REASON_MQTT_RECONNECTED,
     STATUS_REASON_OTA_PENDING_VERIFY,
     STATUS_REASON_OTA_VERIFIED,
+    STATUS_REASON_ROLLBACK_DETECTED,
 } status_reason_t;
 
 static const char *status_reason_str(status_reason_t reason)
@@ -63,6 +65,7 @@ static const char *status_reason_str(status_reason_t reason)
     case STATUS_REASON_MQTT_RECONNECTED:  return "mqtt_reconnected";
     case STATUS_REASON_OTA_PENDING_VERIFY: return "ota_pending_verify";
     case STATUS_REASON_OTA_VERIFIED:      return "ota_verified";
+    case STATUS_REASON_ROLLBACK_DETECTED: return "rollback_detected";
     default:                              return "unknown";
     }
 }
@@ -182,10 +185,13 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
 
         ota_status_t ota;
         ota_get_status(&ota);
-        status_reason_t reason = first_connection
-                               ? (ota.pending_verify ? STATUS_REASON_OTA_PENDING_VERIFY
-                                                     : STATUS_REASON_BOOT)
-                               : STATUS_REASON_MQTT_RECONNECTED;
+        status_reason_t reason = ota.rollback_detected
+                               ? STATUS_REASON_ROLLBACK_DETECTED
+                               : first_connection
+                                     ? (ota.pending_verify
+                                            ? STATUS_REASON_OTA_PENDING_VERIFY
+                                            : STATUS_REASON_BOOT)
+                                     : STATUS_REASON_MQTT_RECONNECTED;
         esp_err_t status_err = publish_status_event(reason);
         if (status_err != ESP_OK && first_connection && time_already_valid) {
             xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -195,11 +201,22 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
         break;
     case MQTT_EVENT_DISCONNECTED:
         s_connected = false;
+        s_rollback_msg_id = -1;
         ESP_LOGW(TAG, "disconnected from broker");
         break;
     case MQTT_EVENT_PUBLISHED:
         if (event->msg_id == s_pending_msg_id) {
             xEventGroupSetBits(s_events, EV_PUBACK);
+        }
+        if (event->msg_id == s_rollback_msg_id) {
+            s_rollback_msg_id = -1;
+            esp_err_t err = ota_acknowledge_rollback_evidence();
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "could not acknowledge rollback evidence: %s",
+                         esp_err_to_name(err));
+            } else {
+                ESP_LOGI(TAG, "broker acknowledged rollback status evidence");
+            }
         }
         break;
     case MQTT_EVENT_ERROR:
@@ -424,8 +441,15 @@ static esp_err_t publish_status_event(status_reason_t reason)
         cJSON_AddStringToObject(root, "time_source",
                                time_source_str(time_status.source));
     }
-    cJSON_AddNullToObject(root, "rollback_from_version");
-    cJSON_AddNullToObject(root, "rollback_target_version");
+    if (ota.rollback_detected) {
+        cJSON_AddStringToObject(root, "rollback_from_version",
+                                ota.rollback_from_version);
+        cJSON_AddStringToObject(root, "rollback_target_version",
+                                ota.rollback_target_version);
+    } else {
+        cJSON_AddNullToObject(root, "rollback_from_version");
+        cJSON_AddNullToObject(root, "rollback_target_version");
+    }
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     uint32_t status_seq = s_status_seq + 1;
@@ -443,6 +467,9 @@ static esp_err_t publish_status_event(status_reason_t reason)
                : esp_mqtt_client_enqueue(s_client, topic, payload, 0, 1, 1, true);
     if (msg_id >= 0) {
         s_status_seq = status_seq;
+        if (reason == STATUS_REASON_ROLLBACK_DETECTED) {
+            s_rollback_msg_id = msg_id;
+        }
     }
     xSemaphoreGive(s_mutex);
     cJSON_free(payload);

@@ -175,6 +175,15 @@ if the session disappears unexpectedly. Intentional MQTT reconfiguration
 publishes offline and waits for its acknowledgement before replacing the
 client. This state describes the broker session, not vehicle power.
 
+Before rebooting into an OTA target, firmware persists the source and target
+versions in NVS. Successful self-test verification clears that attempt. If the
+bootloader restores the prior image, its first schema-v2 status event reports
+`status_reason: "rollback_detected"` with `rollback_from_version` set to the
+failed image and `rollback_target_version` set to the restored image. The
+marker is cleared only after the broker acknowledges that status event; a
+disconnect before acknowledgement causes the evidence to be published again
+after reconnection.
+
 Publishing a release:
 
 ```sh
