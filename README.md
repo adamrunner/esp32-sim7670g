@@ -256,6 +256,11 @@ URL actually embedded in the binary before publishing.
 - `POST /api/reboot` — acknowledge with a one-second delay, then restart the
   ESP32 using `esp_restart()`; this does not electrically power-cycle the
   separate SIM7670G modem
+- `POST /api/modem/restart` — asynchronously tear down PPP, issue
+  `AT+CRESET`, recover the modem at its reset UART baud, re-enable GNSS, and
+  let the modem supervisor restore LTE/PPP. Progress and terminal errors are
+  reported by the `modem_restart` object in `GET /api/status`. The request is
+  rejected while OTA is actively checking or installing.
 
 ## Deferred cleanups
 

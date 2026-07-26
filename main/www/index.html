@@ -143,6 +143,10 @@
       <dt>IMEI</dt><dd id="imei">…</dd>
       <dt>ICCID</dt><dd id="iccid">…</dd>
     </dl>
+    <form id="modemrestartform" style="margin-top: 0.75rem;">
+      <button type="submit" id="modemrestartbtn" class="danger" style="flex: 1;">Restart modem</button>
+    </form>
+    <div class="msg" id="modemrestartmsg"></div>
   </div>
   <div class="card">
     <h2>Firmware</h2>
@@ -238,6 +242,22 @@ async function refresh() {
     for (const k of ['operator','rat','band','ip','model','fw_rev','imei','iccid'])
       $(k).textContent = s[k] || '—';
     if (!apnEdited && document.activeElement !== $('apn')) $('apn').value = s.apn || '';
+
+    const mr = s.modem_restart || {};
+    $('modemrestartbtn').disabled = !!mr.active;
+    if (mr.state === 'requested') $('modemrestartmsg').textContent = 'restart queued…';
+    else if (mr.state === 'resetting') $('modemrestartmsg').textContent = 'sending AT+CRESET…';
+    else if (mr.state === 'waiting_at') {
+      $('modemrestartmsg').textContent = 'modem is rebooting — waiting for AT response…';
+    } else if (mr.state === 'complete') {
+      $('modemrestartmsg').textContent = s.ppp_up
+        ? 'modem restarted; cellular data restored'
+        : 'modem restarted; waiting for LTE / PPP';
+    } else if (mr.state === 'error') {
+      $('modemrestartmsg').textContent = 'restart failed: ' +
+        (mr.error_name || ('error ' + mr.error)) +
+        ' — background recovery is still running';
+    }
 
     const g = s.gnss || {};
     if (!g.powered) pill($('gps_state'), 'off', 'bad');
@@ -440,6 +460,25 @@ $('rebootform').addEventListener('submit', async ev => {
     if (!r.ok) $('rebootbtn').disabled = false;
   } catch (e) {
     $('rebootmsg').textContent = 'connection closed — the ESP32 may be rebooting';
+  }
+});
+
+$('modemrestartform').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  if (!confirm('Restart the SIM7670G modem now? Cellular data, MQTT, and GNSS will temporarily disconnect.'))
+    return;
+
+  $('modemrestartbtn').disabled = true;
+  $('modemrestartmsg').textContent = 'requesting modem restart…';
+  try {
+    const r = await fetch('/api/modem/restart', {method: 'POST'});
+    $('modemrestartmsg').textContent = r.ok
+      ? 'restart queued…'
+      : 'error: ' + (await r.text());
+    if (!r.ok) $('modemrestartbtn').disabled = false;
+  } catch (e) {
+    $('modemrestartmsg').textContent =
+      'connection closed — reconnect if this page was using cellular data';
   }
 });
 

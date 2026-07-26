@@ -47,6 +47,7 @@ static const char *TAG = "modem";
 #define NVS_KEY_APN     "apn"
 
 #define CONNECT_RETRY_MS 20000
+#define RESTART_AT_TIMEOUT_MS 90000
 
 // While PPP is up, every status/GNSS poll pauses the data stream for a
 // couple of seconds ("+++" ... ATO), so pace the polls.
@@ -67,6 +68,7 @@ static bool s_apn_dirty;
 static bool s_ppp_up;
 static char s_ppp_ip[40];
 static bool s_redial_requested;
+static bool s_restart_requested;
 
 // The UART carries either AT commands or PPP data, never both, and CMUX is
 // off the table (a failed negotiation wedges this modem until a reset — see
@@ -95,6 +97,33 @@ void modem_request_redial(void)
     s_redial_requested = true;
     xSemaphoreGive(s_status_mutex);
     ESP_LOGW(TAG, "PPP redial requested");
+}
+
+static bool restart_active(modem_restart_state_t state)
+{
+    return state == MODEM_RESTART_REQUESTED ||
+           state == MODEM_RESTART_RESETTING ||
+           state == MODEM_RESTART_WAITING_AT;
+}
+
+esp_err_t modem_request_restart(void)
+{
+    if (!s_status_mutex) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+    if (s_restart_requested || restart_active(s_status.restart_state)) {
+        xSemaphoreGive(s_status_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_restart_requested = true;
+    s_status.restart_state = MODEM_RESTART_REQUESTED;
+    s_status.restart_error = ESP_OK;
+    s_status.restart_time_us = esp_timer_get_time();
+    xSemaphoreGive(s_status_mutex);
+    ESP_LOGW(TAG, "SIM7670G restart requested");
+    return ESP_OK;
 }
 
 esp_netif_t *modem_get_netif(void)
@@ -483,6 +512,18 @@ static const char *reg_status_str(int stat)
     }
 }
 
+static const char *restart_state_str(modem_restart_state_t state)
+{
+    switch (state) {
+    case MODEM_RESTART_REQUESTED:  return "requested";
+    case MODEM_RESTART_RESETTING:  return "resetting";
+    case MODEM_RESTART_WAITING_AT: return "waiting_at";
+    case MODEM_RESTART_COMPLETE:   return "complete";
+    case MODEM_RESTART_ERROR:      return "error";
+    default:                       return "idle";
+    }
+}
+
 // Append the modem + GNSS status to the shared /api/status object.
 void modem_status_json(cJSON *root)
 {
@@ -505,6 +546,19 @@ void modem_status_json(cJSON *root)
     cJSON_AddNumberToObject(root, "uart_baud", st.uart_baud);
     cJSON_AddStringToObject(root, "ip", st.ip_addr);
     cJSON_AddStringToObject(root, "apn", st.apn);
+
+    cJSON *restart = cJSON_AddObjectToObject(root, "modem_restart");
+    cJSON_AddStringToObject(restart, "state", restart_state_str(st.restart_state));
+    cJSON_AddBoolToObject(restart, "active", restart_active(st.restart_state));
+    cJSON_AddNumberToObject(restart, "count", st.restart_count);
+    cJSON_AddNumberToObject(restart, "error", st.restart_error);
+    cJSON_AddStringToObject(restart, "error_name",
+                           st.restart_error ? esp_err_to_name((esp_err_t)st.restart_error) : "");
+    if (st.restart_time_us) {
+        cJSON_AddNumberToObject(
+            restart, "age_s",
+            (double)((esp_timer_get_time() - st.restart_time_us) / 1000000));
+    }
 
     modem_gnss_t g;
     modem_get_gnss(&g);
@@ -929,11 +983,68 @@ static void modem_task(void *arg)
         strlcpy(apn, s_apn, sizeof(apn));
         bool apn_dirty = s_apn_dirty;
         bool redial_requested = s_redial_requested;
+        bool restart_requested = s_restart_requested;
         s_redial_requested = false;
+        s_restart_requested = false;
         xSemaphoreGive(s_status_mutex);
 
         st.ppp_up = ppp_up;
         st.pdp_active = ppp_up;  // LED turns blue when the data link is up
+
+        bool restart_issued = false;
+        if (restart_requested) {
+            ESP_LOGW(TAG, "restarting SIM7670G with AT+CRESET");
+            st.restart_state = MODEM_RESTART_RESETTING;
+            st.restart_error = ESP_OK;
+            st.restart_time_us = esp_timer_get_time();
+            st.restart_count++;
+            xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+            s_status = st;
+            xSemaphoreGive(s_status_mutex);
+
+            if (ppp_up) {
+                data_disconnect();
+            }
+            xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+            s_ppp_up = false;
+            s_ppp_ip[0] = '\0';
+            xSemaphoreGive(s_status_mutex);
+            ppp_up = false;
+            was_up = false;
+            st.ppp_up = false;
+            st.pdp_active = false;
+            st.ip_addr[0] = '\0';
+            healthy_polls = 0;
+            last_dial_us = 0;
+
+            // This deliberately bypasses modem_send_at(): after CRESET there
+            // is no old PPP session to resume with ATO.
+            xSemaphoreTake(s_at_mutex, portMAX_DELAY);
+            esp_err_t restart_err = at_cmd("AT+CRESET", NULL, 0, 5000);
+            xSemaphoreGive(s_at_mutex);
+            if (restart_err != ESP_OK) {
+                ESP_LOGE(TAG, "AT+CRESET failed: %s", esp_err_to_name(restart_err));
+                st.restart_state = MODEM_RESTART_ERROR;
+                st.restart_error = restart_err;
+            } else {
+                ESP_LOGI(TAG, "AT+CRESET accepted; waiting for modem to return");
+                restart_issued = true;
+                st.restart_state = MODEM_RESTART_WAITING_AT;
+                st.at_ok = false;
+                st.sim_ready = false;
+                st.reg_status = 0;
+                st.rssi_dbm = 0;
+                st.operator_name[0] = '\0';
+                st.rat[0] = '\0';
+                st.band[0] = '\0';
+                identity_read = false;
+                gnss_on = false;
+                xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+                s_gnss.powered = false;
+                s_gnss.has_fix = false;
+                xSemaphoreGive(s_status_mutex);
+            }
+        }
 
         if (redial_requested) {
             ESP_LOGW(TAG, "forcing a clean PPP redial");
@@ -980,7 +1091,7 @@ static void modem_task(void *arg)
         // Probe the modem until it answers AT (at the target baud; see
         // baud_negotiate). Re-runs whenever the AT channel dies, which also
         // re-bumps the baud after an unexpected modem reboot back to 115200.
-        if (!st.at_ok && !ppp_up && at_channel_acquire()) {
+        if (!restart_issued && !st.at_ok && !ppp_up && at_channel_acquire()) {
             if (baud_negotiate()) {
                 st.at_ok = true;
                 at_cmd("ATE0", NULL, 0, 2000);         // echo off simplifies parsing
@@ -988,10 +1099,24 @@ static void modem_task(void *arg)
                 uint32_t baud = 0;
                 uart_get_baudrate(MODEM_UART, &baud);
                 ESP_LOGI(TAG, "modem is responding at %u baud", (unsigned)baud);
+                if (st.restart_state == MODEM_RESTART_WAITING_AT) {
+                    st.restart_state = MODEM_RESTART_COMPLETE;
+                    ESP_LOGI(TAG, "SIM7670G restart complete; restoring GNSS and PPP");
+                }
             } else {
                 ESP_LOGW(TAG, "modem not responding to AT at any baud yet");
             }
             at_channel_release();
+        }
+
+        if (st.restart_state == MODEM_RESTART_WAITING_AT &&
+            esp_timer_get_time() - st.restart_time_us >
+                (int64_t)RESTART_AT_TIMEOUT_MS * 1000) {
+            st.restart_state = MODEM_RESTART_ERROR;
+            st.restart_error = ESP_ERR_TIMEOUT;
+            ESP_LOGE(TAG, "SIM7670G did not return within %d seconds; "
+                     "background recovery will continue",
+                     RESTART_AT_TIMEOUT_MS / 1000);
         }
 
         // Poll status + GNSS. With PPP down this runs every cycle; with PPP

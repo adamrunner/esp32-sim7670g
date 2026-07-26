@@ -9,6 +9,15 @@
 
 #define MODEM_APN_MAX 64
 
+typedef enum {
+    MODEM_RESTART_IDLE = 0,
+    MODEM_RESTART_REQUESTED,
+    MODEM_RESTART_RESETTING,
+    MODEM_RESTART_WAITING_AT,
+    MODEM_RESTART_COMPLETE,
+    MODEM_RESTART_ERROR,
+} modem_restart_state_t;
+
 typedef struct {
     bool at_ok;             // modem responds to AT
     bool sim_ready;         // +CPIN: READY
@@ -27,6 +36,10 @@ typedef struct {
     char ip_addr[40];
     char apn[MODEM_APN_MAX];
     int64_t last_update_us; // esp_timer time of last successful poll
+    modem_restart_state_t restart_state;
+    uint32_t restart_count;
+    int restart_error;      // esp_err_t when restart_state == MODEM_RESTART_ERROR
+    int64_t restart_time_us;
 } modem_status_t;
 
 typedef struct {
@@ -94,6 +107,11 @@ void modem_suspend_polls(bool suspend);
 // safe to call from another task after a transport-level failure; callers can
 // observe completion through modem_get_status().ppp_up.
 void modem_request_redial(void);
+
+// Ask the modem task to restart the SIM7670G with AT+CRESET, recover its UART,
+// and let the normal supervisor restore GNSS and PPP. Returns
+// ESP_ERR_INVALID_STATE while another restart is active.
+esp_err_t modem_request_restart(void);
 
 // The PPP network interface (for binding sockets to cellular explicitly).
 esp_netif_t *modem_get_netif(void);

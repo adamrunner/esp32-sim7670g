@@ -56,6 +56,31 @@ static esp_err_t reboot_post_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, "{\"ok\":true,\"reboot_in_ms\":1000}");
 }
 
+static bool ota_busy(void)
+{
+    ota_status_t st;
+    ota_get_status(&st);
+    return st.state == OTA_STATE_CHECKING ||
+           st.state == OTA_STATE_DOWNLOADING ||
+           st.state == OTA_STATE_VERIFYING ||
+           st.state == OTA_STATE_WAIT_REBOOT;
+}
+
+static esp_err_t modem_restart_post_handler(httpd_req_t *req)
+{
+    if (ota_busy()) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "cannot restart modem while OTA is active");
+    }
+    if (modem_request_restart() != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "modem restart already active");
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true,\"state\":\"requested\"}");
+}
+
 // Serialize `root` as the JSON response, then free both the printed string and
 // the tree. Takes ownership of `root` (freed even on error), so no handler has
 // to repeat the print/send/free/delete dance or risk leaking a branch.
@@ -486,7 +511,7 @@ void webui_init(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.lru_purge_enable = true;
-    cfg.max_uri_handlers = 16;  // default 8; we register 13 routes
+    cfg.max_uri_handlers = 16;  // default 8; we register 14 routes
     cfg.stack_size = 8192;  // ping/DNS handler keeps sizeable buffers on the stack
 
     httpd_handle_t server = NULL;
@@ -506,6 +531,8 @@ void webui_init(void)
         { .uri = "/api/mqtt",   .method = HTTP_GET,  .handler = mqtt_get_handler },
         { .uri = "/api/mqtt",   .method = HTTP_POST, .handler = mqtt_post_handler },
         { .uri = "/api/reboot", .method = HTTP_POST, .handler = reboot_post_handler },
+        { .uri = "/api/modem/restart", .method = HTTP_POST,
+          .handler = modem_restart_post_handler },
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
         ESP_ERROR_CHECK(httpd_register_uri_handler(server, &routes[i]));
