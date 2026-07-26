@@ -53,10 +53,10 @@ void mqtt_get_status(mqtt_status_t *out);
 void mqtt_status_json(cJSON *root);
 bool mqtt_connected(void);
 
-// Publish a retained boot/OTA status document to
-// "bms/status/<device_id>". This is sent automatically after every broker
-// connection and may be called again when OTA pending-verify state changes.
-// The publish is queued at QoS 1 and does not block waiting for PUBACK.
+// Publish a retained schema-v2 OTA-verified status event to
+// "bms/status/<device_id>". Boot, reconnect, pending-verify, and first-time-
+// synchronization events are sent automatically. Each logical event receives
+// a boot-scoped status_seq, which is reused by MQTT's QoS retry.
 esp_err_t mqtt_publish_status(void);
 
 // Publish one telemetry payload to "<base_topic>/<device_id>" at QoS 1 and

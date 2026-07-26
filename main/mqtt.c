@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "esp_app_desc.h"
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
@@ -17,12 +18,14 @@
 
 #include "datalog.h"
 #include "ota.h"
+#include "timesync.h"
 
 static const char *TAG = "mqtt";
 
 #define NVS_NS "mqttcfg"
 #define PUBACK_TIMEOUT_MS 8000
 #define STATUS_TOPIC_PREFIX "bms/status"
+#define STATUS_TIME_POLL_MS 1000
 // The SD spool is the durability layer, so a failed/slow session shouldn't
 // hoard RAM: keep esp-mqtt's own outbox small and let publishes fail fast.
 #define OUTBOX_LIMIT_BYTES 4096
@@ -38,6 +41,41 @@ static mqtt_status_t s_status;
 static volatile bool s_connected;
 static volatile int s_pending_msg_id = -1;
 static char s_boot_id[17];
+static uint32_t s_status_seq;
+static bool s_ever_connected;
+static bool s_time_status_published;
+
+typedef enum {
+    STATUS_REASON_BOOT = 0,
+    STATUS_REASON_TIME_SYNCHRONIZED,
+    STATUS_REASON_MQTT_RECONNECTED,
+    STATUS_REASON_OTA_PENDING_VERIFY,
+    STATUS_REASON_OTA_VERIFIED,
+} status_reason_t;
+
+static const char *status_reason_str(status_reason_t reason)
+{
+    switch (reason) {
+    case STATUS_REASON_BOOT:              return "boot";
+    case STATUS_REASON_TIME_SYNCHRONIZED: return "time_synchronized";
+    case STATUS_REASON_MQTT_RECONNECTED:  return "mqtt_reconnected";
+    case STATUS_REASON_OTA_PENDING_VERIFY: return "ota_pending_verify";
+    case STATUS_REASON_OTA_VERIFIED:      return "ota_verified";
+    default:                              return "unknown";
+    }
+}
+
+static const char *time_source_str(timesync_source_t source)
+{
+    switch (source) {
+    case TIMESYNC_GNSS: return "gnss";
+    case TIMESYNC_SNTP: return "sntp";
+    default:            return NULL;
+    }
+}
+
+static esp_err_t publish_status_event(status_reason_t reason);
+static void status_task(void *arg);
 
 static const char *reset_reason_str(esp_reset_reason_t reason)
 {
@@ -114,7 +152,29 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
         s_connected = true;
         set_last_error("");
         ESP_LOGI(TAG, "connected to broker");
-        mqtt_publish_status();
+        bool time_already_valid = timesync_valid();
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        bool first_connection = !s_ever_connected;
+        s_ever_connected = true;
+        if (first_connection && time_already_valid) {
+            // Reserve the first-sync notification while the boot event is
+            // being queued so the status task cannot manufacture a duplicate.
+            s_time_status_published = true;
+        }
+        xSemaphoreGive(s_mutex);
+
+        ota_status_t ota;
+        ota_get_status(&ota);
+        status_reason_t reason = first_connection
+                               ? (ota.pending_verify ? STATUS_REASON_OTA_PENDING_VERIFY
+                                                     : STATUS_REASON_BOOT)
+                               : STATUS_REASON_MQTT_RECONNECTED;
+        esp_err_t status_err = publish_status_event(reason);
+        if (status_err != ESP_OK && first_connection && time_already_valid) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_time_status_published = false;
+            xSemaphoreGive(s_mutex);
+        }
         break;
     case MQTT_EVENT_DISCONNECTED:
         s_connected = false;
@@ -193,6 +253,7 @@ void mqtt_init(void)
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     restart_client_locked();
     xSemaphoreGive(s_mutex);
+    xTaskCreate(status_task, "mqtt_status", 3072, NULL, 3, NULL);
 }
 
 esp_err_t mqtt_set_config(const mqtt_config_t *cfg)
@@ -248,7 +309,7 @@ void mqtt_status_json(cJSON *root)
     cJSON_AddStringToObject(mq, "last_error", m.last_error);
 }
 
-esp_err_t mqtt_publish_status(void)
+static esp_err_t publish_status_event(status_reason_t reason)
 {
     char device_id[48];
     char topic[sizeof(STATUS_TOPIC_PREFIX) + sizeof(device_id)];
@@ -258,12 +319,14 @@ esp_err_t mqtt_publish_status(void)
     ota_status_t ota;
     ota_get_status(&ota);
     const esp_app_desc_t *app = esp_app_get_description();
+    timesync_status_t time_status;
+    timesync_get_status(&time_status);
 
     cJSON *root = cJSON_CreateObject();
     if (!root) {
         return ESP_ERR_NO_MEM;
     }
-    cJSON_AddNumberToObject(root, "schema_version", 1);
+    cJSON_AddNumberToObject(root, "schema_version", 2);
     cJSON_AddStringToObject(root, "device_id", device_id);
     cJSON_AddBoolToObject(root, "online", true);
     cJSON_AddStringToObject(root, "firmware_version", ota.running_version);
@@ -274,17 +337,35 @@ esp_err_t mqtt_publish_status(void)
     cJSON_AddStringToObject(root, "idf_version", app->idf_ver);
     cJSON_AddStringToObject(root, "build_date", app->date);
     cJSON_AddStringToObject(root, "build_time", app->time);
+    cJSON_AddStringToObject(root, "status_reason", status_reason_str(reason));
+    if (time_status.source == TIMESYNC_NONE) {
+        cJSON_AddNullToObject(root, "reported_at");
+        cJSON_AddNullToObject(root, "time_source");
+    } else {
+        cJSON_AddNumberToObject(root, "reported_at", (double)time(NULL));
+        cJSON_AddStringToObject(root, "time_source",
+                               time_source_str(time_status.source));
+    }
+    cJSON_AddNullToObject(root, "rollback_from_version");
+    cJSON_AddNullToObject(root, "rollback_target_version");
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint32_t status_seq = s_status_seq + 1;
+    cJSON_AddNumberToObject(root, "status_seq", status_seq);
 
     char *payload = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!payload) {
+        xSemaphoreGive(s_mutex);
         return ESP_ERR_NO_MEM;
     }
 
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
     int msg_id = (!s_client || !s_connected)
                ? -1
                : esp_mqtt_client_enqueue(s_client, topic, payload, 0, 1, 1, true);
+    if (msg_id >= 0) {
+        s_status_seq = status_seq;
+    }
     xSemaphoreGive(s_mutex);
     cJSON_free(payload);
 
@@ -292,8 +373,32 @@ esp_err_t mqtt_publish_status(void)
         ESP_LOGW(TAG, "could not queue retained status for %s", device_id);
         return msg_id == -2 ? ESP_ERR_NO_MEM : ESP_ERR_INVALID_STATE;
     }
-    ESP_LOGI(TAG, "queued retained status on %s (message id %d)", topic, msg_id);
+    ESP_LOGI(TAG, "queued retained status #%" PRIu32 " (%s) on %s "
+                  "(message id %d)", status_seq, status_reason_str(reason),
+                  topic, msg_id);
     return ESP_OK;
+}
+
+static void status_task(void *arg)
+{
+    while (true) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        bool should_publish = s_ever_connected && !s_time_status_published;
+        xSemaphoreGive(s_mutex);
+
+        if (should_publish && timesync_valid() &&
+            publish_status_event(STATUS_REASON_TIME_SYNCHRONIZED) == ESP_OK) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_time_status_published = true;
+            xSemaphoreGive(s_mutex);
+        }
+        vTaskDelay(pdMS_TO_TICKS(STATUS_TIME_POLL_MS));
+    }
+}
+
+esp_err_t mqtt_publish_status(void)
+{
+    return publish_status_event(STATUS_REASON_OTA_VERIFIED);
 }
 
 esp_err_t mqtt_publish_telemetry(const char *payload)
