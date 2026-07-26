@@ -80,8 +80,8 @@ web UI for monitoring/configuring the cellular connection.
 - **Web UI** (`main/webui.c`, `main/www/index.html`) — WiFi SoftAP
   **ESP32-SIM7670G** (password **waveshare**), then browse to
   <http://192.168.4.1/>. Shows live connection status, modem/SIM identity,
-  lets you change the APN (persisted in NVS), and has a raw AT-command
-  console.
+  lets you change the APN (persisted in NVS), has a raw AT-command console,
+  and can perform a delayed software reboot after acknowledging the browser.
 
 ### APN: leave it blank
 
@@ -253,6 +253,9 @@ URL actually embedded in the binary before publishing.
   `{"url":"https://.../manifest.json","transport":"cell"}` to target an
   alternate manifest or pin the transfer to the cellular interface
   (both mainly for testing)
+- `POST /api/reboot` — acknowledge with a one-second delay, then restart the
+  ESP32 using `esp_restart()`; this does not electrically power-cycle the
+  separate SIM7670G modem
 
 ## Deferred cleanups
 

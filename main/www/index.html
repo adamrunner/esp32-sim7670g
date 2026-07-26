@@ -157,6 +157,10 @@
       <button type="submit" id="otabtn" style="flex: 1;">Check for update</button>
     </form>
     <div class="msg" id="otamsg"></div>
+    <form id="rebootform" style="margin-top: 0.75rem;">
+      <button type="submit" id="rebootbtn" class="danger" style="flex: 1;">Reboot ESP32</button>
+    </form>
+    <div class="msg" id="rebootmsg"></div>
   </div>
   <div class="card">
     <h2>Home WiFi</h2>
@@ -419,6 +423,24 @@ $('otaform').addEventListener('submit', async ev => {
   } catch (e) { $('otamsg').textContent = 'request failed'; }
   setTimeout(() => { otaMsgLocal = false; }, 4000);
   refreshOta();
+});
+
+$('rebootform').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  if (!confirm('Reboot the ESP32 now? The web UI and network connections will briefly disconnect.'))
+    return;
+
+  $('rebootbtn').disabled = true;
+  $('rebootmsg').textContent = 'scheduling reboot…';
+  try {
+    const r = await fetch('/api/reboot', {method: 'POST'});
+    $('rebootmsg').textContent = r.ok
+      ? 'rebooting — reconnect and reload this page in a few seconds'
+      : 'error: ' + (await r.text());
+    if (!r.ok) $('rebootbtn').disabled = false;
+  } catch (e) {
+    $('rebootmsg').textContent = 'connection closed — the ESP32 may be rebooting';
+  }
 });
 
 $('wifiform').addEventListener('submit', async ev => {

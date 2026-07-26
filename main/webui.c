@@ -2,6 +2,9 @@
 
 #include <string.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #include "esp_http_server.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
@@ -25,6 +28,32 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, (const char *)index_html_start,
                            index_html_end - index_html_start);
+}
+
+static bool s_reboot_pending;
+
+static void reboot_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(1000));  // let the HTTP response reach the browser
+    esp_restart();
+}
+
+static esp_err_t reboot_post_handler(httpd_req_t *req)
+{
+    if (s_reboot_pending) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "reboot already pending");
+    }
+
+    s_reboot_pending = true;
+    if (xTaskCreate(reboot_task, "web_reboot", 2048, NULL, 5, NULL) != pdPASS) {
+        s_reboot_pending = false;
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "could not schedule reboot");
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true,\"reboot_in_ms\":1000}");
 }
 
 // Serialize `root` as the JSON response, then free both the printed string and
@@ -457,7 +486,7 @@ void webui_init(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.lru_purge_enable = true;
-    cfg.max_uri_handlers = 16;  // default 8; we register 12 routes
+    cfg.max_uri_handlers = 16;  // default 8; we register 13 routes
     cfg.stack_size = 8192;  // ping/DNS handler keeps sizeable buffers on the stack
 
     httpd_handle_t server = NULL;
@@ -476,6 +505,7 @@ void webui_init(void)
         { .uri = "/api/bms",    .method = HTTP_POST, .handler = bms_post_handler },
         { .uri = "/api/mqtt",   .method = HTTP_GET,  .handler = mqtt_get_handler },
         { .uri = "/api/mqtt",   .method = HTTP_POST, .handler = mqtt_post_handler },
+        { .uri = "/api/reboot", .method = HTTP_POST, .handler = reboot_post_handler },
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
         ESP_ERROR_CHECK(httpd_register_uri_handler(server, &routes[i]));
