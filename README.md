@@ -158,6 +158,13 @@ must reach the update server over HTTPS within 6 minutes of booting or
 the bootloader rolls back to the previous slot; a rolled-back version
 is never auto-retried.
 
+After each MQTT connection, the device publishes a retained QoS 1 JSON
+document to `bms/status/<device_id>`. It includes `firmware_version`,
+`ota_slot`, `pending_verify`, a per-boot `boot_id`, `reset_reason`, and build
+metadata. A newly installed image republishes after its HTTPS self-test clears
+`pending_verify`, so the retained record can remotely confirm both the running
+version and successful rollback validation.
+
 Publishing a release:
 
 ```sh

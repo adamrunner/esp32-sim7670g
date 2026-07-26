@@ -26,6 +26,7 @@
 #include "nvs.h"
 
 #include "modem.h"
+#include "mqtt.h"
 
 static const char *TAG = "ota";
 
@@ -587,12 +588,16 @@ static void rollback_selftest(void)
         if (fetch_manifest(OTA_MANIFEST_URL, false, true, NULL,
                            errbuf, sizeof(errbuf)) == ESP_OK) {
             esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
-            ESP_LOGI(TAG, "self-test passed (HTTPS reachable); image marked valid (%s)",
-                     esp_err_to_name(err));
-            st_lock();
-            s_st.pending_verify = false;
-            st_unlock();
-            return;
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "self-test passed (HTTPS reachable); image marked valid");
+                st_lock();
+                s_st.pending_verify = false;
+                st_unlock();
+                mqtt_publish_status();
+                return;
+            }
+            ESP_LOGW(TAG, "HTTPS self-test passed but image could not be marked valid (%s); "
+                          "retrying", esp_err_to_name(err));
         }
         ESP_LOGW(TAG, "self-test: server not reachable yet (%s); retrying", errbuf);
         vTaskDelay(pdMS_TO_TICKS(SELFTEST_RETRY_MS));
