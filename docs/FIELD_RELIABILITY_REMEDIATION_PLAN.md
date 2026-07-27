@@ -430,8 +430,9 @@ Compatibility and safety:
   constants are observable, but Phase 2 is the first phase allowed to connect
   decisions to dry-run actions.
 - Before the later, explicitly approved activation recorded below, no hardware
-  had been flashed. No OTA artifact was published, Anton was not contacted or
-  mutated, the SD card was not modified, and no branch was pushed.
+  had been flashed and no Phase 1 OTA artifact had been published. Anton had
+  not been contacted or mutated, the SD card had not been modified, and no
+  branch had been pushed.
 
 Deviations and remaining evidence:
 
@@ -456,9 +457,27 @@ Activation update — 2026-07-26:
 - This confirms only successful transfer and reset. Boot/runtime behavior,
   event-journal FAT behavior, connectivity, and browser APIs still require
   post-flash observation before hardware acceptance.
-- No OTA release was published, Anton was not contacted or mutated, the
+- At this activation point no OTA release had been published and Anton had not
+  been mutated; the publication update below supersedes that state. The
   mounted field SD card was not modified from the host, and no branch was
   pushed.
+
+OTA publication update — 2026-07-26:
+
+- After explicit user approval, the clean current head `113e0e5` was rebuilt
+  with the pinned ESP-IDF 5.5/Python 3.10 environment and published through
+  `tools/release.sh`.
+- The atomically replaced production manifest points to
+  `esp32-sim7670g-113e0e5.bin`: 1,379,632 bytes with SHA-256
+  `a2a8803fc5bbb19b938a839cbe36b4f9bdd96d9fe6b7207166490c6d349e1e80`.
+- External verification confirmed a fresh manifest, full-download size and
+  SHA-256, and HTTP Range response `206`.
+- `113e0e5` differs from the directly flashed `1dda1bd` only by this plan's
+  prior activation record. The connected device remains known to be on
+  `1dda1bd` until device-local OTA status proves that it accepted `113e0e5`.
+- Anton mutation was limited to the versioned firmware artifact and atomic
+  manifest replacement. No application deployment, production-data change,
+  SD-card write, or branch push occurred.
 
 ### Phase 2: Coordinate AT windows and add automatic recovery
 
