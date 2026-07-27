@@ -19,6 +19,7 @@
 
 #include "datalog.h"
 #include "event_journal.h"
+#include "network_pause_gate.h"
 #include "ota.h"
 #include "timesync.h"
 
@@ -407,6 +408,7 @@ void mqtt_status_json(cJSON *root)
     cJSON_AddStringToObject(mq, "base_topic", m.base_topic);
     cJSON_AddNumberToObject(mq, "published", m.published);
     cJSON_AddNumberToObject(mq, "publish_fails", m.publish_fails);
+    cJSON_AddNumberToObject(mq, "publish_deferred", m.publish_deferred);
     cJSON_AddNumberToObject(mq, "connect_count", m.connect_count);
     cJSON_AddNumberToObject(mq, "disconnect_count", m.disconnect_count);
     cJSON_AddNumberToObject(mq, "error_count", m.error_count);
@@ -442,6 +444,8 @@ void mqtt_status_json(cJSON *root)
     cJSON_AddNumberToObject(
         availability, "publish_failures", m.availability_failures);
     cJSON_AddNumberToObject(
+        availability, "publish_deferred", m.availability_deferred);
+    cJSON_AddNumberToObject(
         availability, "requested_count", m.availability_requested_count);
     cJSON_AddNumberToObject(
         availability, "last_requested_uptime_ms",
@@ -467,6 +471,10 @@ static esp_err_t publish_availability(bool online)
                           payload, sizeof(payload));
 
     xSemaphoreTake(s_pub_mutex, portMAX_DELAY);
+    if (!network_pause_gate_puback_begin()) {
+        xSemaphoreGive(s_pub_mutex);
+        return ESP_ERR_NOT_FINISHED;
+    }
     xEventGroupClearBits(s_events, EV_PUBACK);
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -478,6 +486,7 @@ static esp_err_t publish_availability(bool online)
 
     if (msg_id < 0) {
         s_pending_msg_id = -1;
+        network_pause_gate_puback_end();
         xSemaphoreGive(s_pub_mutex);
         return ESP_ERR_INVALID_STATE;
     }
@@ -497,6 +506,7 @@ static esp_err_t publish_availability(bool online)
         pdMS_TO_TICKS(PUBACK_TIMEOUT_MS)
     );
     s_pending_msg_id = -1;
+    network_pause_gate_puback_end();
     xSemaphoreGive(s_pub_mutex);
     if (!(bits & EV_PUBACK)) {
         xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -640,6 +650,8 @@ void mqtt_maintenance_tick(void)
             (uint64_t)esp_timer_get_time() / 1000U;
         s_status.availability_last_error[0] = '\0';
         s_availability_requested = false;
+    } else if (err == ESP_ERR_NOT_FINISHED) {
+        s_status.availability_deferred++;
     } else {
         s_status.availability_failures++;
         s_status.availability_last_failure_uptime_ms =
@@ -652,14 +664,21 @@ void mqtt_maintenance_tick(void)
 
     event_journal_emit(
         "availability",
-        err == ESP_OK ? "online_acknowledged" : "online_failed",
-        err == ESP_OK ? EVENT_SEVERITY_INFO : EVENT_SEVERITY_WARN,
-        err == ESP_OK ? "puback" : esp_err_to_name(err),
-        err == ESP_OK ? "{\"online\":true}" : "{\"online\":true,\"retry\":true}",
+        err == ESP_OK ? "online_acknowledged"
+                      : err == ESP_ERR_NOT_FINISHED ? "publish_deferred"
+                                                    : "online_failed",
+        err == ESP_OK ? EVENT_SEVERITY_INFO
+                      : err == ESP_ERR_NOT_FINISHED ? EVENT_SEVERITY_DEBUG
+                                                    : EVENT_SEVERITY_WARN,
+        err == ESP_OK ? "puback"
+                      : err == ESP_ERR_NOT_FINISHED ? "at_window"
+                                                    : esp_err_to_name(err),
+        err == ESP_OK ? "{\"online\":true}"
+                      : "{\"online\":true,\"retry\":true}",
         err == ESP_OK, err == ESP_OK ? 0 : 30000
     );
 
-    if (err != ESP_OK) {
+    if (err != ESP_OK && err != ESP_ERR_NOT_FINISHED) {
         ESP_LOGW(TAG, "retained online publish failed: %s; retrying",
                  esp_err_to_name(err));
     }
@@ -684,6 +703,17 @@ esp_err_t mqtt_publish_telemetry(const char *payload)
     xSemaphoreGive(s_mutex);
 
     xSemaphoreTake(s_pub_mutex, portMAX_DELAY);
+    if (!network_pause_gate_puback_begin()) {
+        xSemaphoreGive(s_pub_mutex);
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_status.publish_deferred++;
+        xSemaphoreGive(s_mutex);
+        event_journal_emit(
+            "mqtt", "publish_deferred", EVENT_SEVERITY_DEBUG,
+            "at_window", "{\"message\":\"telemetry\"}", false, 30000
+        );
+        return ESP_ERR_NOT_FINISHED;
+    }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_status.last_publish_attempt_uptime_ms =
         (uint64_t)esp_timer_get_time() / 1000U;
@@ -692,6 +722,7 @@ esp_err_t mqtt_publish_telemetry(const char *payload)
 
     int msg_id = esp_mqtt_client_publish(s_client, topic, payload, 0, 1, 0);
     if (msg_id < 0) {
+        network_pause_gate_puback_end();
         xSemaphoreGive(s_pub_mutex);
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         s_status.publish_fails++;
@@ -703,6 +734,7 @@ esp_err_t mqtt_publish_telemetry(const char *payload)
     EventBits_t bits = xEventGroupWaitBits(s_events, EV_PUBACK, pdTRUE, pdTRUE,
                                            pdMS_TO_TICKS(PUBACK_TIMEOUT_MS));
     s_pending_msg_id = -1;
+    network_pause_gate_puback_end();
     xSemaphoreGive(s_pub_mutex);
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);

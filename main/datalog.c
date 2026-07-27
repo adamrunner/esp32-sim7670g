@@ -376,7 +376,7 @@ static void spool_reset(void)
     spool_save_cursor();
 }
 
-static void spool_append(const char *line)
+static void spool_append(const char *line, bool at_window_deferred)
 {
     spool_load_state();
     if (s_spool_size < 0) {
@@ -411,7 +411,9 @@ static void spool_append(const char *line)
             (uint64_t)esp_timer_get_time() / 1000U;
         xSemaphoreGive(s_mutex);
         event_journal_emit(
-            "spool", "appended", EVENT_SEVERITY_INFO, "mqtt_delivery_failed",
+            "spool", "appended", EVENT_SEVERITY_INFO,
+            at_window_deferred ? "at_window_deferred"
+                               : "mqtt_delivery_failed",
             "{\"durable\":true}", false, 60000
         );
     } else {
@@ -470,8 +472,12 @@ static void spool_replay_tick(void)
         if (len && line[len - 1] == '\n') {
             line[len - 1] = '\0';
         }
-        if (line[0] && mqtt_publish_telemetry(line) != ESP_OK) {
-            s_spool_replay_active = false;
+        esp_err_t publish_err =
+            line[0] ? mqtt_publish_telemetry(line) : ESP_OK;
+        if (publish_err != ESP_OK) {
+            if (publish_err != ESP_ERR_NOT_FINISHED) {
+                s_spool_replay_active = false;
+            }
             break;  // broker went away again; cursor stays at this line
         }
         s_spool_cursor = line_start + len;
@@ -522,12 +528,13 @@ static void handle_snapshot(const bms_snapshot_t *snap)
 
     sd_append(line, len);
 
-    if (mqtt_publish_telemetry(line) == ESP_OK) {
+    esp_err_t publish_err = mqtt_publish_telemetry(line);
+    if (publish_err == ESP_OK) {
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         s_status.mqtt_rows++;
         xSemaphoreGive(s_mutex);
     } else {
-        spool_append(line);
+        spool_append(line, publish_err == ESP_ERR_NOT_FINISHED);
     }
 }
 
