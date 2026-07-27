@@ -429,9 +429,9 @@ Compatibility and safety:
 - Automatic recovery actions remain explicitly disabled in status. The policy
   constants are observable, but Phase 2 is the first phase allowed to connect
   decisions to dry-run actions.
-- No hardware was flashed, no OTA artifact was published, Anton was not
-  contacted or mutated, the SD card was not modified, and no branch was
-  pushed.
+- Before the later, explicitly approved activation recorded below, no hardware
+  had been flashed. No OTA artifact was published, Anton was not contacted or
+  mutated, the SD card was not modified, and no branch was pushed.
 
 Deviations and remaining evidence:
 
@@ -443,8 +443,22 @@ Deviations and remaining evidence:
   reproduction therefore uses approved aggregate counts plus one-way SD/schema
   hashes; the helper is ready to consume a separately handled JSONL production
   export when field validation is authorized.
-- The field device remains on `7957a71`; `a2f5a10` and the Phase 0/1 commits
-  are build-validated only.
+- At completion of the build-only Phase 0/1 work, the field device was still
+  on `7957a71`; the activation update below supersedes that state.
+
+Activation update — 2026-07-26:
+
+- After explicit user approval, the clean firmware image at `1dda1bd` was
+  built and directly flashed over the ESP32-S3 native USB interface with the
+  pinned ESP-IDF 5.5/Python 3.10 environment.
+- Esptool verified the hashes of the bootloader, `0x150d30` application image,
+  partition table, and initial OTA-data writes, then hard-reset the ESP32.
+- This confirms only successful transfer and reset. Boot/runtime behavior,
+  event-journal FAT behavior, connectivity, and browser APIs still require
+  post-flash observation before hardware acceptance.
+- No OTA release was published, Anton was not contacted or mutated, the
+  mounted field SD card was not modified from the host, and no branch was
+  pushed.
 
 ### Phase 2: Coordinate AT windows and add automatic recovery
 
