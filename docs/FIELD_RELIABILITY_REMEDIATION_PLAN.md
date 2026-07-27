@@ -556,15 +556,38 @@ Validation:
 
 Activation and remaining evidence:
 
-- The connected device remains on verified Phase 1 firmware `1dda1bd`.
-  Phase 2 has not been flashed or published, and no Anton application or data
-  was changed.
+- After explicit approval on 2026-07-27, the clean Phase 2 dry-run head
+  `7736d39` was published before direct flashing so the prior production
+  manifest could not replace the USB-flashed firmware during bench testing.
+- `tools/release.sh` published `esp32-sim7670g-7736d39.bin`: 1,386,640 bytes
+  with SHA-256
+  `434c005b71efb59fd83a8bb41afa415cea0897c01e385e7a7d0184e450508c26`.
+  External verification confirmed the fresh manifest, full-download size and
+  SHA-256, and HTTP Range response `206`.
+- The identical image was then directly flashed over native USB. Esptool
+  verified every written region and hard-reset the ESP32. Bounded serial
+  observation confirmed `7736d39` from `ota_0`, WiFi, time sync, retained
+  availability PUBACK, Verizon LTE registration, PPP, MQTT, and a successful
+  cellular connectivity check without a reboot or watchdog.
+- Live API evidence recorded one successful weighted AT registration query in
+  one network-pause window. It completed in 3 ms against the 1,000 ms query
+  timeout and 3,000 ms pause-window cap, with zero scheduler failures,
+  deferrals, publish deferrals, or PUBACK timeouts. The recovery supervisor
+  reached `healthy` in `dry_run` mode.
+- At the first post-flash OTA interval, modem status/GNSS polling was suspended
+  around the manifest request and resumed afterward. The device reported
+  `7736d39` up to date, performed no download, and the recovery supervisor
+  deferred to `ota_active` before returning to `healthy`.
 - `automatic_actions_enabled`, `clean_redial_enabled`, and
   `modem_reset_escalation_enabled` remain false. The supervised manual modem
   restart remains available as an explicitly requested fallback only.
-- Direct-flash approval is still required to collect scheduler timing,
-  PUBACK-exclusion, pause-overrun, and dry-run decision evidence on hardware.
-- Clean redial must remain disabled until that dry-run evidence passes.
+- This bench did not include an SD card or connected BMS. Event-journal
+  fail-open behavior remained healthy, but FAT persistence, live BMS
+  telemetry/PUBACK exclusion, SD spooling, restored-coverage timing, and
+  degraded/no-coverage dry-run decisions still require vehicle/house-battery
+  evidence.
+- Clean redial must remain disabled until that remaining dry-run hardware
+  evidence passes.
   Automatic modem-reset escalation must remain disabled until both dry-run and
   clean-redial hardware evidence pass.
 
