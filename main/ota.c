@@ -28,6 +28,7 @@
 
 #include "modem.h"
 #include "mqtt.h"
+#include "event_journal.h"
 #include "wifi.h"
 
 static const char *TAG = "ota";
@@ -104,11 +105,25 @@ void ota_get_status(ota_status_t *out)
 static void set_state(ota_state_t state)
 {
     st_lock();
+    ota_state_t previous = s_st.state;
     s_st.state = state;
     if (state != OTA_STATE_ERROR) {
         s_st.error[0] = '\0';
     }
     st_unlock();
+    if (previous != state) {
+        char details[64];
+        snprintf(details, sizeof(details), "{\"from\":%d,\"to\":%d}",
+                 (int)previous, (int)state);
+        event_journal_emit(
+            "ota", "state_changed",
+            state == OTA_STATE_ERROR ? EVENT_SEVERITY_ERROR :
+            state == OTA_STATE_WAIT_REBOOT ? EVENT_SEVERITY_WARN :
+                                             EVENT_SEVERITY_INFO,
+            "ota_transition", details,
+            state == OTA_STATE_ERROR || state == OTA_STATE_WAIT_REBOOT, 0
+        );
+    }
 }
 
 static void __attribute__((format(printf, 1, 2))) set_error(const char *fmt, ...)
@@ -123,6 +138,10 @@ static void __attribute__((format(printf, 1, 2))) set_error(const char *fmt, ...
     strlcpy(s_st.error, msg, sizeof(s_st.error));
     st_unlock();
     ESP_LOGE(TAG, "%s", msg);
+    event_journal_emit(
+        "ota", "failed", EVENT_SEVERITY_ERROR, "ota_error",
+        "{\"details_redacted\":true}", true, 0
+    );
 }
 
 static void set_progress(int bytes_read, int image_size)

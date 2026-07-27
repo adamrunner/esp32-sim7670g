@@ -15,6 +15,7 @@
 #include "cJSON.h"
 
 #include "modem.h"
+#include "event_journal.h"
 
 static const char *TAG = "timesync";
 
@@ -35,6 +36,10 @@ static void set_synced(timesync_source_t source)
     s_status.synced_at = time(NULL);
     s_status.synced_at_us = esp_timer_get_time();
     xSemaphoreGive(s_mutex);
+    event_journal_note_time_sync(
+        source == TIMESYNC_SNTP ? "sntp" :
+        source == TIMESYNC_GNSS ? "gnss" : "unknown"
+    );
 }
 
 bool timesync_valid(void)
