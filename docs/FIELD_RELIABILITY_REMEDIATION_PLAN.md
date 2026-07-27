@@ -507,6 +507,67 @@ Activation gate:
 - Hardware testing requires explicit flash approval.
 - OTA publication remains a separate approval after direct-flash validation.
 
+#### Phase 2 dry-run implementation record — 2026-07-26
+
+Prerequisite hardware verification:
+
+- After explicit approval, the exact clean `1dda1bd` tree was rebuilt with
+  ESP-IDF 5.5/Python 3.10 and directly flashed. Esptool verified every written
+  region and hard-reset the ESP32.
+- Bounded serial observation confirmed `1dda1bd` running from `ota_0`, then
+  WiFi association, LTE registration, packet attachment, PPP, MQTT, retained
+  availability PUBACK, time synchronization, and a successful cellular
+  connectivity check.
+- Live `/api/status` and `/api/events` requests returned HTTP 200 and confirmed
+  ordered RAM events, MQTT/PUBACK timestamps, PPP state, and
+  `automatic_actions_enabled: false`. An early browser request received an
+  empty response during startup; visual browser acceptance remains unproven
+  even though subsequent API requests were healthy.
+- No SD card was mounted during this check. The journal recorded append
+  failures while networking and the web API continued, validating fail-open
+  behavior but not FAT rotation, power-cut durability, or on-card outage
+  reconstruction.
+
+Implementation:
+
+- Firmware `dc8e450` — shared network-pause gate for synchronous MQTT PUBACK
+  transactions and live-PPP AT windows; explicit publish deferral/spooling;
+  one bounded, weighted AT query per healthy-PPP window; OTA poll suspension;
+  and additive scheduler/gate counters and timing in `/api/status`.
+- Firmware `3211d13` — portable connectivity-policy core plus live supervisor
+  snapshots for WiFi, registration, packet attachment, PPP, MQTT/PUBACK, modem
+  responsiveness, and OTA state. The supervisor emits decisions and the action
+  it would request, but does not call the modem redial or restart APIs.
+- Existing status fields, MQTT/CSV payloads, NVS keys, manual modem restart,
+  modem UART ownership, and OTA behavior remain compatible. New fields and
+  objects are additive.
+
+Validation:
+
+- Eleven host tests pass. They cover journal faults plus no coverage, healthy
+  WiFi suppression, stale PPP/MQTT redial decisions, two failed redial cycles,
+  modem-restart cooldown, stable PUBACK recovery, and OTA action deferral in
+  both the Python reference model and portable C policy core.
+- A clean pinned ESP-IDF 5.5/Python 3.10 build passed at `3211d13`. The
+  application is `0x152890` bytes and leaves `0x2ad770` bytes (67%) free in the
+  smallest app partition.
+- Static inspection confirms the dry-run supervisor contains no call to
+  `modem_request_redial()` or `modem_request_restart()`.
+
+Activation and remaining evidence:
+
+- The connected device remains on verified Phase 1 firmware `1dda1bd`.
+  Phase 2 has not been flashed or published, and no Anton application or data
+  was changed.
+- `automatic_actions_enabled`, `clean_redial_enabled`, and
+  `modem_reset_escalation_enabled` remain false. The supervised manual modem
+  restart remains available as an explicitly requested fallback only.
+- Direct-flash approval is still required to collect scheduler timing,
+  PUBACK-exclusion, pause-overrun, and dry-run decision evidence on hardware.
+- Clean redial must remain disabled until that dry-run evidence passes.
+  Automatic modem-reset escalation must remain disabled until both dry-run and
+  clean-redial hardware evidence pass.
+
 ### Phase 3: Repair the local WiFi control plane
 
 Deliverables:
