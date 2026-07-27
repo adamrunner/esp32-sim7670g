@@ -670,6 +670,7 @@ void modem_status_json(cJSON *root)
     cJSON_AddBoolToObject(root, "sim_ready", st.sim_ready);
     cJSON_AddNumberToObject(root, "reg_status", st.reg_status);
     cJSON_AddStringToObject(root, "reg_text", reg_status_str(st.reg_status));
+    cJSON_AddBoolToObject(root, "packet_attached", st.packet_attached);
     cJSON_AddBoolToObject(root, "pdp_active", st.pdp_active);
     cJSON_AddBoolToObject(root, "ppp_up", st.ppp_up);
     cJSON_AddNumberToObject(root, "rssi_dbm", st.rssi_dbm);
@@ -1390,6 +1391,9 @@ static void modem_task(void *arg)
 
         st.ppp_up = ppp_up;
         st.pdp_active = ppp_up;  // LED turns blue when the data link is up
+        if (ppp_up) {
+            st.packet_attached = true;
+        }
 
         bool restart_issued = false;
         if (restart_requested) {
@@ -1443,6 +1447,7 @@ static void modem_task(void *arg)
                 st.at_ok = false;
                 st.sim_ready = false;
                 st.reg_status = 0;
+                st.packet_attached = false;
                 st.rssi_dbm = 0;
                 st.operator_name[0] = '\0';
                 st.rat[0] = '\0';
@@ -1614,6 +1619,10 @@ static void modem_task(void *arg)
                 gnss_poll();
             }
 
+            if (!ppp_up && st.reg_status != 1 && st.reg_status != 5) {
+                st.packet_attached = false;
+            }
+
             // Self-heal a rejected LTE attach: a named APN left in context 1
             // (by a previous dial) makes some networks deny registration
             // after a modem reboot. Blank the attach context and re-scan.
@@ -1680,6 +1689,7 @@ static void modem_task(void *arg)
             } else {
                 ESP_LOGI(TAG, "registered but PS not attached yet; delaying dial");
             }
+            st.packet_attached = attached;
             if ((int)attached != previous_packet_attached) {
                 char details[48];
                 snprintf(details, sizeof(details), "{\"attached\":%s}",

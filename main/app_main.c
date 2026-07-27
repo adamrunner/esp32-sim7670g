@@ -5,6 +5,7 @@
 
 #include "bms.h"
 #include "board_battery.h"
+#include "connectivity_supervisor.h"
 #include "datalog.h"
 #include "event_journal.h"
 #include "led.h"
@@ -49,6 +50,7 @@ void app_main(void)
     mqtt_init();
     datalog_init();
     bms_init();
+    connectivity_supervisor_init(); // Phase 2 policy evidence; dry-run only
 
     ESP_LOGI(TAG, "up — if no home WiFi is stored/reachable, join "
                   "\"ESP32-SIM7670G\" (pass \"waveshare\") and open "

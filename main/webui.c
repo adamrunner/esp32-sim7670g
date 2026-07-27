@@ -15,6 +15,7 @@
 
 #include "bms.h"
 #include "board_battery.h"
+#include "connectivity_supervisor.h"
 #include "datalog.h"
 #include "event_journal.h"
 #include "modem.h"
@@ -155,6 +156,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     wifi_status_json(root);       // "wifi"
     webui_status_json(root);      // "http"
     event_journal_status_json(root); // "event_journal"
+    connectivity_supervisor_status_json(root); // extends "recovery"
     return send_json(req, root);
 }
 

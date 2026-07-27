@@ -57,6 +57,14 @@ class RecoveryPolicyTests(unittest.TestCase):
             Decision.WIFI_UPLINK_HEALTHY,
         )
 
+    def test_ota_activity_defers_recovery_actions(self):
+        policy = RecoveryPolicy()
+        self.assertEqual(
+            policy.evaluate(now=1000, state=snapshot(ota_active=True)),
+            Decision.OTA_ACTIVE,
+        )
+        self.assertEqual(policy.failed_redials, 0)
+
     def test_two_failed_redials_escalate_to_modem_restart(self):
         policy = RecoveryPolicy()
         state = snapshot()
