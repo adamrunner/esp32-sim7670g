@@ -12,11 +12,13 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "mqtt_client.h"
 #include "cJSON.h"
 #include "nvs.h"
 
 #include "datalog.h"
+#include "event_journal.h"
 #include "ota.h"
 #include "timesync.h"
 
@@ -174,10 +176,20 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
         set_last_error("");
         ESP_LOGI(TAG, "connected to broker");
         xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_status.connect_count++;
+        s_status.last_connect_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
         s_status.availability_confirmed = false;
         s_status.availability_last_error[0] = '\0';
         s_availability_requested = true;
+        s_status.availability_requested_count++;
+        s_status.availability_last_requested_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
         xSemaphoreGive(s_mutex);
+        event_journal_emit(
+            "mqtt", "connected", EVENT_SEVERITY_INFO, "broker_session",
+            "{\"session_up\":true}", true, 0
+        );
         bool time_already_valid = timesync_valid();
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         bool first_connection = !s_ever_connected;
@@ -209,11 +221,27 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
         s_connected = false;
         s_rollback_msg_id = -1;
         xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_status.disconnect_count++;
+        s_status.last_disconnect_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
         s_status.availability_confirmed = false;
         xSemaphoreGive(s_mutex);
         ESP_LOGW(TAG, "disconnected from broker");
+        event_journal_emit(
+            "mqtt", "disconnected", EVENT_SEVERITY_WARN, "broker_session",
+            "{\"session_up\":false}", true, 0
+        );
         break;
     case MQTT_EVENT_PUBLISHED:
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_status.puback_count++;
+        s_status.last_puback_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
+        xSemaphoreGive(s_mutex);
+        event_journal_emit(
+            "mqtt", "puback", EVENT_SEVERITY_DEBUG, "qos1_acknowledged",
+            "{\"acknowledged\":true}", false, 60000
+        );
         if (event->msg_id == s_pending_msg_id) {
             xEventGroupSetBits(s_events, EV_PUBACK);
         }
@@ -229,11 +257,25 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
         }
         break;
     case MQTT_EVENT_ERROR:
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_status.error_count++;
+        s_status.last_error_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
+        xSemaphoreGive(s_mutex);
         if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
             set_last_error("transport error (broker unreachable?)");
         } else if (event->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {
             set_last_error("connection refused (bad credentials?)");
         }
+        char details[64];
+        snprintf(
+            details, sizeof(details), "{\"error_type\":%d}",
+            (int)event->error_handle->error_type
+        );
+        event_journal_emit(
+            "mqtt", "error", EVENT_SEVERITY_ERROR, "client_error",
+            details, true, 30000
+        );
         break;
     default:
         break;
@@ -344,6 +386,11 @@ void mqtt_get_status(mqtt_status_t *out)
     out->state = !s_cfg.enabled || s_cfg.uri[0] == '\0' ? MQTT_UI_DISABLED
                : s_connected                            ? MQTT_UI_CONNECTED
                                                         : MQTT_UI_CONNECTING;
+    out->availability_requested = s_availability_requested;
+    out->availability_queued =
+        s_availability_requested &&
+        s_status.availability_last_queued_uptime_ms >=
+            s_status.availability_last_requested_uptime_ms;
     xSemaphoreGive(s_mutex);
 }
 
@@ -360,8 +407,31 @@ void mqtt_status_json(cJSON *root)
     cJSON_AddStringToObject(mq, "base_topic", m.base_topic);
     cJSON_AddNumberToObject(mq, "published", m.published);
     cJSON_AddNumberToObject(mq, "publish_fails", m.publish_fails);
+    cJSON_AddNumberToObject(mq, "connect_count", m.connect_count);
+    cJSON_AddNumberToObject(mq, "disconnect_count", m.disconnect_count);
+    cJSON_AddNumberToObject(mq, "error_count", m.error_count);
+    cJSON_AddNumberToObject(mq, "puback_count", m.puback_count);
+    cJSON_AddNumberToObject(mq, "puback_timeouts", m.puback_timeouts);
+    cJSON_AddNumberToObject(mq, "last_connect_uptime_ms",
+                            (double)m.last_connect_uptime_ms);
+    cJSON_AddNumberToObject(mq, "last_disconnect_uptime_ms",
+                            (double)m.last_disconnect_uptime_ms);
+    cJSON_AddNumberToObject(mq, "last_error_uptime_ms",
+                            (double)m.last_error_uptime_ms);
+    cJSON_AddNumberToObject(mq, "last_puback_uptime_ms",
+                            (double)m.last_puback_uptime_ms);
+    cJSON_AddNumberToObject(mq, "last_puback_timeout_uptime_ms",
+                            (double)m.last_puback_timeout_uptime_ms);
+    cJSON_AddNumberToObject(mq, "last_publish_attempt_uptime_ms",
+                            (double)m.last_publish_attempt_uptime_ms);
     cJSON_AddStringToObject(mq, "last_error", m.last_error);
     cJSON *availability = cJSON_AddObjectToObject(mq, "availability");
+    cJSON_AddBoolToObject(
+        availability, "requested", m.availability_requested);
+    cJSON_AddBoolToObject(
+        availability, "queued", m.availability_queued);
+    cJSON_AddBoolToObject(
+        availability, "acknowledged", m.availability_confirmed);
     cJSON_AddStringToObject(
         availability, "state",
         !s_connected ? "disconnected"
@@ -371,6 +441,20 @@ void mqtt_status_json(cJSON *root)
         availability, "publish_attempts", m.availability_attempts);
     cJSON_AddNumberToObject(
         availability, "publish_failures", m.availability_failures);
+    cJSON_AddNumberToObject(
+        availability, "requested_count", m.availability_requested_count);
+    cJSON_AddNumberToObject(
+        availability, "last_requested_uptime_ms",
+        (double)m.availability_last_requested_uptime_ms);
+    cJSON_AddNumberToObject(
+        availability, "last_queued_uptime_ms",
+        (double)m.availability_last_queued_uptime_ms);
+    cJSON_AddNumberToObject(
+        availability, "last_ack_uptime_ms",
+        (double)m.availability_last_ack_uptime_ms);
+    cJSON_AddNumberToObject(
+        availability, "last_failure_uptime_ms",
+        (double)m.availability_last_failure_uptime_ms);
     cJSON_AddStringToObject(
         availability, "last_error", m.availability_last_error);
 }
@@ -397,6 +481,16 @@ static esp_err_t publish_availability(bool online)
         xSemaphoreGive(s_pub_mutex);
         return ESP_ERR_INVALID_STATE;
     }
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_status.availability_last_queued_uptime_ms =
+        (uint64_t)esp_timer_get_time() / 1000U;
+    xSemaphoreGive(s_mutex);
+    event_journal_emit(
+        "availability", "queued", EVENT_SEVERITY_INFO,
+        online ? "online_publish" : "offline_publish",
+        online ? "{\"online\":true}" : "{\"online\":false}",
+        false, 30000
+    );
 
     EventBits_t bits = xEventGroupWaitBits(
         s_events, EV_PUBACK, pdTRUE, pdTRUE,
@@ -405,6 +499,16 @@ static esp_err_t publish_availability(bool online)
     s_pending_msg_id = -1;
     xSemaphoreGive(s_pub_mutex);
     if (!(bits & EV_PUBACK)) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_status.puback_timeouts++;
+        s_status.last_puback_timeout_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
+        xSemaphoreGive(s_mutex);
+        event_journal_emit(
+            "mqtt", "puback_timeout", EVENT_SEVERITY_ERROR,
+            "availability_ack_timeout", "{\"message\":\"availability\"}",
+            true, 30000
+        );
         return ESP_ERR_TIMEOUT;
     }
 
@@ -532,15 +636,28 @@ void mqtt_maintenance_tick(void)
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     if (err == ESP_OK) {
         s_status.availability_confirmed = true;
+        s_status.availability_last_ack_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
         s_status.availability_last_error[0] = '\0';
         s_availability_requested = false;
     } else {
         s_status.availability_failures++;
+        s_status.availability_last_failure_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
         strlcpy(s_status.availability_last_error,
                 esp_err_to_name(err),
                 sizeof(s_status.availability_last_error));
     }
     xSemaphoreGive(s_mutex);
+
+    event_journal_emit(
+        "availability",
+        err == ESP_OK ? "online_acknowledged" : "online_failed",
+        err == ESP_OK ? EVENT_SEVERITY_INFO : EVENT_SEVERITY_WARN,
+        err == ESP_OK ? "puback" : esp_err_to_name(err),
+        err == ESP_OK ? "{\"online\":true}" : "{\"online\":true,\"retry\":true}",
+        err == ESP_OK, err == ESP_OK ? 0 : 30000
+    );
 
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "retained online publish failed: %s; retrying",
@@ -567,6 +684,10 @@ esp_err_t mqtt_publish_telemetry(const char *payload)
     xSemaphoreGive(s_mutex);
 
     xSemaphoreTake(s_pub_mutex, portMAX_DELAY);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_status.last_publish_attempt_uptime_ms =
+        (uint64_t)esp_timer_get_time() / 1000U;
+    xSemaphoreGive(s_mutex);
     xEventGroupClearBits(s_events, EV_PUBACK);
 
     int msg_id = esp_mqtt_client_publish(s_client, topic, payload, 0, 1, 0);
@@ -589,8 +710,18 @@ esp_err_t mqtt_publish_telemetry(const char *payload)
         s_status.published++;
     } else {
         s_status.publish_fails++;
+        s_status.puback_timeouts++;
+        s_status.last_puback_timeout_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
     }
     xSemaphoreGive(s_mutex);
 
+    if (!(bits & EV_PUBACK)) {
+        event_journal_emit(
+            "mqtt", "puback_timeout", EVENT_SEVERITY_ERROR,
+            "telemetry_ack_timeout", "{\"message\":\"telemetry\"}",
+            true, 30000
+        );
+    }
     return (bits & EV_PUBACK) ? ESP_OK : ESP_ERR_TIMEOUT;
 }

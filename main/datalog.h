@@ -60,6 +60,18 @@ typedef struct {
     uint32_t spool_pending;    // bytes waiting for replay to the broker
     uint32_t spool_replayed;   // spooled rows delivered since boot
     uint32_t mqtt_rows;        // rows delivered live (not via spool)
+    uint32_t sd_flush_count;
+    uint32_t sd_write_failures;
+    uint32_t spool_appended;
+    uint32_t spool_append_failures;
+    uint32_t spool_replay_starts;
+    uint32_t spool_cursor_failures;
+    uint64_t last_sd_flush_uptime_ms;
+    uint64_t last_sd_write_failure_uptime_ms;
+    uint64_t last_spool_append_uptime_ms;
+    uint64_t last_spool_replay_uptime_ms;
+    uint64_t last_spool_drain_uptime_ms;
+    uint64_t last_spool_failure_uptime_ms;
 } datalog_status_t;
 
 // Start the queue + fan-out task. Call after sdcard_init()/mqtt_init().

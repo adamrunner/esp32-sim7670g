@@ -1,8 +1,10 @@
 #include "webui.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "esp_http_server.h"
@@ -14,6 +16,7 @@
 #include "bms.h"
 #include "board_battery.h"
 #include "datalog.h"
+#include "event_journal.h"
 #include "modem.h"
 #include "mqtt.h"
 #include "ota.h"
@@ -22,6 +25,44 @@
 
 extern const uint8_t index_html_start[] asm("_binary_index_html_start");
 extern const uint8_t index_html_end[]   asm("_binary_index_html_end");
+
+typedef struct {
+    uint32_t request_count;
+    uint32_t failure_count;
+    uint32_t slow_request_count;
+    uint64_t last_request_uptime_ms;
+    uint64_t last_success_uptime_ms;
+    uint64_t last_error_uptime_ms;
+    uint32_t last_duration_ms;
+    int last_error;
+    char last_uri[48];
+} webui_observability_t;
+
+static SemaphoreHandle_t s_http_mutex;
+static webui_observability_t s_http_status;
+
+static void webui_status_json(cJSON *root)
+{
+    webui_observability_t status;
+    xSemaphoreTake(s_http_mutex, portMAX_DELAY);
+    status = s_http_status;
+    xSemaphoreGive(s_http_mutex);
+    cJSON *http = cJSON_AddObjectToObject(root, "http");
+    cJSON_AddNumberToObject(http, "request_count", status.request_count);
+    cJSON_AddNumberToObject(http, "failure_count", status.failure_count);
+    cJSON_AddNumberToObject(http, "slow_request_count",
+                            status.slow_request_count);
+    cJSON_AddNumberToObject(http, "last_request_uptime_ms",
+                            (double)status.last_request_uptime_ms);
+    cJSON_AddNumberToObject(http, "last_success_uptime_ms",
+                            (double)status.last_success_uptime_ms);
+    cJSON_AddNumberToObject(http, "last_error_uptime_ms",
+                            (double)status.last_error_uptime_ms);
+    cJSON_AddNumberToObject(http, "last_duration_ms",
+                            status.last_duration_ms);
+    cJSON_AddNumberToObject(http, "last_error", status.last_error);
+    cJSON_AddStringToObject(http, "last_uri", status.last_uri);
+}
 
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
@@ -109,6 +150,39 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     mqtt_status_json(root);       // "mqtt"
     datalog_status_json(root);    // "datalog"
     timesync_status_json(root);   // "time"
+    wifi_status_json(root);       // "wifi"
+    webui_status_json(root);      // "http"
+    event_journal_status_json(root); // "event_journal"
+    return send_json(req, root);
+}
+
+static esp_err_t events_get_handler(httpd_req_t *req)
+{
+    size_t limit = EVENT_JOURNAL_RING_CAPACITY;
+    size_t query_len = httpd_req_get_url_query_len(req);
+    if (query_len > 0 && query_len < 64) {
+        char query[64];
+        char value[12];
+        if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+            httpd_query_key_value(
+                query, "limit", value, sizeof(value)) == ESP_OK) {
+            char *end = NULL;
+            long requested = strtol(value, &end, 10);
+            if (!end || *end != '\0' || requested < 1 ||
+                requested > EVENT_JOURNAL_RING_CAPACITY) {
+                return httpd_resp_send_err(
+                    req, HTTPD_400_BAD_REQUEST, "limit must be 1..48"
+                );
+            }
+            limit = (size_t)requested;
+        }
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "schema_version", 1);
+    cJSON_AddStringToObject(root, "ordering",
+                            "boot_id,event_sequence");
+    event_journal_events_json(root, limit);
     return send_json(req, root);
 }
 
@@ -507,11 +581,62 @@ static esp_err_t mqtt_post_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
+typedef esp_err_t (*webui_handler_t)(httpd_req_t *req);
+
+static esp_err_t observed_handler(httpd_req_t *req)
+{
+    int64_t started_us = esp_timer_get_time();
+    xSemaphoreTake(s_http_mutex, portMAX_DELAY);
+    s_http_status.request_count++;
+    s_http_status.last_request_uptime_ms = (uint64_t)started_us / 1000U;
+    strlcpy(s_http_status.last_uri, req->uri,
+            sizeof(s_http_status.last_uri));
+    xSemaphoreGive(s_http_mutex);
+
+    webui_handler_t handler = (webui_handler_t)req->user_ctx;
+    esp_err_t result = handler(req);
+    uint32_t duration_ms =
+        (uint32_t)((esp_timer_get_time() - started_us) / 1000);
+    bool slow = duration_ms >= 2000;
+    xSemaphoreTake(s_http_mutex, portMAX_DELAY);
+    s_http_status.last_duration_ms = duration_ms;
+    if (result == ESP_OK) {
+        s_http_status.last_success_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
+    } else {
+        s_http_status.failure_count++;
+        s_http_status.last_error = result;
+        s_http_status.last_error_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
+    }
+    if (slow) {
+        s_http_status.slow_request_count++;
+    }
+    xSemaphoreGive(s_http_mutex);
+
+    if (result != ESP_OK || slow) {
+        char details[128];
+        snprintf(
+            details, sizeof(details),
+            "{\"uri\":\"%.47s\",\"duration_ms\":%lu,\"error\":%d}",
+            req->uri, (unsigned long)duration_ms, result
+        );
+        event_journal_emit(
+            "http", result == ESP_OK ? "slow_request" : "request_failed",
+            result == ESP_OK ? EVENT_SEVERITY_WARN : EVENT_SEVERITY_ERROR,
+            result == ESP_OK ? "duration_threshold" : "handler_error",
+            details, result != ESP_OK, 30000
+        );
+    }
+    return result;
+}
+
 void webui_init(void)
 {
+    s_http_mutex = xSemaphoreCreateMutex();
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.lru_purge_enable = true;
-    cfg.max_uri_handlers = 16;  // default 8; we register 14 routes
+    cfg.max_uri_handlers = 18;  // default 8; observability adds /api/events
     cfg.stack_size = 8192;  // ping/DNS handler keeps sizeable buffers on the stack
 
     httpd_handle_t server = NULL;
@@ -520,6 +645,7 @@ void webui_init(void)
     static const httpd_uri_t routes[] = {
         { .uri = "/",           .method = HTTP_GET,  .handler = root_get_handler },
         { .uri = "/api/status", .method = HTTP_GET,  .handler = status_get_handler },
+        { .uri = "/api/events", .method = HTTP_GET,  .handler = events_get_handler },
         { .uri = "/api/wifi",   .method = HTTP_GET,  .handler = wifi_get_handler },
         { .uri = "/api/wifi",   .method = HTTP_POST, .handler = wifi_post_handler },
         { .uri = "/api/apn",    .method = HTTP_POST, .handler = apn_post_handler },
@@ -535,6 +661,13 @@ void webui_init(void)
           .handler = modem_restart_post_handler },
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
-        ESP_ERROR_CHECK(httpd_register_uri_handler(server, &routes[i]));
+        httpd_uri_t observed = routes[i];
+        observed.user_ctx = (void *)observed.handler;
+        observed.handler = observed_handler;
+        ESP_ERROR_CHECK(httpd_register_uri_handler(server, &observed));
     }
+    event_journal_emit(
+        "http", "server_started", EVENT_SEVERITY_INFO, "listener_ready",
+        "{\"port\":80}", true, 0
+    );
 }

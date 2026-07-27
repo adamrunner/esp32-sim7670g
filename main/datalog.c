@@ -17,6 +17,7 @@
 #include "nvs.h"
 
 #include "mqtt.h"
+#include "event_journal.h"
 #include "sdcard.h"
 #include "timesync.h"
 
@@ -51,6 +52,21 @@ static bool s_sd_full;
 static long s_spool_size = -1;    // -1 = not yet loaded from disk
 static long s_spool_cursor;
 static int s_spool_unsaved_acks;
+static bool s_spool_replay_active;
+
+static void note_storage_failure(
+    const char *event_name,
+    const char *reason,
+    int error_number
+)
+{
+    char details[64];
+    snprintf(details, sizeof(details), "{\"errno\":%d}", error_number);
+    event_journal_emit(
+        "storage", event_name, EVENT_SEVERITY_ERROR, reason, details,
+        true, 30000
+    );
+}
 
 void datalog_device_id(char *out, size_t out_len)
 {
@@ -202,6 +218,16 @@ static void sd_flush(void)
     }
     s_sd_full = sdcard_mounted() && !sd_check_space();
     if (!sdcard_mounted() || s_sd_full) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_status.sd_write_failures++;
+        s_status.last_sd_write_failure_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
+        xSemaphoreGive(s_mutex);
+        note_storage_failure(
+            "sd_flush_failed",
+            !sdcard_mounted() ? "sd_unmounted" : "sd_full",
+            !sdcard_mounted() ? ENODEV : ENOSPC
+        );
         s_sd_buf_len = 0;  // nowhere to put it; MQTT/spool still has the data
         return;
     }
@@ -223,6 +249,12 @@ static void sd_flush(void)
         // are off (stale sdkconfig missing CONFIG_FATFS_LFN_HEAP=y).
         ESP_LOGW(TAG, "fopen(%s) failed: %d%s", path, errno,
                  errno == EINVAL ? " (FATFS LFN disabled?)" : "");
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_status.sd_write_failures++;
+        s_status.last_sd_write_failure_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
+        xSemaphoreGive(s_mutex);
+        note_storage_failure("sd_flush_failed", "open_failed", errno);
         s_sd_buf_len = 0;
         return;
     }
@@ -230,16 +262,25 @@ static void sd_flush(void)
         write_csv_header(f);
     }
     size_t written = fwrite(s_sd_buf, 1, s_sd_buf_len, f);
-    fclose(f);
+    bool closed = fclose(f) == 0;
 
-    if (written == s_sd_buf_len) {
+    if (written == s_sd_buf_len && closed) {
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         strlcpy(s_status.sd_file, path, sizeof(s_status.sd_file));
+        s_status.sd_flush_count++;
+        s_status.last_sd_flush_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
         xSemaphoreGive(s_mutex);
         strlcpy(s_sd_file, path, sizeof(s_sd_file));
     } else {
         ESP_LOGW(TAG, "short write to %s (%u/%u)", path,
                  (unsigned)written, (unsigned)s_sd_buf_len);
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_status.sd_write_failures++;
+        s_status.last_sd_write_failure_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
+        xSemaphoreGive(s_mutex);
+        note_storage_failure("sd_flush_failed", "short_write", EIO);
     }
     s_sd_buf_len = 0;
 }
@@ -300,8 +341,29 @@ static void spool_save_cursor(void)
 {
     FILE *f = fopen(SPOOL_CURSOR_FILE, "w");
     if (f) {
-        fprintf(f, "%ld", s_spool_cursor);
-        fclose(f);
+        bool ok = fprintf(f, "%ld", s_spool_cursor) > 0 &&
+                  fflush(f) == 0;
+        if (fclose(f) != 0) {
+            ok = false;
+        }
+        if (!ok) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_status.spool_cursor_failures++;
+            s_status.last_spool_failure_uptime_ms =
+                (uint64_t)esp_timer_get_time() / 1000U;
+            xSemaphoreGive(s_mutex);
+            note_storage_failure(
+                "spool_cursor_failed", "cursor_write_failed", EIO
+            );
+        }
+    } else {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_status.spool_cursor_failures++;
+        s_status.last_spool_failure_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
+        xSemaphoreGive(s_mutex);
+        note_storage_failure("spool_cursor_failed", "cursor_open_failed",
+                             errno);
     }
     s_spool_unsaved_acks = 0;
 }
@@ -331,12 +393,34 @@ static void spool_append(const char *line)
 
     FILE *f = fopen(SPOOL_FILE, "a");
     if (!f) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_status.spool_append_failures++;
+        s_status.last_spool_failure_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
+        xSemaphoreGive(s_mutex);
+        note_storage_failure("spool_append_failed", "open_failed", errno);
         return;
     }
     int n = fprintf(f, "%s\n", line);
-    fclose(f);
-    if (n > 0) {
+    bool closed = fclose(f) == 0;
+    if (n > 0 && closed) {
         s_spool_size += n;
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_status.spool_appended++;
+        s_status.last_spool_append_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
+        xSemaphoreGive(s_mutex);
+        event_journal_emit(
+            "spool", "appended", EVENT_SEVERITY_INFO, "mqtt_delivery_failed",
+            "{\"durable\":true}", false, 60000
+        );
+    } else {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_status.spool_append_failures++;
+        s_status.last_spool_failure_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
+        xSemaphoreGive(s_mutex);
+        note_storage_failure("spool_append_failed", "write_failed", EIO);
     }
 }
 
@@ -346,11 +430,32 @@ static void spool_replay_tick(void)
 {
     spool_load_state();
     if (s_spool_size <= 0 || s_spool_cursor >= s_spool_size || !mqtt_connected()) {
+        if (!mqtt_connected()) {
+            s_spool_replay_active = false;
+        }
         return;
+    }
+    if (!s_spool_replay_active) {
+        s_spool_replay_active = true;
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_status.spool_replay_starts++;
+        s_status.last_spool_replay_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
+        xSemaphoreGive(s_mutex);
+        event_journal_emit(
+            "spool", "replay_started", EVENT_SEVERITY_INFO,
+            "broker_available", "{\"active\":true}", true, 0
+        );
     }
 
     FILE *f = fopen(SPOOL_FILE, "r");
     if (!f) {
+        s_spool_replay_active = false;
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_status.last_spool_failure_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
+        xSemaphoreGive(s_mutex);
+        note_storage_failure("spool_replay_failed", "open_failed", errno);
         return;
     }
     fseek(f, s_spool_cursor, SEEK_SET);
@@ -366,13 +471,20 @@ static void spool_replay_tick(void)
             line[len - 1] = '\0';
         }
         if (line[0] && mqtt_publish_telemetry(line) != ESP_OK) {
+            s_spool_replay_active = false;
             break;  // broker went away again; cursor stays at this line
         }
         s_spool_cursor = line_start + len;
         if (line[0]) {
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_status.spool_replayed++;
+            s_status.last_spool_replay_uptime_ms =
+                (uint64_t)esp_timer_get_time() / 1000U;
             xSemaphoreGive(s_mutex);
+            event_journal_emit(
+                "spool", "replay_progress", EVENT_SEVERITY_INFO,
+                "row_acknowledged", "{\"progress\":true}", false, 60000
+            );
         }
         if (++s_spool_unsaved_acks >= SPOOL_CURSOR_EVERY) {
             spool_save_cursor();
@@ -384,6 +496,15 @@ static void spool_replay_tick(void)
         ESP_LOGI(TAG, "spool drained (%lu rows replayed since boot)",
                  (unsigned long)s_status.spool_replayed);
         spool_reset();
+        s_spool_replay_active = false;
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_status.last_spool_drain_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
+        xSemaphoreGive(s_mutex);
+        event_journal_emit(
+            "spool", "drained", EVENT_SEVERITY_INFO, "replay_complete",
+            "{\"pending_bytes\":0}", true, 0
+        );
     } else if (s_spool_unsaved_acks) {
         spool_save_cursor();
     }
@@ -474,4 +595,25 @@ void datalog_status_json(cJSON *root)
     cJSON_AddNumberToObject(dl, "mqtt_rows", d.mqtt_rows);
     cJSON_AddNumberToObject(dl, "spool_pending", d.spool_pending);
     cJSON_AddNumberToObject(dl, "spool_replayed", d.spool_replayed);
+    cJSON_AddNumberToObject(dl, "sd_flush_count", d.sd_flush_count);
+    cJSON_AddNumberToObject(dl, "sd_write_failures", d.sd_write_failures);
+    cJSON_AddNumberToObject(dl, "spool_appended", d.spool_appended);
+    cJSON_AddNumberToObject(dl, "spool_append_failures",
+                            d.spool_append_failures);
+    cJSON_AddNumberToObject(dl, "spool_replay_starts",
+                            d.spool_replay_starts);
+    cJSON_AddNumberToObject(dl, "spool_cursor_failures",
+                            d.spool_cursor_failures);
+    cJSON_AddNumberToObject(dl, "last_sd_flush_uptime_ms",
+                            (double)d.last_sd_flush_uptime_ms);
+    cJSON_AddNumberToObject(dl, "last_sd_write_failure_uptime_ms",
+                            (double)d.last_sd_write_failure_uptime_ms);
+    cJSON_AddNumberToObject(dl, "last_spool_append_uptime_ms",
+                            (double)d.last_spool_append_uptime_ms);
+    cJSON_AddNumberToObject(dl, "last_spool_replay_uptime_ms",
+                            (double)d.last_spool_replay_uptime_ms);
+    cJSON_AddNumberToObject(dl, "last_spool_drain_uptime_ms",
+                            (double)d.last_spool_drain_uptime_ms);
+    cJSON_AddNumberToObject(dl, "last_spool_failure_uptime_ms",
+                            (double)d.last_spool_failure_uptime_ms);
 }

@@ -23,6 +23,8 @@
 #include "ping/ping_sock.h"
 #include "nvs.h"
 
+#include "event_journal.h"
+
 static const char *TAG = "modem";
 
 // Waveshare ESP32-S3-SIM7670G-4G: SIM7670G on UART1
@@ -70,6 +72,33 @@ static char s_ppp_ip[40];
 static bool s_redial_requested;
 static bool s_restart_requested;
 
+typedef struct {
+    uint32_t ppp_up_count;
+    uint32_t ppp_down_count;
+    uint32_t ppp_error_count;
+    uint32_t ppp_pause_count;
+    uint32_t ppp_pause_failure_count;
+    uint32_t packet_attach_change_count;
+    uint32_t registration_change_count;
+    uint32_t redial_request_count;
+    uint32_t restart_request_count;
+    uint32_t restart_complete_count;
+    uint32_t restart_failure_count;
+    uint64_t last_ppp_up_uptime_ms;
+    uint64_t last_ppp_down_uptime_ms;
+    uint64_t last_ppp_error_uptime_ms;
+    uint64_t last_ppp_pause_uptime_ms;
+    uint64_t last_ppp_pause_failure_uptime_ms;
+    uint32_t last_ppp_pause_duration_ms;
+    uint64_t last_packet_attach_change_uptime_ms;
+    uint64_t last_registration_change_uptime_ms;
+    uint64_t last_redial_request_uptime_ms;
+    uint64_t last_restart_request_uptime_ms;
+    uint64_t last_restart_result_uptime_ms;
+} modem_observability_t;
+
+static modem_observability_t s_observability;
+
 // The UART carries either AT commands or PPP data, never both, and CMUX is
 // off the table (a failed negotiation wedges this modem until a reset — see
 // README). esp_modem_pause_net() gives us a middle ground: pause lwIP, wait
@@ -84,6 +113,7 @@ static bool s_net_paused;   // guarded by s_at_mutex
 // unaffected — the redial state machine keeps running, so a link that drops
 // mid-download still gets redialed. Single writer (the OTA task).
 static volatile bool s_polls_suspended;
+static int64_t s_net_pause_started_us;
 
 void modem_suspend_polls(bool suspend)
 {
@@ -95,8 +125,16 @@ void modem_request_redial(void)
 {
     xSemaphoreTake(s_status_mutex, portMAX_DELAY);
     s_redial_requested = true;
+    s_observability.redial_request_count++;
+    s_observability.last_redial_request_uptime_ms =
+        (uint64_t)esp_timer_get_time() / 1000U;
     xSemaphoreGive(s_status_mutex);
     ESP_LOGW(TAG, "PPP redial requested");
+    event_journal_emit(
+        "recovery", "redial_requested", EVENT_SEVERITY_WARN,
+        "manual_or_transport_request", "{\"supervisor_action\":false}",
+        true, 0
+    );
 }
 
 static bool restart_active(modem_restart_state_t state)
@@ -121,8 +159,15 @@ esp_err_t modem_request_restart(void)
     s_status.restart_state = MODEM_RESTART_REQUESTED;
     s_status.restart_error = ESP_OK;
     s_status.restart_time_us = esp_timer_get_time();
+    s_observability.restart_request_count++;
+    s_observability.last_restart_request_uptime_ms =
+        (uint64_t)esp_timer_get_time() / 1000U;
     xSemaphoreGive(s_status_mutex);
     ESP_LOGW(TAG, "SIM7670G restart requested");
+    event_journal_emit(
+        "recovery", "modem_restart_requested", EVENT_SEVERITY_WARN,
+        "manual_request", "{\"automatic\":false}", true, 0
+    );
     return ESP_OK;
 }
 
@@ -152,17 +197,47 @@ static bool at_channel_acquire(void)
         // Best effort un-pause; if the modem never left data mode the ATO
         // is just line noise PPP's framing discards.
         esp_modem_pause_net(s_dce, false);
+        xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+        s_observability.ppp_pause_failure_count++;
+        s_observability.last_ppp_pause_failure_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
+        xSemaphoreGive(s_status_mutex);
+        event_journal_emit(
+            "ppp", "pause_failed", EVENT_SEVERITY_WARN,
+            "command_mode_unavailable", "{\"paused\":false}", true, 30000
+        );
         xSemaphoreGive(s_at_mutex);
         return false;
     }
     s_net_paused = true;
+    s_net_pause_started_us = esp_timer_get_time();
+    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+    s_observability.ppp_pause_count++;
+    s_observability.last_ppp_pause_uptime_ms =
+        (uint64_t)s_net_pause_started_us / 1000U;
+    xSemaphoreGive(s_status_mutex);
     return true;
 }
 
 static void at_channel_release(void)
 {
     if (s_net_paused) {
+        uint32_t duration_ms = (uint32_t)(
+            (esp_timer_get_time() - s_net_pause_started_us) / 1000
+        );
         s_net_paused = false;
+        xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+        s_observability.last_ppp_pause_duration_ms = duration_ms;
+        xSemaphoreGive(s_status_mutex);
+        char details[64];
+        snprintf(details, sizeof(details), "{\"duration_ms\":%lu}",
+                 (unsigned long)duration_ms);
+        event_journal_emit(
+            "ppp", duration_ms > 3000 ? "pause_overrun" : "pause_complete",
+            duration_ms > 3000 ? EVENT_SEVERITY_WARN : EVENT_SEVERITY_DEBUG,
+            duration_ms > 3000 ? "duration_threshold" : "at_window",
+            details, duration_ms > 3000, duration_ms > 3000 ? 0 : 60000
+        );
         if (esp_modem_pause_net(s_dce, false) != ESP_OK) {
             // ATO didn't bring the data flow back; mark the link down so the
             // modem task tears the session down and redials cleanly.
@@ -170,7 +245,14 @@ static void at_channel_release(void)
             xSemaphoreTake(s_status_mutex, portMAX_DELAY);
             s_ppp_up = false;
             s_ppp_ip[0] = '\0';
+            s_observability.ppp_pause_failure_count++;
+            s_observability.last_ppp_pause_failure_uptime_ms =
+                (uint64_t)esp_timer_get_time() / 1000U;
             xSemaphoreGive(s_status_mutex);
+            event_journal_emit(
+                "ppp", "resume_failed", EVENT_SEVERITY_ERROR,
+                "data_mode_unavailable", details, true, 0
+            );
         }
     }
     xSemaphoreGive(s_at_mutex);
@@ -528,7 +610,11 @@ static const char *restart_state_str(modem_restart_state_t state)
 void modem_status_json(cJSON *root)
 {
     modem_status_t st;
+    modem_observability_t observability;
     modem_get_status(&st);
+    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+    observability = s_observability;
+    xSemaphoreGive(s_status_mutex);
     cJSON_AddBoolToObject(root, "modem_ok", st.at_ok);
     cJSON_AddBoolToObject(root, "sim_ready", st.sim_ready);
     cJSON_AddNumberToObject(root, "reg_status", st.reg_status);
@@ -559,6 +645,63 @@ void modem_status_json(cJSON *root)
             restart, "age_s",
             (double)((esp_timer_get_time() - st.restart_time_us) / 1000000));
     }
+    cJSON *ppp = cJSON_AddObjectToObject(root, "ppp");
+    cJSON_AddBoolToObject(ppp, "up", st.ppp_up);
+    cJSON_AddNumberToObject(ppp, "up_count",
+                            observability.ppp_up_count);
+    cJSON_AddNumberToObject(ppp, "down_count",
+                            observability.ppp_down_count);
+    cJSON_AddNumberToObject(ppp, "error_count",
+                            observability.ppp_error_count);
+    cJSON_AddNumberToObject(ppp, "pause_count",
+                            observability.ppp_pause_count);
+    cJSON_AddNumberToObject(ppp, "pause_failure_count",
+                            observability.ppp_pause_failure_count);
+    cJSON_AddNumberToObject(ppp, "last_pause_uptime_ms",
+                            (double)observability.last_ppp_pause_uptime_ms);
+    cJSON_AddNumberToObject(ppp, "last_pause_failure_uptime_ms",
+                            (double)observability.last_ppp_pause_failure_uptime_ms);
+    cJSON_AddNumberToObject(ppp, "last_pause_duration_ms",
+                            observability.last_ppp_pause_duration_ms);
+    cJSON_AddNumberToObject(ppp, "last_up_uptime_ms",
+                            (double)observability.last_ppp_up_uptime_ms);
+    cJSON_AddNumberToObject(ppp, "last_down_uptime_ms",
+                            (double)observability.last_ppp_down_uptime_ms);
+    cJSON_AddNumberToObject(ppp, "last_error_uptime_ms",
+                            (double)observability.last_ppp_error_uptime_ms);
+    cJSON_AddNumberToObject(ppp, "registration_change_count",
+                            observability.registration_change_count);
+    cJSON_AddNumberToObject(ppp, "last_registration_change_uptime_ms",
+                            (double)observability.last_registration_change_uptime_ms);
+    cJSON_AddNumberToObject(ppp, "packet_attach_change_count",
+                            observability.packet_attach_change_count);
+    cJSON_AddNumberToObject(ppp, "last_packet_attach_change_uptime_ms",
+                            (double)observability.last_packet_attach_change_uptime_ms);
+
+    cJSON *recovery = cJSON_AddObjectToObject(root, "recovery");
+    cJSON_AddBoolToObject(recovery, "automatic_actions_enabled", false);
+    cJSON_AddStringToObject(recovery, "state",
+                            "observability_only_phase_1");
+    cJSON_AddNumberToObject(recovery, "redial_request_count",
+                            observability.redial_request_count);
+    cJSON_AddNumberToObject(recovery, "restart_request_count",
+                            observability.restart_request_count);
+    cJSON_AddNumberToObject(recovery, "restart_complete_count",
+                            observability.restart_complete_count);
+    cJSON_AddNumberToObject(recovery, "restart_failure_count",
+                            observability.restart_failure_count);
+    cJSON_AddNumberToObject(recovery, "last_redial_request_uptime_ms",
+                            (double)observability.last_redial_request_uptime_ms);
+    cJSON_AddNumberToObject(recovery, "last_restart_request_uptime_ms",
+                            (double)observability.last_restart_request_uptime_ms);
+    cJSON_AddNumberToObject(recovery, "last_restart_result_uptime_ms",
+                            (double)observability.last_restart_result_uptime_ms);
+    cJSON *policy = cJSON_AddObjectToObject(recovery, "policy_defaults");
+    cJSON_AddNumberToObject(policy, "mqtt_unhealthy_seconds", 90);
+    cJSON_AddNumberToObject(policy, "recovery_attempt_seconds", 90);
+    cJSON_AddNumberToObject(policy, "failed_redials_before_restart", 2);
+    cJSON_AddNumberToObject(policy, "restart_cooldown_seconds", 900);
+    cJSON_AddNumberToObject(policy, "stable_recovery_seconds", 300);
 
     modem_gnss_t g;
     modem_get_gnss(&g);
@@ -841,6 +984,9 @@ static void on_ip_event(void *arg, esp_event_base_t base, int32_t event_id, void
         ip_event_got_ip_t *ev = data;
         xSemaphoreTake(s_status_mutex, portMAX_DELAY);
         s_ppp_up = true;
+        s_observability.ppp_up_count++;
+        s_observability.last_ppp_up_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
         snprintf(s_ppp_ip, sizeof(s_ppp_ip), IPSTR, IP2STR(&ev->ip_info.ip));
         xSemaphoreGive(s_status_mutex);
 
@@ -849,12 +995,23 @@ static void on_ip_event(void *arg, esp_event_base_t base, int32_t event_id, void
         ESP_LOGI(TAG, "PPP up: ip " IPSTR " gw " IPSTR " dns " IPSTR,
                  IP2STR(&ev->ip_info.ip), IP2STR(&ev->ip_info.gw),
                  IP2STR(&dns.ip.u_addr.ip4));
+        event_journal_emit(
+            "ppp", "up", EVENT_SEVERITY_INFO, "ip_assigned",
+            "{\"address_assigned\":true}", true, 0
+        );
     } else if (event_id == IP_EVENT_PPP_LOST_IP) {
         xSemaphoreTake(s_status_mutex, portMAX_DELAY);
         s_ppp_up = false;
+        s_observability.ppp_down_count++;
+        s_observability.last_ppp_down_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
         s_ppp_ip[0] = '\0';
         xSemaphoreGive(s_status_mutex);
         ESP_LOGW(TAG, "PPP lost IP");
+        event_journal_emit(
+            "ppp", "down", EVENT_SEVERITY_WARN, "ip_lost",
+            "{\"address_assigned\":false}", true, 0
+        );
     }
 }
 
@@ -866,8 +1023,17 @@ static void on_ppp_status(void *arg, esp_event_base_t base, int32_t event_id, vo
         ESP_LOGW(TAG, "PPP error event %d — link down", (int)event_id);
         xSemaphoreTake(s_status_mutex, portMAX_DELAY);
         s_ppp_up = false;
+        s_observability.ppp_error_count++;
+        s_observability.last_ppp_error_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
         s_ppp_ip[0] = '\0';
         xSemaphoreGive(s_status_mutex);
+        char details[48];
+        snprintf(details, sizeof(details), "{\"event_id\":%d}", (int)event_id);
+        event_journal_emit(
+            "ppp", "error", EVENT_SEVERITY_ERROR, "lwip_ppp_error",
+            details, true, 30000
+        );
     }
 }
 
@@ -974,6 +1140,8 @@ static void modem_task(void *arg)
     int dead_polls = 0;
     int healthy_polls = 0;
     int pause_fails = 0;
+    int previous_reg_status = -1;
+    int previous_packet_attached = -1;
 
     while (1) {
         xSemaphoreTake(s_status_mutex, portMAX_DELAY);
@@ -1026,6 +1194,16 @@ static void modem_task(void *arg)
                 ESP_LOGE(TAG, "AT+CRESET failed: %s", esp_err_to_name(restart_err));
                 st.restart_state = MODEM_RESTART_ERROR;
                 st.restart_error = restart_err;
+                xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+                s_observability.restart_failure_count++;
+                s_observability.last_restart_result_uptime_ms =
+                    (uint64_t)esp_timer_get_time() / 1000U;
+                xSemaphoreGive(s_status_mutex);
+                event_journal_emit(
+                    "recovery", "modem_restart_failed",
+                    EVENT_SEVERITY_ERROR, esp_err_to_name(restart_err),
+                    "{\"stage\":\"reset_command\"}", true, 0
+                );
             } else {
                 ESP_LOGI(TAG, "AT+CRESET accepted; waiting for modem to return");
                 restart_issued = true;
@@ -1102,6 +1280,16 @@ static void modem_task(void *arg)
                 if (st.restart_state == MODEM_RESTART_WAITING_AT) {
                     st.restart_state = MODEM_RESTART_COMPLETE;
                     ESP_LOGI(TAG, "SIM7670G restart complete; restoring GNSS and PPP");
+                    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+                    s_observability.restart_complete_count++;
+                    s_observability.last_restart_result_uptime_ms =
+                        (uint64_t)esp_timer_get_time() / 1000U;
+                    xSemaphoreGive(s_status_mutex);
+                    event_journal_emit(
+                        "recovery", "modem_restart_complete",
+                        EVENT_SEVERITY_INFO, "at_responsive",
+                        "{\"ppp_restored\":false}", true, 0
+                    );
                 }
             } else {
                 ESP_LOGW(TAG, "modem not responding to AT at any baud yet");
@@ -1114,6 +1302,15 @@ static void modem_task(void *arg)
                 (int64_t)RESTART_AT_TIMEOUT_MS * 1000) {
             st.restart_state = MODEM_RESTART_ERROR;
             st.restart_error = ESP_ERR_TIMEOUT;
+            xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+            s_observability.restart_failure_count++;
+            s_observability.last_restart_result_uptime_ms =
+                (uint64_t)esp_timer_get_time() / 1000U;
+            xSemaphoreGive(s_status_mutex);
+            event_journal_emit(
+                "recovery", "modem_restart_failed", EVENT_SEVERITY_ERROR,
+                "at_timeout", "{\"stage\":\"waiting_at\"}", true, 0
+            );
             ESP_LOGE(TAG, "SIM7670G did not return within %d seconds; "
                      "background recovery will continue",
                      RESTART_AT_TIMEOUT_MS / 1000);
@@ -1231,6 +1428,21 @@ static void modem_task(void *arg)
             } else {
                 ESP_LOGI(TAG, "registered but PS not attached yet; delaying dial");
             }
+            if ((int)attached != previous_packet_attached) {
+                char details[48];
+                snprintf(details, sizeof(details), "{\"attached\":%s}",
+                         attached ? "true" : "false");
+                xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+                s_observability.packet_attach_change_count++;
+                s_observability.last_packet_attach_change_uptime_ms =
+                    (uint64_t)esp_timer_get_time() / 1000U;
+                xSemaphoreGive(s_status_mutex);
+                event_journal_emit(
+                    "lte", "packet_attach_changed", EVENT_SEVERITY_INFO,
+                    "pre_dial_query", details, true, 0
+                );
+                previous_packet_attached = attached;
+            }
         }
 
         if (st.at_ok) {
@@ -1239,6 +1451,24 @@ static void modem_task(void *arg)
                      st.sim_ready, st.reg_status, st.rssi_dbm,
                      st.operator_name, st.rat,
                      st.ppp_up ? st.ip_addr : "down");
+        }
+
+        if (st.reg_status != previous_reg_status) {
+            char details[64];
+            snprintf(
+                details, sizeof(details), "{\"from\":%d,\"to\":%d}",
+                previous_reg_status, st.reg_status
+            );
+            xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+            s_observability.registration_change_count++;
+            s_observability.last_registration_change_uptime_ms =
+                (uint64_t)esp_timer_get_time() / 1000U;
+            xSemaphoreGive(s_status_mutex);
+            event_journal_emit(
+                "lte", "registration_changed", EVENT_SEVERITY_INFO,
+                "modem_poll", details, true, 0
+            );
+            previous_reg_status = st.reg_status;
         }
 
         xSemaphoreTake(s_status_mutex, portMAX_DELAY);

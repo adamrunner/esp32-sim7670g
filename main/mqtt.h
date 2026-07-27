@@ -38,8 +38,26 @@ typedef struct {
     bool availability_confirmed;  // retained online state received a PUBACK
     uint32_t availability_attempts;
     uint32_t availability_failures;
+    bool availability_requested;
+    bool availability_queued;
     char availability_last_error[64];
     char last_error[64];
+    uint32_t connect_count;
+    uint32_t disconnect_count;
+    uint32_t error_count;
+    uint32_t puback_count;
+    uint32_t puback_timeouts;
+    uint32_t availability_requested_count;
+    uint64_t last_connect_uptime_ms;
+    uint64_t last_disconnect_uptime_ms;
+    uint64_t last_error_uptime_ms;
+    uint64_t last_puback_uptime_ms;
+    uint64_t last_puback_timeout_uptime_ms;
+    uint64_t last_publish_attempt_uptime_ms;
+    uint64_t availability_last_requested_uptime_ms;
+    uint64_t availability_last_queued_uptime_ms;
+    uint64_t availability_last_ack_uptime_ms;
+    uint64_t availability_last_failure_uptime_ms;
 } mqtt_status_t;
 
 // Load config from NVS and start the client if enabled. Requires the default

@@ -44,6 +44,8 @@
 </head>
 <body>
 <h1>ESP32-S3 &middot; SIM7670G Cellular Status</h1>
+<div class="msg bad" id="status_error" role="alert"
+     style="display:none; max-width:960px; margin:0 0 1rem; padding:0.6rem;"></div>
 <div class="cards">
   <div class="card">
     <h2>Connection</h2>
@@ -231,7 +233,9 @@ async function refresh() {
   if (pinging) return;  // server handles one request at a time; don't queue behind a ping
   try {
     const r = await fetch('/api/status');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
     const s = await r.json();
+    $('status_error').style.display = 'none';
     pill($('modem_ok'), s.modem_ok ? 'responding' : 'no response', s.modem_ok ? 'ok' : 'bad');
     pill($('sim_ready'), s.sim_ready ? 'ready' : 'not ready', s.sim_ready ? 'ok' : 'bad');
     const regOk = s.reg_status === 1 || s.reg_status === 5;
@@ -357,7 +361,12 @@ async function refresh() {
     $('time_state').textContent = t.valid
       ? new Date(t.epoch * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' UTC (' + t.source + ')'
       : 'not set (rows carry timestamp 0)';
-  } catch (e) { /* board busy; try again next tick */ }
+  } catch (e) {
+    $('status_error').textContent =
+      'Status unavailable: ' + (e && e.message ? e.message : 'request failed') +
+      '. Local controls may still work; retrying automatically.';
+    $('status_error').style.display = 'block';
+  }
 }
 
 const WIFI_STATE = {
@@ -371,7 +380,9 @@ let apSsid = 'ESP32-SIM7670G';
 async function refreshWifi() {
   if (pinging) return;
   try {
-    const s = await (await fetch('/api/wifi')).json();
+    const response = await fetch('/api/wifi');
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const s = await response.json();
     apSsid = s.ap_ssid || apSsid;
     const [txt, cls] = WIFI_STATE[s.state] || [s.state, 'warn'];
     pill($('wifi_state'), txt, cls);
@@ -380,7 +391,10 @@ async function refreshWifi() {
                                : (s.state === 'softap' ? 'AP: ' + s.ap_ssid : '—');
     $('wifi_ip').textContent = s.ip || '—';
     $('wifi_rssi').textContent = s.rssi_dbm ? s.rssi_dbm + ' dBm' : '—';
-  } catch (e) { /* board busy; retry next tick */ }
+  } catch (e) {
+    $('wifimsg').textContent =
+      'WiFi status unavailable: ' + (e && e.message ? e.message : 'request failed');
+  }
 }
 
 const OTA_STATE = {
@@ -395,7 +409,9 @@ const OTA_STATE = {
 async function refreshOta() {
   if (pinging) return;
   try {
-    const s = await (await fetch('/api/ota')).json();
+    const response = await fetch('/api/ota');
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const s = await response.json();
     $('fw_version').textContent = (s.version || '—') + (s.pending_verify ? ' (pending verify)' : '');
     $('fw_slot').textContent = s.slot || '—';
     let [txt, cls] = OTA_STATE[s.state] || [s.state, 'warn'];
@@ -425,7 +441,11 @@ async function refreshOta() {
       : s.last_check_age_s < 90 ? Math.round(s.last_check_age_s) + ' s ago'
       : Math.round(s.last_check_age_s / 60) + ' min ago';
     $('otabtn').disabled = ['checking', 'downloading', 'verifying', 'wait_reboot'].includes(s.state);
-  } catch (e) { /* board busy or rebooting mid-update; retry next tick */ }
+  } catch (e) {
+    $('otamsg').textContent =
+      'Firmware status unavailable: ' +
+      (e && e.message ? e.message : 'request failed');
+  }
 }
 
 let otaMsgLocal = false;

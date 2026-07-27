@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "esp_err.h"
+#include "cJSON.h"
 
 #define WIFI_SSID_MAX 33   // 32-char SSID + NUL
 #define WIFI_PASS_MAX 64   // up to 63-char WPA2 passphrase + NUL
@@ -22,6 +23,19 @@ typedef struct {
     int rssi_dbm;                // STA RSSI when connected, else 0
     char ap_ssid[WIFI_SSID_MAX]; // the SoftAP's SSID
     int disconnect_count;        // STA disconnect events since boot
+    uint32_t connect_count;
+    uint32_t connect_attempt_count;
+    uint32_t ap_start_count;
+    uint32_t ap_client_count;
+    uint32_t ap_association_count;
+    uint32_t ap_disassociation_count;
+    uint32_t transition_count;
+    uint64_t last_transition_uptime_ms;
+    uint64_t last_connected_uptime_ms;
+    uint64_t last_disconnected_uptime_ms;
+    uint64_t last_ap_start_uptime_ms;
+    uint64_t last_ap_association_uptime_ms;
+    uint64_t last_ap_disassociation_uptime_ms;
 } wifi_ui_status_t;
 
 // Bring up WiFi: try to join the stored home network (STA); fall back to the
@@ -32,6 +46,7 @@ void wifi_init(void);
 
 // Thread-safe snapshot of the current WiFi state for the web UI.
 void wifi_get_status(wifi_ui_status_t *out);
+void wifi_status_json(cJSON *root);
 
 // Persist new home-WiFi credentials to NVS and re-evaluate the connection: the
 // supervisor will attempt STA and, on success, drop the SoftAP. An empty ssid

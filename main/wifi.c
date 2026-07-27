@@ -11,7 +11,10 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "esp_timer.h"
 #include "nvs.h"
+
+#include "event_journal.h"
 
 static const char *TAG = "wifi";
 
@@ -53,9 +56,24 @@ static wifi_ui_status_t s_status;
 
 static void set_state(wifi_ui_state_t state)
 {
+    bool changed;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
+    changed = s_status.state != state;
     s_status.state = state;
+    if (changed) {
+        s_status.transition_count++;
+        s_status.last_transition_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
+    }
     xSemaphoreGive(s_mutex);
+    if (changed) {
+        char details[48];
+        snprintf(details, sizeof(details), "{\"state\":%d}", (int)state);
+        event_journal_emit(
+            "wifi", "mode_changed", EVENT_SEVERITY_INFO, "state_transition",
+            details, true, 0
+        );
+    }
 }
 
 static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -69,9 +87,17 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
         ESP_LOGW(TAG, "STA disconnected (reason %d)", d->reason);
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         s_status.disconnect_count++;
+        s_status.last_disconnected_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
         s_status.ip[0] = '\0';
         s_status.rssi_dbm = 0;
         xSemaphoreGive(s_mutex);
+        char details[48];
+        snprintf(details, sizeof(details), "{\"reason\":%d}", d->reason);
+        event_journal_emit(
+            "wifi", "sta_disconnected", EVENT_SEVERITY_WARN,
+            "driver_disconnect", details, true, 0
+        );
         // Clear GOT_IP so a stale bit can't fool the next connect wait.
         xEventGroupClearBits(s_events, BIT_GOT_IP);
         xEventGroupSetBits(s_events, BIT_DISCONNECTED);
@@ -79,10 +105,43 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
         const ip_event_got_ip_t *e = data;
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         snprintf(s_status.ip, sizeof(s_status.ip), IPSTR, IP2STR(&e->ip_info.ip));
+        s_status.connect_count++;
+        s_status.last_connected_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
         xSemaphoreGive(s_mutex);
+        event_journal_emit(
+            "wifi", "sta_connected", EVENT_SEVERITY_INFO, "got_ip",
+            "{\"address_assigned\":true}", true, 0
+        );
         ESP_LOGI(TAG, "STA got IP %s", s_status.ip);
         xEventGroupClearBits(s_events, BIT_DISCONNECTED);
         xEventGroupSetBits(s_events, BIT_GOT_IP);
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STACONNECTED) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        if (s_status.ap_client_count < AP_MAX_CONN) {
+            s_status.ap_client_count++;
+        }
+        s_status.ap_association_count++;
+        s_status.last_ap_association_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
+        xSemaphoreGive(s_mutex);
+        event_journal_emit(
+            "wifi", "ap_client_associated", EVENT_SEVERITY_INFO,
+            "softap_client", "{\"associated\":true}", true, 0
+        );
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STADISCONNECTED) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        if (s_status.ap_client_count > 0) {
+            s_status.ap_client_count--;
+        }
+        s_status.ap_disassociation_count++;
+        s_status.last_ap_disassociation_uptime_ms =
+            (uint64_t)esp_timer_get_time() / 1000U;
+        xSemaphoreGive(s_mutex);
+        event_journal_emit(
+            "wifi", "ap_client_disassociated", EVENT_SEVERITY_INFO,
+            "softap_client", "{\"associated\":false}", true, 0
+        );
     }
 }
 
@@ -139,10 +198,17 @@ static void start_ap(void)
     s_wifi_running = true;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    s_status.state = WIFI_UI_AP;
     strlcpy(s_status.ip, "192.168.4.1", sizeof(s_status.ip));
     s_status.rssi_dbm = 0;
+    s_status.ap_start_count++;
+    s_status.last_ap_start_uptime_ms =
+        (uint64_t)esp_timer_get_time() / 1000U;
     xSemaphoreGive(s_mutex);
+    set_state(WIFI_UI_AP);
+    event_journal_emit(
+        "wifi", "ap_started", EVENT_SEVERITY_INFO, "fallback_control_plane",
+        "{\"ip\":\"192.168.4.1\"}", true, 0
+    );
     ESP_LOGI(TAG, "SoftAP \"%s\" up — http://192.168.4.1/", AP_SSID);
 }
 
@@ -184,6 +250,9 @@ static bool sta_connect_loop(int max_attempts, bool *reconfig)
     uint32_t backoff = BACKOFF_MIN_MS;
 
     for (int attempt = 1; attempt <= max_attempts; attempt++) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_status.connect_attempt_count++;
+        xSemaphoreGive(s_mutex);
         EventBits_t bits = xEventGroupWaitBits(
             s_events, BIT_GOT_IP | BIT_DISCONNECTED | BIT_RECONFIG,
             pdFALSE, pdFALSE, pdMS_TO_TICKS(CONNECT_TIMEOUT_MS));
@@ -314,6 +383,51 @@ void wifi_get_status(wifi_ui_status_t *out)
     }
     *out = s_status;
     xSemaphoreGive(s_mutex);
+}
+
+static const char *wifi_state_name(wifi_ui_state_t state)
+{
+    switch (state) {
+    case WIFI_UI_STA_CONNECTING: return "connecting";
+    case WIFI_UI_STA_CONNECTED:  return "connected";
+    case WIFI_UI_AP:             return "softap";
+    default:                     return "booting";
+    }
+}
+
+void wifi_status_json(cJSON *root)
+{
+    wifi_ui_status_t status;
+    wifi_get_status(&status);
+    cJSON *wifi = cJSON_AddObjectToObject(root, "wifi");
+    cJSON_AddStringToObject(wifi, "state", wifi_state_name(status.state));
+    cJSON_AddBoolToObject(wifi, "sta_configured", status.sta_configured);
+    cJSON_AddNumberToObject(wifi, "connect_count", status.connect_count);
+    cJSON_AddNumberToObject(wifi, "connect_attempt_count",
+                            status.connect_attempt_count);
+    cJSON_AddNumberToObject(wifi, "disconnect_count",
+                            status.disconnect_count);
+    cJSON_AddNumberToObject(wifi, "ap_start_count", status.ap_start_count);
+    cJSON_AddNumberToObject(wifi, "ap_client_count",
+                            status.ap_client_count);
+    cJSON_AddNumberToObject(wifi, "ap_association_count",
+                            status.ap_association_count);
+    cJSON_AddNumberToObject(wifi, "ap_disassociation_count",
+                            status.ap_disassociation_count);
+    cJSON_AddNumberToObject(wifi, "transition_count",
+                            status.transition_count);
+    cJSON_AddNumberToObject(wifi, "last_transition_uptime_ms",
+                            (double)status.last_transition_uptime_ms);
+    cJSON_AddNumberToObject(wifi, "last_connected_uptime_ms",
+                            (double)status.last_connected_uptime_ms);
+    cJSON_AddNumberToObject(wifi, "last_disconnected_uptime_ms",
+                            (double)status.last_disconnected_uptime_ms);
+    cJSON_AddNumberToObject(wifi, "last_ap_start_uptime_ms",
+                            (double)status.last_ap_start_uptime_ms);
+    cJSON_AddNumberToObject(wifi, "last_ap_association_uptime_ms",
+                            (double)status.last_ap_association_uptime_ms);
+    cJSON_AddNumberToObject(wifi, "last_ap_disassociation_uptime_ms",
+                            (double)status.last_ap_disassociation_uptime_ms);
 }
 
 esp_err_t wifi_set_credentials(const char *ssid, const char *pass)

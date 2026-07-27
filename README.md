@@ -57,6 +57,13 @@ web UI for monitoring/configuring the cellular connection.
   if no card is inserted it logs a warning and the rest of the app runs
   normally. Callers just `fopen("/sdcard/…")`; long filenames are enabled so
   date-stamped names like `2026-07-14.csv` aren't truncated to 8.3.
+- **Diagnostic event journal** (`main/event_journal.c`) — every producer writes
+  first to a fixed RAM ring and makes a zero-wait queue attempt. A separate
+  low-priority worker appends redacted schema-v1 JSONL to
+  `/sdcard/events/events.jsonl`, rotates deterministically at 128 KiB across
+  four files, repairs an interrupted final line at boot, and `fsync`s critical
+  transitions. Journal failure counters remain visible and never stop BMS
+  collection, MQTT, WiFi, or HTTP service.
 - **JBD BMS monitor** (`main/bms.c`) — polls the JBD BMS on the 4S4P LiFePO4
   house battery over UART2 (TX=GPIO1, RX=GPIO2 by default, 9600 8N1; confirm
   against the header before wiring). TX/RX are reconfigurable from the web UI
@@ -232,7 +239,12 @@ URL actually embedded in the binary before publishing.
   object (`powered`, `fix`, `sats` (in view), `sats_used` (in the fix),
   `hdop`, and — once there has been a
   fix — `lat`, `lon`, `alt_m`, `speed_kmh`, `course_deg`, `utc`,
-  `fix_age_s`; position persists as last-known when the fix drops)
+  `fix_age_s`; position persists as last-known when the fix drops). Additive
+  `wifi`, `ppp`, `mqtt`, `datalog`, `http`, `recovery`, and `event_journal`
+  objects expose boot-scoped counters and monotonic transition timestamps.
+- `GET /api/events?limit=48` — read-only chronological snapshot of the RAM
+  event ring. Unsynchronized events deliberately have `wall_time: null` and
+  remain ordered by `boot_id,event_sequence`.
 - `POST /api/apn` — `{"apn":"..."}` save APN to NVS and reconnect
 - `POST /api/at` — `{"cmd":"AT+CSQ"}` raw AT passthrough; while the PPP
   link is up this pauses the data stream for the duration of the command
@@ -269,6 +281,17 @@ URL actually embedded in the binary before publishing.
   let the modem supervisor restore LTE/PPP. Progress and terminal errors are
   reported by the `modem_restart` object in `GET /api/status`. The request is
   rejected while OTA is actively checking or installing.
+
+Host diagnostics require no field telemetry in Git:
+
+```sh
+python3 tools/event_report.py /path/to/copied/events --output outage.json
+python3 -m unittest discover -s tests -v
+```
+
+`event_report.py` reads rotated journal files oldest-to-newest, verifies
+boot-scoped sequence order and redaction, and summarizes PPP/MQTT outage
+intervals plus spool/recovery transitions without serial logs.
 
 ## Deferred cleanups
 
