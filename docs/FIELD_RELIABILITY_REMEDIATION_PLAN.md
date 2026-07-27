@@ -366,6 +366,86 @@ Activation gate:
 - Build and local validation are allowed.
 - Hardware flash or OTA publication requires explicit approval.
 
+#### Phase 0 and Phase 1 implementation record — 2026-07-26
+
+Implementation status:
+
+- Phase 0 is complete for the approved local scope.
+- Phase 1 implementation and host fault validation are complete. Direct
+  hardware power-cut, FAT-card, and live outage validation remain activation
+  gated; no Phase 2 behavior is enabled by these changes.
+
+Commits:
+
+- Firmware `5791090` — synthetic-time recovery-policy reference model and
+  tests for no coverage, stale PPP/MQTT, healthy WiFi, repeated redial
+  failure, restart cooldown, and stable recovery.
+- Backend `91bb63f` — legacy/schema-v2 parsing and field reconciliation
+  harness, machine-readable July 26 baseline fixture, boot/gap/duplicate and
+  replay-delay summaries.
+- Firmware `b6213ff` — fixed RAM event ring, zero-wait producer queue,
+  dedicated SD JSONL worker, redaction, interrupted-tail repair, deterministic
+  128 KiB/four-file rotation, critical `fsync`, host fault tests, and outage
+  report generator.
+- Firmware `02bcc6b` — additive WiFi/PPP/MQTT/PUBACK/spool/availability/
+  HTTP/recovery counters and monotonic timestamps, read-only `/api/status` and
+  `/api/events`, AP-client and transition events, and visible browser status
+  errors.
+
+Baseline and validation:
+
+- Revalidated clean starting states before edits: firmware `6c73a38` on
+  `main`; backend `940bc2a` on `dev`.
+- Treated the mounted `/Volumes/SDCARD` as read-only. Its four BMS CSVs
+  contained 27,345 data rows; byte sizes and SHA-256 values are preserved in
+  the non-sensitive backend fixture. The same hashes were rechecked after
+  implementation.
+- The reconciliation fixture reproduces 27,345 card rows, 790 card-only rows,
+  125 production-only unique rows, 749 excess production duplicates, 26,680
+  derived unique production rows, and 27,429 derived total production rows.
+- Backend isolated Python 3.10 validation: 48 tests passed (44 pre-existing
+  plus four reconciliation tests).
+- Firmware host validation: nine tests passed. Coverage includes rotation,
+  redaction, interrupted-tail repair, timestamp-zero ordering, rate limiting,
+  write failure, synthetic outage reconstruction, and all six recovery-policy
+  cases.
+- Embedded browser JavaScript passed `node --check`.
+- Clean pinned ESP-IDF 5.5/Python 3.10 build passed at `02bcc6b`; application
+  size was `0x150d30`, leaving `0x2af2d0` bytes (67%) free in the smallest app
+  partition. The unchanged Phase 0 firmware also built successfully before
+  Phase 1 runtime changes.
+
+Compatibility and safety:
+
+- Existing status fields, CSV telemetry, MQTT payloads, NVS keys, modem
+  ownership, OTA polling suspension, and HTTP mutation endpoints are
+  unchanged. New status objects and fields are additive.
+- Event producers never perform SD I/O or wait for queue space. A dedicated
+  low-priority task owns encoding/rotation/writes; journal failures and queue
+  pressure are counted and do not stop telemetry, MQTT, WiFi, or HTTP.
+- Event details are bounded and sensitive keys are redacted before both RAM
+  and SD sinks. No raw telemetry, credentials, SIM identifiers, or raw AT
+  responses were added.
+- Automatic recovery actions remain explicitly disabled in status. The policy
+  constants are observable, but Phase 2 is the first phase allowed to connect
+  decisions to dry-run actions.
+- No hardware was flashed, no OTA artifact was published, Anton was not
+  contacted or mutated, the SD card was not modified, and no branch was
+  pushed.
+
+Deviations and remaining evidence:
+
+- The approved activation boundary prevented real power-cut and live outage
+  tests. Host tests inject partial JSONL writes, failed paths, rotations, and a
+  complete zero-wall-time PPP/MQTT/spool outage timeline; actual FAT behavior,
+  task/heap pressure, and event rates still require direct hardware evidence.
+- The historical production database was not exported or committed. Baseline
+  reproduction therefore uses approved aggregate counts plus one-way SD/schema
+  hashes; the helper is ready to consume a separately handled JSONL production
+  export when field validation is authorized.
+- The field device remains on `7957a71`; `a2f5a10` and the Phase 0/1 commits
+  are build-validated only.
+
 ### Phase 2: Coordinate AT windows and add automatic recovery
 
 Deliverables:
