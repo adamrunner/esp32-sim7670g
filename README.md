@@ -4,6 +4,14 @@ ESP-IDF project for the **Waveshare ESP32-S3-SIM7670G-4G** dev board.
 Brings the board up, talks to the SIM7670G cellular modem, and serves a
 web UI for monitoring/configuring the cellular connection.
 
+## Reliability plans
+
+- [Field reliability remediation](docs/FIELD_RELIABILITY_REMEDIATION_PLAN.md) —
+  phased work for cellular recovery, local WiFi access, delivery
+  deduplication, durable diagnostics, and field validation.
+- [Supervised modem restart](docs/MODEM_RESTART_PLAN.md)
+- [OTA reliability and failure traceability](docs/OTA_RELIABILITY_PLAN.md)
+
 ## What it does
 
 - **Cellular data via PPP** (`main/modem.c`) — the ESP32 gets its own IP
