@@ -30,6 +30,7 @@
 #include "mqtt.h"
 #include "event_journal.h"
 #include "ota_policy_core.h"
+#include "webui.h"
 #include "wifi.h"
 
 static const char *TAG = "ota";
@@ -1014,15 +1015,22 @@ static void ota_task(void *arg)
                 wifi.last_ap_association_uptime_ms,
             .last_ap_disassociation_uptime_ms =
                 wifi.last_ap_disassociation_uptime_ms,
+            .last_http_request_uptime_ms =
+                webui_last_request_uptime_ms(),
             .now_uptime_ms =
                 (uint64_t)esp_timer_get_time() / 1000U,
         };
         ota_policy_decision_t policy =
             ota_policy_evaluate(&policy_snapshot);
         if (policy != OTA_POLICY_PROCEED) {
-            const char *reason =
-                policy == OTA_POLICY_DEFER_AP_CLIENT
-                    ? "ap_client_active" : "ap_quiet_period";
+            const char *reason;
+            if (policy == OTA_POLICY_DEFER_AP_CLIENT) {
+                reason = "ap_client_active";
+            } else if (policy == OTA_POLICY_DEFER_HTTP_QUIET) {
+                reason = "http_quiet_period";
+            } else {
+                reason = "ap_quiet_period";
+            }
             st_lock();
             s_st.control_plane_defer_count++;
             s_st.last_control_plane_defer_us = esp_timer_get_time();

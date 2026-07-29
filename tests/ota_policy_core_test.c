@@ -64,6 +64,35 @@ static void test_home_wifi_does_not_block_ota(void)
     assert(ota_policy_evaluate(&snapshot) == OTA_POLICY_PROCEED);
 }
 
+static void test_recent_http_request_defers_routine_check(void)
+{
+    ota_policy_snapshot_t snapshot = routine_softap();
+    snapshot.softap_active = false;
+    snapshot.last_http_request_uptime_ms =
+        snapshot.now_uptime_ms - OTA_HTTP_QUIET_PERIOD_MS + 1;
+    assert(ota_policy_evaluate(&snapshot) ==
+           OTA_POLICY_DEFER_HTTP_QUIET);
+}
+
+static void test_http_quiet_period_expires(void)
+{
+    ota_policy_snapshot_t snapshot = routine_softap();
+    snapshot.softap_active = false;
+    snapshot.last_http_request_uptime_ms =
+        snapshot.now_uptime_ms - OTA_HTTP_QUIET_PERIOD_MS;
+    assert(ota_policy_evaluate(&snapshot) == OTA_POLICY_PROCEED);
+}
+
+static void test_out_of_order_http_timestamp_defers(void)
+{
+    ota_policy_snapshot_t snapshot = routine_softap();
+    snapshot.softap_active = false;
+    snapshot.last_http_request_uptime_ms =
+        snapshot.now_uptime_ms + 1;
+    assert(ota_policy_evaluate(&snapshot) ==
+           OTA_POLICY_DEFER_HTTP_QUIET);
+}
+
 static void test_out_of_order_client_timestamps_defer(void)
 {
     ota_policy_snapshot_t snapshot = routine_softap();
@@ -81,6 +110,9 @@ int main(void)
     test_routine_check_proceeds_after_quiet_period();
     test_never_used_ap_does_not_block_ota();
     test_home_wifi_does_not_block_ota();
+    test_recent_http_request_defers_routine_check();
+    test_http_quiet_period_expires();
+    test_out_of_order_http_timestamp_defers();
     test_out_of_order_client_timestamps_defer();
     puts("OTA policy core tests: ok");
     return 0;

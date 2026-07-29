@@ -22,6 +22,14 @@ class FieldSafetyContractTests(unittest.TestCase):
         )
         self.assertIn("httpd_resp_send_chunk", webui_source)
         self.assertIn("response_error_count", webui_source)
+        self.assertIn("json_stream_status_fragment", webui_source)
+        self.assertIn("event_journal_visit_events_json", webui_source)
+        self.assertNotIn("event_journal_events_json(", webui_source)
+
+    def test_routine_ota_observes_recent_http_control_plane_use(self):
+        ota_source = (REPOSITORY_ROOT / "main" / "ota.c").read_text()
+        self.assertIn("webui_last_request_uptime_ms()", ota_source)
+        self.assertIn("http_quiet_period", ota_source)
 
     def test_supervisor_activation_boundary_remains_disabled(self):
         modem_source = (

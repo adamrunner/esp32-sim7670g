@@ -345,11 +345,17 @@ void event_journal_status_json(cJSON *root)
                             status.last_write_uptime_ms);
 }
 
-void event_journal_events_json(cJSON *root, size_t limit)
+bool event_journal_visit_events_json(
+    size_t limit,
+    event_journal_json_visitor_t visitor,
+    void *context
+)
 {
-    cJSON *events = cJSON_AddArrayToObject(root, "events");
+    if (!visitor) {
+        return false;
+    }
     if (!s_initialized) {
-        return;
+        return true;
     }
     if (limit == 0 || limit > EVENT_JOURNAL_RING_CAPACITY) {
         limit = EVENT_JOURNAL_RING_CAPACITY;
@@ -367,10 +373,16 @@ void event_journal_events_json(cJSON *root, size_t limit)
 
     for (size_t i = 0; i < count; i++) {
         cJSON *event = record_json(&s_api_snapshot[i]);
-        if (event) {
-            cJSON_AddItemToArray(events, event);
+        if (!event) {
+            return false;
+        }
+        bool accepted = visitor(event, i, context);
+        cJSON_Delete(event);
+        if (!accepted) {
+            return false;
         }
     }
+    return true;
 }
 
 const char *event_journal_boot_id(void)

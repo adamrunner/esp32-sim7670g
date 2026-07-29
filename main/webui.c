@@ -55,6 +55,17 @@ static bool s_current_response_error;
 static int s_current_http_status;
 static esp_err_t s_current_response_error_code;
 
+uint64_t webui_last_request_uptime_ms(void)
+{
+    if (!s_http_mutex) {
+        return 0;
+    }
+    xSemaphoreTake(s_http_mutex, portMAX_DELAY);
+    uint64_t last_request = s_http_status.last_request_uptime_ms;
+    xSemaphoreGive(s_http_mutex);
+    return last_request;
+}
+
 static void update_resource_minimum(uint32_t *minimum, uint32_t value)
 {
     if (*minimum == 0 || value < *minimum) {
@@ -195,7 +206,24 @@ typedef struct {
     char chunk[JSON_STREAM_CHUNK_BYTES];
     size_t used;
     esp_err_t error;
+    bool sent;
 } json_stream_t;
+
+static void record_serialization_failure(void)
+{
+    xSemaphoreTake(s_http_mutex, portMAX_DELAY);
+    s_http_status.serialization_failure_count++;
+    xSemaphoreGive(s_http_mutex);
+}
+
+static void json_stream_begin(json_stream_t *stream, httpd_req_t *req)
+{
+    memset(stream, 0, sizeof(*stream));
+    stream->req = req;
+    stream->error = ESP_OK;
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+}
 
 static bool json_stream_flush(json_stream_t *stream)
 {
@@ -209,6 +237,9 @@ static bool json_stream_flush(json_stream_t *stream)
         stream->req, stream->chunk, stream->used
     );
     stream->used = 0;
+    if (stream->error == ESP_OK) {
+        stream->sent = true;
+    }
     return stream->error == ESP_OK;
 }
 
@@ -345,67 +376,148 @@ static bool json_stream_value(json_stream_t *stream, const cJSON *item)
     return json_stream_literal(stream, "null");
 }
 
+static bool json_stream_object_members(
+    json_stream_t *stream,
+    const cJSON *object,
+    bool *first
+)
+{
+    const cJSON *child = object ? object->child : NULL;
+    while (child) {
+        if ((!*first && !json_stream_literal(stream, ",")) ||
+            !json_stream_string(stream, child->string) ||
+            !json_stream_literal(stream, ":") ||
+            !json_stream_value(stream, child)) {
+            return false;
+        }
+        *first = false;
+        child = child->next;
+    }
+    return true;
+}
+
+static esp_err_t json_stream_finish(
+    json_stream_t *stream,
+    bool encoded
+)
+{
+    if (encoded) {
+        encoded = json_stream_flush(stream);
+    }
+    if (encoded) {
+        stream->error = httpd_resp_send_chunk(stream->req, NULL, 0);
+        encoded = stream->error == ESP_OK;
+    }
+    if (encoded) {
+        return ESP_OK;
+    }
+
+    xSemaphoreTake(s_http_mutex, portMAX_DELAY);
+    s_http_status.stream_failure_count++;
+    xSemaphoreGive(s_http_mutex);
+    esp_err_t diagnostic_error =
+        stream->error == ESP_OK ? ESP_FAIL : stream->error;
+    if (!stream->sent) {
+        return send_internal_error(
+            stream->req, "json encode failed", diagnostic_error
+        );
+    }
+    s_current_response_error = true;
+    s_current_http_status = 0;
+    s_current_response_error_code = diagnostic_error;
+    return diagnostic_error;
+}
+
 // Stream `root` in bounded chunks and then free the tree. Unlike
 // cJSON_PrintUnformatted(), this never needs a second response-sized
 // contiguous allocation. The schema and JSON types remain unchanged.
 static esp_err_t send_json(httpd_req_t *req, cJSON *root)
 {
     if (!root) {
-        xSemaphoreTake(s_http_mutex, portMAX_DELAY);
-        s_http_status.serialization_failure_count++;
-        xSemaphoreGive(s_http_mutex);
+        record_serialization_failure();
         return send_http_error(
             req, HTTPD_500_INTERNAL_SERVER_ERROR, 500,
             "json object allocation failed", ESP_ERR_NO_MEM
         );
     }
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    json_stream_t stream = {
-        .req = req,
-        .error = ESP_OK,
-    };
+    json_stream_t stream;
+    json_stream_begin(&stream, req);
     bool encoded = json_stream_value(&stream, root);
     cJSON_Delete(root);
-    if (encoded) {
-        encoded = json_stream_flush(&stream);
-    }
-    if (encoded) {
-        stream.error = httpd_resp_send_chunk(req, NULL, 0);
-        encoded = stream.error == ESP_OK;
-    }
-    if (!encoded) {
-        xSemaphoreTake(s_http_mutex, portMAX_DELAY);
-        s_http_status.stream_failure_count++;
-        xSemaphoreGive(s_http_mutex);
-        s_current_response_error = true;
-        s_current_http_status = 0;
-        s_current_response_error_code =
-            stream.error == ESP_OK ? ESP_FAIL : stream.error;
-        return s_current_response_error_code;
-    }
-    return ESP_OK;
+    return json_stream_finish(&stream, encoded);
 }
 
-// Aggregate every module's status into one JSON document. Each module owns the
-// serialization of its own fields (and the domain knowledge behind them); this
-// handler just stitches the pieces together and ships the result.
+typedef void (*status_json_builder_t)(cJSON *root);
+
+static bool json_stream_status_fragment(
+    json_stream_t *stream,
+    status_json_builder_t builder,
+    bool *first
+)
+{
+    cJSON *fragment = cJSON_CreateObject();
+    if (!fragment) {
+        record_serialization_failure();
+        stream->error = ESP_ERR_NO_MEM;
+        return false;
+    }
+    builder(fragment);
+    bool encoded = json_stream_object_members(stream, fragment, first);
+    cJSON_Delete(fragment);
+    return encoded;
+}
+
+// Each module still owns the schema and types of its status fields, but only
+// one module fragment exists at a time. This preserves the aggregate response
+// while bounding peak cJSON heap independently of the total document size.
 static esp_err_t status_get_handler(httpd_req_t *req)
 {
-    cJSON *root = cJSON_CreateObject();
-    if (!root) {
-        return send_json(req, root);
+    static const status_json_builder_t builders[] = {
+        modem_status_json,
+        board_battery_status_json,
+        bms_status_json,
+        mqtt_status_json,
+        datalog_status_json,
+        timesync_status_json,
+        wifi_status_json,
+        webui_status_json,
+        event_journal_status_json,
+    };
+    json_stream_t stream;
+    json_stream_begin(&stream, req);
+    bool first = true;
+    bool encoded = json_stream_literal(&stream, "{");
+    for (size_t i = 0;
+         encoded && i < sizeof(builders) / sizeof(builders[0]);
+         i++) {
+        encoded = json_stream_status_fragment(
+            &stream, builders[i], &first
+        );
     }
-    modem_status_json(root);      // modem fields + "gnss"
-    board_battery_status_json(root); // "internal_battery"
-    bms_status_json(root);        // "bms"
-    mqtt_status_json(root);       // "mqtt"
-    datalog_status_json(root);    // "datalog"
-    timesync_status_json(root);   // "time"
-    wifi_status_json(root);       // "wifi"
-    webui_status_json(root);      // "http"
-    event_journal_status_json(root); // "event_journal"
-    return send_json(req, root);
+    if (encoded) {
+        encoded = json_stream_literal(&stream, "}");
+    }
+    return json_stream_finish(&stream, encoded);
+}
+
+typedef struct {
+    json_stream_t *stream;
+    bool first;
+} event_json_stream_context_t;
+
+static bool stream_event_json(
+    const cJSON *event,
+    size_t index,
+    void *context
+)
+{
+    event_json_stream_context_t *event_stream = context;
+    if ((index > 0 || !event_stream->first) &&
+        !json_stream_literal(event_stream->stream, ",")) {
+        return false;
+    }
+    event_stream->first = false;
+    return json_stream_value(event_stream->stream, event);
 }
 
 static esp_err_t events_get_handler(httpd_req_t *req)
@@ -428,15 +540,30 @@ static esp_err_t events_get_handler(httpd_req_t *req)
         }
     }
 
-    cJSON *root = cJSON_CreateObject();
-    if (!root) {
-        return send_json(req, root);
+    json_stream_t stream;
+    json_stream_begin(&stream, req);
+    bool encoded = json_stream_literal(
+        &stream,
+        "{\"schema_version\":1,"
+        "\"ordering\":\"boot_id,event_sequence\",\"events\":["
+    );
+    event_json_stream_context_t context = {
+        .stream = &stream,
+        .first = true,
+    };
+    if (encoded) {
+        encoded = event_journal_visit_events_json(
+            limit, stream_event_json, &context
+        );
+        if (!encoded && stream.error == ESP_OK) {
+            record_serialization_failure();
+            stream.error = ESP_ERR_NO_MEM;
+        }
     }
-    cJSON_AddNumberToObject(root, "schema_version", 1);
-    cJSON_AddStringToObject(root, "ordering",
-                            "boot_id,event_sequence");
-    event_journal_events_json(root, limit);
-    return send_json(req, root);
+    if (encoded) {
+        encoded = json_stream_literal(&stream, "]}");
+    }
+    return json_stream_finish(&stream, encoded);
 }
 
 // Read and null-terminate a small JSON request body.

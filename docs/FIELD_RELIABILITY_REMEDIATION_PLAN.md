@@ -693,13 +693,16 @@ Correction boundary:
   to restore a genuinely down route, but they do not request a PPP teardown
   or touch the modem UART.
 - Routine OTA checks defer while a SoftAP client is present and for a
-  five-minute quiet period after disassociation. Explicit operator checks
-  preserve their existing immediate behavior.
-- `/api/status`, `/api/events`, and the other JSON APIs stream the existing
-  cJSON trees in fixed-size chunks, removing the second response-sized output
-  allocation without changing endpoint schemas or value types. Transmitted
-  HTTP errors, stream failures, minimum heap/largest-block, and HTTP-task
-  stack high-water evidence are additive.
+  five-minute quiet period after disassociation, or while the HTTP control
+  plane was used in the last minute. Explicit operator checks preserve their
+  existing immediate behavior.
+- `/api/status` streams one module fragment at a time, and `/api/events`
+  builds and streams one event at a time. Fixed-size output chunks remove the
+  response-sized output allocation while bounding peak cJSON heap
+  independently of the total document or event count. Endpoint schemas,
+  field order, and value types remain unchanged. Transmitted HTTP errors,
+  stream failures, minimum heap/largest-block, and HTTP-task stack high-water
+  evidence are additive.
 - The SD journal also uses a fixed preallocated output buffer. Modem/PPP fault
   events and `/api/status.recovery` add heap, largest-block, modem-task stack,
   and redial-source evidence.
@@ -709,7 +712,7 @@ Correction boundary:
 
 Validation and activation status:
 
-- Firmware commit `6cf9a16` passes all 13 host tests. The portable policy
+- Firmware commit `6cf9a16` passed all 13 host tests. The portable policy
   harness covers explicit checks, active AP clients, the post-disassociation
   quiet period, never-used APs, home WiFi, and conservative timestamp handling.
   Source contracts confirm OTA cannot call either redial API, the HTTP response
@@ -719,9 +722,37 @@ Validation and activation status:
   The application is 1,384,832 bytes (`0x152180`), leaves `0x2ade80` bytes
   (67%) free in the smallest app partition, and has SHA-256
   `3aa7b44a896f0b710d894d5e3786f581514487f4197168e79255e8d090cc6fa0`.
-- This is build evidence only. The image has not been flashed or published,
-  and there is no serial, browser/API, SD+BMS, clean-redial, or vehicle
-  acceptance evidence for `6cf9a16`.
+- After explicit approval, exact commit `6cf9a16` was rebuilt from a detached
+  clean worktree and directly flashed. ESP-IDF selected the native USB-JTAG
+  port, identified the ESP32-S3, verified every written region, and hard-reset
+  the board. Serial confirmed `6cf9a16` from `ota_0`, SD mount, home WiFi,
+  retained MQTT availability PUBACK, Verizon registration, PPP, and a
+  successful cellular connectivity check.
+- The device remained on one boot (`b5e8bceea1fe8631`) through 282 seconds of
+  observation with zero PPP down/error events, zero redial requests, and zero
+  restart requests. Repeated `/api/status` responses were HTTP 200 and the
+  browser populated live modem, GNSS, MQTT, SD, WiFi, and firmware fields.
+- The 90-second routine OTA check exposed a remaining allocation failure.
+  Four manifest TLS attempts could not allocate a 4,437-byte buffer; failure
+  snapshots showed 12–15 KiB free but only 1,920–2,944 contiguous bytes and a
+  16-byte minimum free heap. All three retries were passive and PPP remained
+  up with no redial, proving the recovery boundary, but concurrent browser
+  polling recorded at least three transient HTTP stream failures.
+- `/api/events?limit=16` still returned HTTP 200. After the TLS pressure,
+  `/api/events?limit=48` drove the observed minimum free heap to 316 bytes and
+  minimum largest block to 224 bytes, then closed after 4,096 response bytes.
+  The first implementation therefore did not pass local-control acceptance:
+  chunked output removed the printed-document allocation but still retained
+  the complete cJSON event tree.
+- The follow-up implementation visits one event at a time, streams
+  `/api/status` one module fragment at a time, and defers routine OTA during
+  recent HTTP use. Fourteen host tests and an incremental pinned ESP-IDF
+  compile pass; an exact clean commit build and a separately approved reflash
+  remain required. OTA publication, clean-redial activation, and automatic
+  modem-reset escalation remain blocked.
+- The BMS was not attached during this USB test. SD+BMS pressure, vehicle
+  power, restored-coverage timing, and clean-redial behavior remain
+  hardware-only acceptance gaps.
 
 ### Phase 3: Repair the local WiFi control plane
 

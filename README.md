@@ -181,8 +181,9 @@ bounded passive retries; after a transient connection failure, firmware
 waits for the existing modem state machine to restore a genuinely down
 transport but never requests a PPP redial itself. A routine background check
 is deferred while a SoftAP client is associated and for five minutes after
-the last disassociation, preventing an OTA check from interrupting the local
-control plane. Explicitly requested checks are not deferred.
+the last disassociation, or while the HTTP control plane was used in the last
+minute, preventing an OTA check from interrupting a local session. Explicitly
+requested checks are not deferred.
 Any failed cycle, including a manually requested check, retries after
 5 minutes rather than waiting for the normal hourly poll. HTTP operations
 allow 60 seconds so the modem can tolerate transient cellular latency.
@@ -246,13 +247,13 @@ URL actually embedded in the binary before publishing.
   `fix_age_s`; position persists as last-known when the fix drops). Additive
   `wifi`, `ppp`, `mqtt`, `datalog`, `http`, `recovery`, and `event_journal`
   objects expose boot-scoped counters and monotonic transition timestamps.
-  Responses are encoded in bounded chunks, avoiding a second
-  response-sized contiguous heap allocation; the `http` and `recovery`
-  objects include minimum heap/task-stack evidence and truthful transmitted
-  4xx/5xx counters.
+  Responses are encoded in bounded chunks, with one module fragment resident
+  at a time; the `http` and `recovery` objects include minimum
+  heap/task-stack evidence and truthful transmitted 4xx/5xx counters.
 - `GET /api/events?limit=48` — read-only chronological snapshot of the RAM
   event ring. Unsynchronized events deliberately have `wall_time: null` and
-  remain ordered by `boot_id,event_sequence`.
+  remain ordered by `boot_id,event_sequence`. Events are serialized one at a
+  time so peak cJSON heap is independent of the requested limit.
 - `POST /api/apn` — `{"apn":"..."}` save APN to NVS and reconnect
 - `POST /api/at` — `{"cmd":"AT+CSQ"}` raw AT passthrough; while the PPP
   link is up this pauses the data stream for the duration of the command

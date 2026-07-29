@@ -31,6 +31,12 @@ typedef struct {
     char boot_id[17];
 } event_journal_status_t;
 
+typedef bool (*event_journal_json_visitor_t)(
+    const cJSON *event,
+    size_t index,
+    void *context
+);
+
 // Start the non-blocking RAM ring and the dedicated SD writer. Call after
 // sdcard_init(). Failure to mount or write the SD journal is non-fatal.
 void event_journal_init(void);
@@ -54,7 +60,14 @@ void event_journal_note_time_sync(const char *source);
 void event_journal_get_status(event_journal_status_t *out);
 void event_journal_status_json(cJSON *root);
 
-// Append up to `limit` chronological RAM-ring events as root["events"].
-void event_journal_events_json(cJSON *root, size_t limit);
+// Visit up to `limit` chronological RAM-ring events. Each cJSON event remains
+// valid only for the duration of the callback and is freed before the next
+// event is built, bounding peak heap independently of the requested limit.
+// Returns false if an event allocation or the visitor fails.
+bool event_journal_visit_events_json(
+    size_t limit,
+    event_journal_json_visitor_t visitor,
+    void *context
+);
 
 const char *event_journal_boot_id(void);
