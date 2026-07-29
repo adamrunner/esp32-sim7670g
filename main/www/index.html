@@ -29,6 +29,7 @@
   }
   button { background: #1f4fd8; border: none; cursor: pointer; }
   button:hover { background: #2b5ceb; }
+  button:disabled { background: #344054; color: #8b98a8; cursor: not-allowed; }
   button.danger { background: #7f1d1d; }
   button.danger:hover { background: #991b1b; }
   form { display: flex; gap: 0.5rem; }
@@ -160,9 +161,11 @@
       <dt>Last check</dt><dd id="fw_lastcheck">…</dd>
     </dl>
     <form id="otaform" style="margin-top: 0.75rem;">
-      <button type="submit" id="otabtn" style="flex: 1;">Check for update</button>
+      <button type="submit" id="otabtn" style="flex: 1;" disabled>Check for update</button>
     </form>
     <div class="msg" id="otamsg"></div>
+    <div class="msg bad" id="otaerrormsg"></div>
+    <div class="msg" id="otadefermsg"></div>
     <form id="rebootform" style="margin-top: 0.75rem;">
       <button type="submit" id="rebootbtn" class="danger" style="flex: 1;">Reboot ESP32</button>
     </form>
@@ -216,10 +219,61 @@
 
 <script>
 const $ = id => document.getElementById(id);
+const POLL_REQUEST_TIMEOUT_MS = 2500;
+const POLL_CYCLE_DELAY_MS = 2000;
 let apnEdited = false;
+let pinging = false;
+let statusRefreshActive = false;
+let wifiRefreshActive = false;
+let otaRefreshActive = false;
+let softApControlPlaneActive = true;
+let otaState = 'idle';
+let otaSubmitActive = false;
+let otaMsgLocal = false;
 
 function pill(el, text, cls) {
   el.innerHTML = '<span class="pill ' + cls + '">' + text + '</span>';
+}
+
+async function fetchJsonWithDeadline(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), POLL_REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    return await response.json();
+  } catch (e) {
+    if (e && e.name === 'AbortError') throw new Error('request timed out');
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function formatAge(seconds) {
+  if (seconds === undefined || seconds === null) return 'at an unknown time';
+  if (seconds < 90) return Math.round(seconds) + ' s ago';
+  return Math.round(seconds / 60) + ' min ago';
+}
+
+function updateOtaButton() {
+  const busy = otaSubmitActive ||
+    ['checking', 'downloading', 'verifying', 'wait_reboot'].includes(otaState);
+  const button = $('otabtn');
+  button.disabled = softApControlPlaneActive || busy;
+  button.title = softApControlPlaneActive
+    ? 'Background checks resume after the SoftAP session ends.'
+    : '';
+}
+
+function updateOtaActionMessage() {
+  if (otaMsgLocal) return;
+  $('otamsg').textContent = softApControlPlaneActive
+    ? 'Manual checks are disabled during a SoftAP session; background checks resume after disconnect.'
+    : '';
 }
 
 function compassDirection(degrees) {
@@ -230,11 +284,10 @@ function compassDirection(degrees) {
 }
 
 async function refresh() {
-  if (pinging) return;  // server handles one request at a time; don't queue behind a ping
+  if (pinging || statusRefreshActive) return;
+  statusRefreshActive = true;
   try {
-    const r = await fetch('/api/status');
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    const s = await r.json();
+    const s = await fetchJsonWithDeadline('/api/status');
     $('status_error').style.display = 'none';
     pill($('modem_ok'), s.modem_ok ? 'responding' : 'no response', s.modem_ok ? 'ok' : 'bad');
     pill($('sim_ready'), s.sim_ready ? 'ready' : 'not ready', s.sim_ready ? 'ok' : 'bad');
@@ -366,6 +419,8 @@ async function refresh() {
       'Status unavailable: ' + (e && e.message ? e.message : 'request failed') +
       '. Local controls may still work; retrying automatically.';
     $('status_error').style.display = 'block';
+  } finally {
+    statusRefreshActive = false;
   }
 }
 
@@ -378,12 +433,14 @@ const WIFI_STATE = {
 
 let apSsid = 'ESP32-SIM7670G';
 async function refreshWifi() {
-  if (pinging) return;
+  if (pinging || wifiRefreshActive) return;
+  wifiRefreshActive = true;
   try {
-    const response = await fetch('/api/wifi');
-    if (!response.ok) throw new Error('HTTP ' + response.status);
-    const s = await response.json();
+    const s = await fetchJsonWithDeadline('/api/wifi');
     apSsid = s.ap_ssid || apSsid;
+    softApControlPlaneActive = s.state === 'softap';
+    updateOtaButton();
+    updateOtaActionMessage();
     const [txt, cls] = WIFI_STATE[s.state] || [s.state, 'warn'];
     pill($('wifi_state'), txt, cls);
     $('wifi_ssid').textContent = s.connected ? s.ssid
@@ -394,6 +451,8 @@ async function refreshWifi() {
   } catch (e) {
     $('wifimsg').textContent =
       'WiFi status unavailable: ' + (e && e.message ? e.message : 'request failed');
+  } finally {
+    wifiRefreshActive = false;
   }
 }
 
@@ -407,11 +466,11 @@ const OTA_STATE = {
 };
 
 async function refreshOta() {
-  if (pinging) return;
+  if (pinging || otaRefreshActive) return;
+  otaRefreshActive = true;
   try {
-    const response = await fetch('/api/ota');
-    if (!response.ok) throw new Error('HTTP ' + response.status);
-    const s = await response.json();
+    const s = await fetchJsonWithDeadline('/api/ota');
+    otaState = s.state;
     $('fw_version').textContent = (s.version || '—') + (s.pending_verify ? ' (pending verify)' : '');
     $('fw_slot').textContent = s.slot || '—';
     let [txt, cls] = OTA_STATE[s.state] || [s.state, 'warn'];
@@ -432,31 +491,48 @@ async function refreshOta() {
       }
       if (s.next_check_in_s)
         details.push('retry in ' + Math.max(1, Math.round(s.next_check_in_s / 60)) + ' min');
-      $('otamsg').textContent = (s.error || 'update failed') +
+      $('otaerrormsg').textContent = 'Last check failed ' +
+        formatAge(s.last_check_age_s) + ': ' + (s.error || 'update failed') +
         (details.length ? ' · ' + details.join(' · ') : '');
+    } else {
+      $('otaerrormsg').textContent = '';
     }
-    else if (!otaMsgLocal && s.last_control_plane_defer_reason &&
-             s.last_control_plane_defer_age_s < 360) {
-      $('otamsg').textContent =
-        'Background check deferred while the local WiFi control plane is in use.';
-    }
-    else if (!otaMsgLocal) $('otamsg').textContent = '';
+    const deferReasons = {
+      ap_client_active: 'an active SoftAP client',
+      ap_quiet_period: 'the post-SoftAP quiet period',
+      http_quiet_period: 'recent local WebUI activity',
+    };
+    $('otadefermsg').textContent = s.last_control_plane_defer_reason
+      ? 'Last background deferral ' +
+        formatAge(s.last_control_plane_defer_age_s) + ': ' +
+        (deferReasons[s.last_control_plane_defer_reason] ||
+         s.last_control_plane_defer_reason) + '.'
+      : '';
+    updateOtaActionMessage();
     $('fw_available').textContent = s.update_available ? s.available_version : 'none (up to date)';
     $('fw_lastcheck').textContent = s.last_check_age_s === undefined ? 'never'
       : s.last_check_age_s < 90 ? Math.round(s.last_check_age_s) + ' s ago'
       : Math.round(s.last_check_age_s / 60) + ' min ago';
-    $('otabtn').disabled = ['checking', 'downloading', 'verifying', 'wait_reboot'].includes(s.state);
+    updateOtaButton();
   } catch (e) {
     $('otamsg').textContent =
       'Firmware status unavailable: ' +
       (e && e.message ? e.message : 'request failed');
+  } finally {
+    otaRefreshActive = false;
   }
 }
 
-let otaMsgLocal = false;
 $('otaform').addEventListener('submit', async ev => {
   ev.preventDefault();
+  if (softApControlPlaneActive) {
+    $('otamsg').textContent =
+      'Manual checks are disabled during a SoftAP session; disconnect and allow the background check to run.';
+    return;
+  }
   otaMsgLocal = true;
+  otaSubmitActive = true;
+  updateOtaButton();
   $('otamsg').textContent = 'checking…';
   try {
     const r = await fetch('/api/ota/check', {
@@ -466,7 +542,12 @@ $('otaform').addEventListener('submit', async ev => {
     });
     $('otamsg').textContent = r.ok ? 'check started' : 'error: ' + (await r.text());
   } catch (e) { $('otamsg').textContent = 'request failed'; }
-  setTimeout(() => { otaMsgLocal = false; }, 4000);
+  otaSubmitActive = false;
+  updateOtaButton();
+  setTimeout(() => {
+    otaMsgLocal = false;
+    updateOtaActionMessage();
+  }, 4000);
   refreshOta();
 });
 
@@ -639,7 +720,6 @@ $('mqttform').addEventListener('submit', async ev => {
   } catch (e) { $('mqttmsg').textContent = 'request failed'; }
 });
 
-let pinging = false;
 $('pingform').addEventListener('submit', async ev => {
   ev.preventDefault();
   const host = $('pinghost').value.trim();
@@ -678,12 +758,17 @@ $('pingform').addEventListener('submit', async ev => {
   }
 });
 
-refresh();
-refreshWifi();
-refreshOta();
-setInterval(refresh, 3000);
-setInterval(refreshWifi, 3000);
-setInterval(refreshOta, 2000);
+async function pollDashboard() {
+  try {
+    await refresh();
+    await refreshWifi();
+    await refreshOta();
+  } finally {
+    setTimeout(pollDashboard, POLL_CYCLE_DELAY_MS);
+  }
+}
+
+pollDashboard();
 </script>
 </body>
 </html>

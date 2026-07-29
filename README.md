@@ -99,7 +99,9 @@ web UI for monitoring/configuring the cellular connection.
   and can perform a delayed software reboot after acknowledging the browser.
   The SoftAP DHCP lease intentionally omits router and DNS offers: the local
   `192.168.4.0/24` route still reaches the UI while phones can retain cellular
-  as their internet route.
+  as their internet route. Dashboard polling is sequential, has bounded
+  request deadlines, and cannot consume sockets indefinitely. The HTTP server
+  reserves three lwIP socket slots for MQTT, OTA, and other outbound work.
 
 ### APN: leave it blank
 
@@ -186,7 +188,9 @@ transport but never requests a PPP redial itself. A routine background check
 is deferred while a SoftAP client is associated and for five minutes after
 the last disassociation, or while the HTTP control plane was used in the last
 minute, preventing an OTA check from interrupting a local session. Explicitly
-requested checks are not deferred.
+requested API checks are not deferred. The WebUI disables its manual update
+button during SoftAP sessions so an accidental click cannot compete with the
+local control plane; controlled API callers retain the existing behavior.
 Any failed cycle, including a manually requested check, retries after
 5 minutes rather than waiting for the normal hourly poll. HTTP operations
 allow 60 seconds so the modem can tolerate transient cellular latency.

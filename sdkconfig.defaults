@@ -16,6 +16,10 @@ CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 # Roomier HTTP headers for browser requests
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 
+# Keep the socket budget explicit: the HTTP server uses seven slots including
+# its internal sockets, leaving three for MQTT, OTA, and transient clients.
+CONFIG_LWIP_MAX_SOCKETS=10
+
 # The fallback SoftAP is a local control link. Do not add an implicit DNS
 # server to its DHCP offers; wifi.c also disables the router and explicit DNS
 # offer bits before the DHCP server starts.

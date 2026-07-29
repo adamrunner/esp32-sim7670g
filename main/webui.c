@@ -1094,6 +1094,10 @@ void webui_init(void)
     s_http_mutex = xSemaphoreCreateMutex();
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.lru_purge_enable = true;
+    // The server also owns three internal sockets. Four client sessions keep
+    // its total at seven of the ten lwIP slots, reserving three for MQTT, OTA,
+    // and transient outbound work.
+    cfg.max_open_sockets = 4;
     cfg.max_uri_handlers = 18;  // default 8; observability adds /api/events
     cfg.stack_size = 8192;  // ping/DNS handler keeps sizeable buffers on the stack
 
