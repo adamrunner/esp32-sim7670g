@@ -868,10 +868,31 @@ SoftAP OTA socket-pressure correction — 2026-07-28:
   full-clean ESP-IDF 5.5/Python 3.10 build of `4d9759d` passed; its application
   image is 1,389,456 bytes with SHA-256
   `92cedebbe46b2edfe63d01227b9c1f580b324532c3850ae1e2a98875f74b05c6`.
-- This correction is source/build validated only. The installed and published
-  firmware remain `8ff3076`; direct flashing and OTA publication remain
-  separate approval gates. Automatic supervisor redial and modem-reset
-  escalation remain disabled.
+- At this validation point the correction was source/build validated only and
+  the installed and published firmware remained `8ff3076`; the publication
+  update below supersedes only the manifest state. Automatic supervisor redial
+  and modem-reset escalation remain disabled.
+
+OTA publication update — 2026-07-28:
+
+- After separate publication approval, exact source commit `4d9759d` was
+  rebuilt from a clean detached worktree with the pinned ESP-IDF 5.5/Python
+  3.10 environment. The release build again passed all seventeen host tests
+  and JavaScript syntax validation.
+- The published `esp32-sim7670g-4d9759d.bin` is 1,389,456 bytes with SHA-256
+  `841f34201c48f2dd42b1adfad3631bda049aff8b5aa57f28199a7669204b0404`.
+  The checksum differs from the earlier validation build because ESP-IDF
+  embeds build-time metadata; both clean builds identify source version
+  `4d9759d`.
+- The release script atomically replaced the production manifest and verified
+  its freshness, full-download byte count and checksum, and a 1,024-byte HTTP
+  Range request with status 206.
+- No USB flash occurred. The last device-local confirmed image remains
+  `8ff3076`; the device may install `4d9759d` after its active SoftAP client
+  disconnects and the control-plane quiet period expires. Acceptance still
+  requires device-local or production evidence of `4d9759d` running and
+  rollback verification cleared.
+- Automatic supervisor redial and modem-reset escalation remain disabled.
 
 ### Phase 3: Repair the local WiFi control plane
 
