@@ -707,6 +707,22 @@ Correction boundary:
   Direct flashing, OTA publication, clean-redial activation, and reset
   escalation remain independent approval and hardware-evidence gates.
 
+Validation and activation status:
+
+- Firmware commit `6cf9a16` passes all 13 host tests. The portable policy
+  harness covers explicit checks, active AP clients, the post-disassociation
+  quiet period, never-used APs, home WiFi, and conservative timestamp handling.
+  Source contracts confirm OTA cannot call either redial API, the HTTP response
+  path has no response-sized `cJSON_PrintUnformatted(root)` allocation, and
+  automatic supervisor actions remain false.
+- A full-clean ESP-IDF 5.5/Python 3.10 build of exact commit `6cf9a16` passed.
+  The application is 1,384,832 bytes (`0x152180`), leaves `0x2ade80` bytes
+  (67%) free in the smallest app partition, and has SHA-256
+  `3aa7b44a896f0b710d894d5e3786f581514487f4197168e79255e8d090cc6fa0`.
+- This is build evidence only. The image has not been flashed or published,
+  and there is no serial, browser/API, SD+BMS, clean-redial, or vehicle
+  acceptance evidence for `6cf9a16`.
+
 ### Phase 3: Repair the local WiFi control plane
 
 Deliverables:
