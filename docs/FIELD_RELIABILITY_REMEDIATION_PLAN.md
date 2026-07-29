@@ -790,6 +790,47 @@ Validation and activation status:
   power, restored-coverage timing, and clean-redial behavior remain
   hardware-only acceptance gaps.
 
+SoftAP local-route activation update — 2026-07-28:
+
+- Commit `8ff3076` keeps the existing SoftAP address, credentials, and local
+  `/24` route while disabling the DHCP router and DNS offers before the DHCP
+  server starts. Additive `/api/status.wifi` fields expose both configured
+  offers as `false`; the AP-start event records the same state. The
+  ESP-IDF fallback that would otherwise advertise the AP address as DNS is
+  disabled in `sdkconfig.defaults`.
+- All fifteen host tests passed, including the source contract for both DHCP
+  offers, and a full-clean ESP-IDF 5.5/Python 3.10 build passed.
+- After explicit flash approval, exact commit `8ff3076` was built in a
+  detached clean worktree and directly flashed through the native USB-JTAG
+  port. The application is 1,386,928 bytes with SHA-256
+  `c9600a601e61a0ac371543e66eaad533a4bddc7b9c3ae3ed8f65b3e5c0488d3e`.
+  Esptool identified the ESP32-S3, verified every written region, and
+  hard-reset the board.
+- Serial confirmed `8ff3076` running from `ota_0`, SD mounted, and
+  `SoftAP DHCP router and DNS offers disabled` before WiFi startup. Home WiFi,
+  retained MQTT availability, Verizon registration, PPP, and a 4/4 cellular
+  connectivity check recovered normally. A final API snapshot reported
+  modem, PPP, MQTT, and WiFi healthy; both DHCP-offer fields were `false`;
+  HTTP failure and response-error counts were zero; and redial and restart
+  request counts were zero.
+- The reachable stored home network selected STA mode and turned SoftAP off.
+  The bench run therefore verifies firmware configuration but does not prove
+  the DHCP packet received by an iPhone. Actual lease contents, simultaneous
+  local-UI and cellular-internet routing, and a sustained AP association
+  remain explicit field acceptance checks. Stored WiFi credentials were not
+  removed merely to force this test.
+- After explicit publication approval, the exact flashed binary was published
+  as `esp32-sim7670g-8ff3076.bin`; no rebuild occurred between flash and
+  publication. External verification passed for the fresh manifest, full
+  download size and checksum, and an HTTP Range request with status 206.
+- An explicit device-local OTA check fetched the production manifest once,
+  reported `8ff3076` up to date, made zero download attempts, and returned to
+  idle with `last_check_ok=true`. Modem status/GNSS polling suspended and
+  resumed around the request without a redial or restart.
+- Automatic supervisor redial and modem-reset escalation remain disabled.
+  Clean-redial hardware acceptance and reset-escalation approval remain
+  separate gates.
+
 ### Phase 3: Repair the local WiFi control plane
 
 Deliverables:
