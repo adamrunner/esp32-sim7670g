@@ -50,6 +50,10 @@ typedef struct {
     int manifest_attempts;                  // attempts used by the current/last cycle
     int download_attempts;
     int64_t next_check_us;                  // scheduled monotonic time, 0 while active
+    uint32_t passive_retry_count;           // retry waits; never manipulates PPP
+    uint32_t control_plane_defer_count;      // routine checks deferred for SoftAP use
+    int64_t last_control_plane_defer_us;
+    char last_control_plane_defer_reason[24];
     ota_failure_t failure;                  // structured details for the last failure
 } ota_status_t;
 

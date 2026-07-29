@@ -1,5 +1,6 @@
 #include "webui.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -29,7 +30,13 @@ extern const uint8_t index_html_end[]   asm("_binary_index_html_end");
 typedef struct {
     uint32_t request_count;
     uint32_t failure_count;
+    uint32_t response_error_count;
+    uint32_t serialization_failure_count;
+    uint32_t stream_failure_count;
     uint32_t slow_request_count;
+    uint32_t min_task_stack_free;
+    uint32_t min_free_heap;
+    uint32_t min_largest_free_block;
     uint64_t last_request_uptime_ms;
     uint64_t last_success_uptime_ms;
     uint64_t last_error_uptime_ms;
@@ -40,6 +47,53 @@ typedef struct {
 
 static SemaphoreHandle_t s_http_mutex;
 static webui_observability_t s_http_status;
+// ESP-IDF's HTTP server invokes handlers on one server task. This per-request
+// marker lets observed_handler distinguish a deliberately sent HTTP error
+// from a successful application response; httpd_resp_send_err() itself
+// returns ESP_OK when it successfully transmits a 4xx/5xx response.
+static bool s_current_response_error;
+static int s_current_http_status;
+static esp_err_t s_current_response_error_code;
+
+static void update_resource_minimum(uint32_t *minimum, uint32_t value)
+{
+    if (*minimum == 0 || value < *minimum) {
+        *minimum = value;
+    }
+}
+
+static esp_err_t send_http_error(
+    httpd_req_t *req,
+    httpd_err_code_t status,
+    int status_code,
+    const char *message,
+    esp_err_t diagnostic_error
+)
+{
+    s_current_response_error = true;
+    s_current_http_status = status_code;
+    s_current_response_error_code = diagnostic_error;
+    return httpd_resp_send_err(req, status, message);
+}
+
+static esp_err_t send_bad_request(httpd_req_t *req, const char *message)
+{
+    return send_http_error(
+        req, HTTPD_400_BAD_REQUEST, 400, message, ESP_ERR_INVALID_ARG
+    );
+}
+
+static esp_err_t send_internal_error(
+    httpd_req_t *req,
+    const char *message,
+    esp_err_t diagnostic_error
+)
+{
+    return send_http_error(
+        req, HTTPD_500_INTERNAL_SERVER_ERROR, 500, message,
+        diagnostic_error
+    );
+}
 
 static void webui_status_json(cJSON *root)
 {
@@ -50,8 +104,20 @@ static void webui_status_json(cJSON *root)
     cJSON *http = cJSON_AddObjectToObject(root, "http");
     cJSON_AddNumberToObject(http, "request_count", status.request_count);
     cJSON_AddNumberToObject(http, "failure_count", status.failure_count);
+    cJSON_AddNumberToObject(http, "response_error_count",
+                            status.response_error_count);
+    cJSON_AddNumberToObject(http, "serialization_failure_count",
+                            status.serialization_failure_count);
+    cJSON_AddNumberToObject(http, "stream_failure_count",
+                            status.stream_failure_count);
     cJSON_AddNumberToObject(http, "slow_request_count",
                             status.slow_request_count);
+    cJSON_AddNumberToObject(http, "min_task_stack_free",
+                            status.min_task_stack_free);
+    cJSON_AddNumberToObject(http, "min_free_heap",
+                            status.min_free_heap);
+    cJSON_AddNumberToObject(http, "min_largest_free_block",
+                            status.min_largest_free_block);
     cJSON_AddNumberToObject(http, "last_request_uptime_ms",
                             (double)status.last_request_uptime_ms);
     cJSON_AddNumberToObject(http, "last_success_uptime_ms",
@@ -82,15 +148,15 @@ static void reboot_task(void *arg)
 static esp_err_t reboot_post_handler(httpd_req_t *req)
 {
     if (s_reboot_pending) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                                   "reboot already pending");
+        return send_bad_request(req, "reboot already pending");
     }
 
     s_reboot_pending = true;
     if (xTaskCreate(reboot_task, "web_reboot", 2048, NULL, 5, NULL) != pdPASS) {
         s_reboot_pending = false;
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                                   "could not schedule reboot");
+        return send_internal_error(
+            req, "could not schedule reboot", ESP_ERR_NO_MEM
+        );
     }
 
     httpd_resp_set_type(req, "application/json");
@@ -110,32 +176,215 @@ static bool ota_busy(void)
 static esp_err_t modem_restart_post_handler(httpd_req_t *req)
 {
     if (ota_busy()) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                                   "cannot restart modem while OTA is active");
+        return send_bad_request(
+            req, "cannot restart modem while OTA is active"
+        );
     }
     if (modem_request_restart() != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                                   "modem restart already active");
+        return send_bad_request(req, "modem restart already active");
     }
 
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, "{\"ok\":true,\"state\":\"requested\"}");
 }
 
-// Serialize `root` as the JSON response, then free both the printed string and
-// the tree. Takes ownership of `root` (freed even on error), so no handler has
-// to repeat the print/send/free/delete dance or risk leaking a branch.
+#define JSON_STREAM_CHUNK_BYTES 512
+
+typedef struct {
+    httpd_req_t *req;
+    char chunk[JSON_STREAM_CHUNK_BYTES];
+    size_t used;
+    esp_err_t error;
+} json_stream_t;
+
+static bool json_stream_flush(json_stream_t *stream)
+{
+    if (stream->error != ESP_OK) {
+        return false;
+    }
+    if (stream->used == 0) {
+        return true;
+    }
+    stream->error = httpd_resp_send_chunk(
+        stream->req, stream->chunk, stream->used
+    );
+    stream->used = 0;
+    return stream->error == ESP_OK;
+}
+
+static bool json_stream_write(
+    json_stream_t *stream,
+    const char *data,
+    size_t length
+)
+{
+    while (length > 0) {
+        size_t available = sizeof(stream->chunk) - stream->used;
+        if (available == 0 && !json_stream_flush(stream)) {
+            return false;
+        }
+        available = sizeof(stream->chunk) - stream->used;
+        size_t count = length < available ? length : available;
+        memcpy(stream->chunk + stream->used, data, count);
+        stream->used += count;
+        data += count;
+        length -= count;
+    }
+    return true;
+}
+
+static bool json_stream_literal(json_stream_t *stream, const char *literal)
+{
+    return json_stream_write(stream, literal, strlen(literal));
+}
+
+static bool json_stream_string(json_stream_t *stream, const char *value)
+{
+    if (!json_stream_literal(stream, "\"")) {
+        return false;
+    }
+    const unsigned char *cursor =
+        (const unsigned char *)(value ? value : "");
+    while (*cursor) {
+        const char *escape = NULL;
+        switch (*cursor) {
+        case '"':  escape = "\\\""; break;
+        case '\\': escape = "\\\\"; break;
+        case '\b': escape = "\\b";  break;
+        case '\f': escape = "\\f";  break;
+        case '\n': escape = "\\n";  break;
+        case '\r': escape = "\\r";  break;
+        case '\t': escape = "\\t";  break;
+        default: break;
+        }
+        if (escape) {
+            if (!json_stream_literal(stream, escape)) {
+                return false;
+            }
+        } else if (*cursor < 0x20) {
+            char encoded[7];
+            snprintf(encoded, sizeof(encoded), "\\u%04x", *cursor);
+            if (!json_stream_literal(stream, encoded)) {
+                return false;
+            }
+        } else {
+            char byte = (char)*cursor;
+            if (!json_stream_write(stream, &byte, 1)) {
+                return false;
+            }
+        }
+        cursor++;
+    }
+    return json_stream_literal(stream, "\"");
+}
+
+static bool json_stream_value(json_stream_t *stream, const cJSON *item)
+{
+    if (!item || cJSON_IsNull(item) || cJSON_IsInvalid(item)) {
+        return json_stream_literal(stream, "null");
+    }
+    if (cJSON_IsFalse(item)) {
+        return json_stream_literal(stream, "false");
+    }
+    if (cJSON_IsTrue(item)) {
+        return json_stream_literal(stream, "true");
+    }
+    if (cJSON_IsNumber(item)) {
+        if (!isfinite(item->valuedouble)) {
+            return json_stream_literal(stream, "null");
+        }
+        char number[32];
+        int length = snprintf(
+            number, sizeof(number), "%.17g", item->valuedouble
+        );
+        return length > 0 && (size_t)length < sizeof(number) &&
+               json_stream_write(stream, number, (size_t)length);
+    }
+    if (cJSON_IsString(item)) {
+        return json_stream_string(stream, item->valuestring);
+    }
+    if (cJSON_IsRaw(item)) {
+        return json_stream_literal(
+            stream, item->valuestring ? item->valuestring : "null"
+        );
+    }
+    if (cJSON_IsArray(item)) {
+        if (!json_stream_literal(stream, "[")) {
+            return false;
+        }
+        const cJSON *child = item->child;
+        bool first = true;
+        while (child) {
+            if ((!first && !json_stream_literal(stream, ",")) ||
+                !json_stream_value(stream, child)) {
+                return false;
+            }
+            first = false;
+            child = child->next;
+        }
+        return json_stream_literal(stream, "]");
+    }
+    if (cJSON_IsObject(item)) {
+        if (!json_stream_literal(stream, "{")) {
+            return false;
+        }
+        const cJSON *child = item->child;
+        bool first = true;
+        while (child) {
+            if ((!first && !json_stream_literal(stream, ",")) ||
+                !json_stream_string(stream, child->string) ||
+                !json_stream_literal(stream, ":") ||
+                !json_stream_value(stream, child)) {
+                return false;
+            }
+            first = false;
+            child = child->next;
+        }
+        return json_stream_literal(stream, "}");
+    }
+    return json_stream_literal(stream, "null");
+}
+
+// Stream `root` in bounded chunks and then free the tree. Unlike
+// cJSON_PrintUnformatted(), this never needs a second response-sized
+// contiguous allocation. The schema and JSON types remain unchanged.
 static esp_err_t send_json(httpd_req_t *req, cJSON *root)
 {
-    char *json = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    if (!json) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json encode failed");
+    if (!root) {
+        xSemaphoreTake(s_http_mutex, portMAX_DELAY);
+        s_http_status.serialization_failure_count++;
+        xSemaphoreGive(s_http_mutex);
+        return send_http_error(
+            req, HTTPD_500_INTERNAL_SERVER_ERROR, 500,
+            "json object allocation failed", ESP_ERR_NO_MEM
+        );
     }
     httpd_resp_set_type(req, "application/json");
-    esp_err_t err = httpd_resp_sendstr(req, json);
-    cJSON_free(json);
-    return err;
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    json_stream_t stream = {
+        .req = req,
+        .error = ESP_OK,
+    };
+    bool encoded = json_stream_value(&stream, root);
+    cJSON_Delete(root);
+    if (encoded) {
+        encoded = json_stream_flush(&stream);
+    }
+    if (encoded) {
+        stream.error = httpd_resp_send_chunk(req, NULL, 0);
+        encoded = stream.error == ESP_OK;
+    }
+    if (!encoded) {
+        xSemaphoreTake(s_http_mutex, portMAX_DELAY);
+        s_http_status.stream_failure_count++;
+        xSemaphoreGive(s_http_mutex);
+        s_current_response_error = true;
+        s_current_http_status = 0;
+        s_current_response_error_code =
+            stream.error == ESP_OK ? ESP_FAIL : stream.error;
+        return s_current_response_error_code;
+    }
+    return ESP_OK;
 }
 
 // Aggregate every module's status into one JSON document. Each module owns the
@@ -144,6 +393,9 @@ static esp_err_t send_json(httpd_req_t *req, cJSON *root)
 static esp_err_t status_get_handler(httpd_req_t *req)
 {
     cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return send_json(req, root);
+    }
     modem_status_json(root);      // modem fields + "gnss"
     board_battery_status_json(root); // "internal_battery"
     bms_status_json(root);        // "bms"
@@ -170,15 +422,16 @@ static esp_err_t events_get_handler(httpd_req_t *req)
             long requested = strtol(value, &end, 10);
             if (!end || *end != '\0' || requested < 1 ||
                 requested > EVENT_JOURNAL_RING_CAPACITY) {
-                return httpd_resp_send_err(
-                    req, HTTPD_400_BAD_REQUEST, "limit must be 1..48"
-                );
+                return send_bad_request(req, "limit must be 1..48");
             }
             limit = (size_t)requested;
         }
     }
 
     cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return send_json(req, root);
+    }
     cJSON_AddNumberToObject(root, "schema_version", 1);
     cJSON_AddStringToObject(root, "ordering",
                             "boot_id,event_sequence");
@@ -190,14 +443,14 @@ static esp_err_t events_get_handler(httpd_req_t *req)
 static esp_err_t read_body(httpd_req_t *req, char *buf, size_t buf_len)
 {
     if (req->content_len >= buf_len) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body too large");
+        send_bad_request(req, "body too large");
         return ESP_FAIL;
     }
     int received = 0;
     while (received < req->content_len) {
         int n = httpd_req_recv(req, buf + received, req->content_len - received);
         if (n <= 0) {
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "recv failed");
+            send_bad_request(req, "recv failed");
             return ESP_FAIL;
         }
         received += n;
@@ -217,13 +470,13 @@ static esp_err_t apn_post_handler(httpd_req_t *req)
     const cJSON *apn = root ? cJSON_GetObjectItem(root, "apn") : NULL;
     if (!cJSON_IsString(apn) || strlen(apn->valuestring) >= MODEM_APN_MAX) {
         cJSON_Delete(root);
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "expected {\"apn\":\"...\"}");
+        return send_bad_request(req, "expected {\"apn\":\"...\"}");
     }
 
     esp_err_t err = modem_set_apn(apn->valuestring);
     cJSON_Delete(root);
     if (err != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "NVS write failed");
+        return send_internal_error(req, "NVS write failed", err);
     }
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, "{\"ok\":true}");
@@ -240,7 +493,7 @@ static esp_err_t at_post_handler(httpd_req_t *req)
     const cJSON *cmd = root ? cJSON_GetObjectItem(root, "cmd") : NULL;
     if (!cJSON_IsString(cmd) || strlen(cmd->valuestring) == 0) {
         cJSON_Delete(root);
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "expected {\"cmd\":\"AT...\"}");
+        return send_bad_request(req, "expected {\"cmd\":\"AT...\"}");
     }
 
     static char resp[2048];
@@ -248,6 +501,9 @@ static esp_err_t at_post_handler(httpd_req_t *req)
     cJSON_Delete(root);
 
     cJSON *out = cJSON_CreateObject();
+    if (!out) {
+        return send_json(req, out);
+    }
     cJSON_AddBoolToObject(out, "ok", at_err == ESP_OK);
     cJSON_AddBoolToObject(out, "timeout", at_err == ESP_ERR_TIMEOUT);
     cJSON_AddStringToObject(out, "response", resp);
@@ -265,17 +521,20 @@ static esp_err_t ping_post_handler(httpd_req_t *req)
     const cJSON *host = root ? cJSON_GetObjectItem(root, "host") : NULL;
     if (!cJSON_IsString(host) || strlen(host->valuestring) == 0) {
         cJSON_Delete(root);
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "expected {\"host\":\"...\"}");
+        return send_bad_request(req, "expected {\"host\":\"...\"}");
     }
 
     static modem_netdiag_t diag;  // ~1 KB; httpd serves requests one at a time
     esp_err_t err = modem_ping_host(host->valuestring, &diag);
     cJSON_Delete(root);
     if (err == ESP_ERR_INVALID_ARG) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid hostname");
+        return send_bad_request(req, "invalid hostname");
     }
 
     cJSON *out = cJSON_CreateObject();
+    if (!out) {
+        return send_json(req, out);
+    }
     cJSON_AddBoolToObject(out, "dns_ok", diag.dns_ok);
     cJSON_AddNumberToObject(out, "dns_err", diag.dns_err);
     cJSON *ips = cJSON_AddArrayToObject(out, "ips");
@@ -311,6 +570,9 @@ static esp_err_t ota_get_handler(httpd_req_t *req)
     ota_get_status(&st);
 
     cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return send_json(req, root);
+    }
     cJSON_AddStringToObject(root, "version", st.running_version);
     cJSON_AddStringToObject(root, "slot", st.running_slot);
     cJSON_AddStringToObject(root, "state", ota_state_str(st.state));
@@ -324,6 +586,29 @@ static esp_err_t ota_get_handler(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "last_check_ok", st.last_check_ok);
     cJSON_AddNumberToObject(root, "manifest_attempts", st.manifest_attempts);
     cJSON_AddNumberToObject(root, "download_attempts", st.download_attempts);
+    cJSON_AddBoolToObject(
+        root, "active_modem_recovery_enabled", false
+    );
+    cJSON_AddNumberToObject(
+        root, "passive_retry_count", st.passive_retry_count
+    );
+    cJSON_AddNumberToObject(
+        root, "control_plane_defer_count",
+        st.control_plane_defer_count
+    );
+    cJSON_AddStringToObject(
+        root, "last_control_plane_defer_reason",
+        st.last_control_plane_defer_reason
+    );
+    if (st.last_control_plane_defer_us) {
+        cJSON_AddNumberToObject(
+            root, "last_control_plane_defer_age_s",
+            (double)(
+                (esp_timer_get_time() -
+                 st.last_control_plane_defer_us) / 1000000
+            )
+        );
+    }
     if (st.last_check_us) {
         cJSON_AddNumberToObject(root, "last_check_age_s",
                                 (double)((esp_timer_get_time() - st.last_check_us) / 1000000));
@@ -385,8 +670,9 @@ static esp_err_t ota_check_post_handler(httpd_req_t *req)
             if (strncmp(url->valuestring, "https://", 8) != 0 ||
                 strlen(url->valuestring) >= OTA_URL_MAX) {
                 cJSON_Delete(root);
-                return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                                           "url must be https:// and short");
+                return send_bad_request(
+                    req, "url must be https:// and short"
+                );
             }
             strlcpy(opts.url, url->valuestring, sizeof(opts.url));
         }
@@ -397,8 +683,9 @@ static esp_err_t ota_check_post_handler(httpd_req_t *req)
     }
 
     if (ota_check_now(&opts) != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                                   "a check or update is already running");
+        return send_bad_request(
+            req, "a check or update is already running"
+        );
     }
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, "{\"ok\":true}");
@@ -420,6 +707,9 @@ static esp_err_t wifi_get_handler(httpd_req_t *req)
     wifi_get_status(&st);
 
     cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return send_json(req, root);
+    }
     cJSON_AddStringToObject(root, "state", wifi_state_str(st.state));
     cJSON_AddBoolToObject(root, "sta_configured", st.sta_configured);
     cJSON_AddBoolToObject(root, "connected", st.state == WIFI_UI_STA_CONNECTED);
@@ -444,18 +734,19 @@ static esp_err_t wifi_post_handler(httpd_req_t *req)
     // ssid required (empty string clears creds); password optional (open nets)
     if (!cJSON_IsString(ssid) || (pass && !cJSON_IsString(pass))) {
         cJSON_Delete(root);
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                                   "expected {\"ssid\":\"...\",\"password\":\"...\"}");
+        return send_bad_request(
+            req, "expected {\"ssid\":\"...\",\"password\":\"...\"}"
+        );
     }
 
     esp_err_t err = wifi_set_credentials(ssid->valuestring,
                                          pass ? pass->valuestring : "");
     cJSON_Delete(root);
     if (err == ESP_ERR_INVALID_ARG) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ssid/password too long");
+        return send_bad_request(req, "ssid/password too long");
     }
     if (err != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "NVS write failed");
+        return send_internal_error(req, "NVS write failed", err);
     }
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, "{\"ok\":true}");
@@ -473,8 +764,11 @@ static esp_err_t bms_post_handler(httpd_req_t *req)
 
     cJSON *root = cJSON_Parse(body);
     if (!root) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                                   "expected {\"enabled\":true,\"sim\":false,\"tx_pin\":1,\"rx_pin\":2}");
+        return send_bad_request(
+            req,
+            "expected {\"enabled\":true,\"sim\":false,"
+            "\"tx_pin\":1,\"rx_pin\":2}"
+        );
     }
 
     bms_status_t cur;
@@ -491,12 +785,15 @@ static esp_err_t bms_post_handler(httpd_req_t *req)
 
     // Valid GPIOs on the ESP32-S3 are 0-48; TX and RX must be distinct.
     if (new_tx < 0 || new_tx > 48 || new_rx < 0 || new_rx > 48 || new_tx == new_rx) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                                   "tx_pin/rx_pin must be distinct GPIOs in 0-48");
+        return send_bad_request(
+            req, "tx_pin/rx_pin must be distinct GPIOs in 0-48"
+        );
     }
 
-    if (bms_set_options(new_enabled, new_sim, new_tx, new_rx) != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "NVS write failed");
+    esp_err_t bms_err =
+        bms_set_options(new_enabled, new_sim, new_tx, new_rx);
+    if (bms_err != ESP_OK) {
+        return send_internal_error(req, "NVS write failed", bms_err);
     }
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, "{\"ok\":true}");
@@ -508,6 +805,9 @@ static esp_err_t mqtt_get_handler(httpd_req_t *req)
     mqtt_get_config(&cfg);
 
     cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return send_json(req, root);
+    }
     cJSON_AddBoolToObject(root, "enabled", cfg.enabled);
     cJSON_AddStringToObject(root, "uri", cfg.uri);
     cJSON_AddStringToObject(root, "username", cfg.username);
@@ -527,7 +827,7 @@ static esp_err_t mqtt_post_handler(httpd_req_t *req)
 
     cJSON *root = cJSON_Parse(body);
     if (!root) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON");
+        return send_bad_request(req, "invalid JSON");
     }
 
     mqtt_config_t cfg;
@@ -544,23 +844,26 @@ static esp_err_t mqtt_post_handler(httpd_req_t *req)
             (uri->valuestring[0] && strncmp(uri->valuestring, "mqtt://", 7) != 0 &&
              strncmp(uri->valuestring, "mqtts://", 8) != 0)) {
             cJSON_Delete(root);
-            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                                       "uri must be mqtt:// or mqtts://");
+            return send_bad_request(
+                req, "uri must be mqtt:// or mqtts://"
+            );
         }
         strlcpy(cfg.uri, uri->valuestring, sizeof(cfg.uri));
     }
     if (cJSON_IsString(user) && strlen(user->valuestring) >= MQTT_USER_MAX) {
         cJSON_Delete(root);
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                                   "username must be at most 63 characters");
+        return send_bad_request(
+            req, "username must be at most 63 characters"
+        );
     }
     if (cJSON_IsString(user)) {
         strlcpy(cfg.username, user->valuestring, sizeof(cfg.username));
     }
     if (cJSON_IsString(pass) && strlen(pass->valuestring) >= MQTT_PASS_MAX) {
         cJSON_Delete(root);
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                                   "password must be at most 63 characters");
+        return send_bad_request(
+            req, "password must be at most 63 characters"
+        );
     }
     if (cJSON_IsString(pass)) {
         strlcpy(cfg.password, pass->valuestring, sizeof(cfg.password));
@@ -574,8 +877,9 @@ static esp_err_t mqtt_post_handler(httpd_req_t *req)
     }
     cJSON_Delete(root);
 
-    if (mqtt_set_config(&cfg) != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "NVS write failed");
+    esp_err_t mqtt_err = mqtt_set_config(&cfg);
+    if (mqtt_err != ESP_OK) {
+        return send_internal_error(req, "NVS write failed", mqtt_err);
     }
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, "{\"ok\":true}");
@@ -586,6 +890,9 @@ typedef esp_err_t (*webui_handler_t)(httpd_req_t *req);
 static esp_err_t observed_handler(httpd_req_t *req)
 {
     int64_t started_us = esp_timer_get_time();
+    s_current_response_error = false;
+    s_current_http_status = 200;
+    s_current_response_error_code = ESP_OK;
     xSemaphoreTake(s_http_mutex, portMAX_DELAY);
     s_http_status.request_count++;
     s_http_status.last_request_uptime_ms = (uint64_t)started_us / 1000U;
@@ -598,14 +905,32 @@ static esp_err_t observed_handler(httpd_req_t *req)
     uint32_t duration_ms =
         (uint32_t)((esp_timer_get_time() - started_us) / 1000);
     bool slow = duration_ms >= 2000;
+    bool failed = result != ESP_OK || s_current_response_error;
+    esp_err_t diagnostic_error =
+        s_current_response_error ? s_current_response_error_code : result;
+    uint32_t task_stack_free =
+        (uint32_t)uxTaskGetStackHighWaterMark(NULL);
+    uint32_t free_heap = (uint32_t)esp_get_free_heap_size();
+    uint32_t largest_free_block =
+        (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     xSemaphoreTake(s_http_mutex, portMAX_DELAY);
     s_http_status.last_duration_ms = duration_ms;
-    if (result == ESP_OK) {
+    update_resource_minimum(
+        &s_http_status.min_task_stack_free, task_stack_free
+    );
+    update_resource_minimum(&s_http_status.min_free_heap, free_heap);
+    update_resource_minimum(
+        &s_http_status.min_largest_free_block, largest_free_block
+    );
+    if (!failed) {
         s_http_status.last_success_uptime_ms =
             (uint64_t)esp_timer_get_time() / 1000U;
     } else {
         s_http_status.failure_count++;
-        s_http_status.last_error = result;
+        if (s_current_response_error) {
+            s_http_status.response_error_count++;
+        }
+        s_http_status.last_error = diagnostic_error;
         s_http_status.last_error_uptime_ms =
             (uint64_t)esp_timer_get_time() / 1000U;
     }
@@ -614,18 +939,24 @@ static esp_err_t observed_handler(httpd_req_t *req)
     }
     xSemaphoreGive(s_http_mutex);
 
-    if (result != ESP_OK || slow) {
-        char details[128];
+    if (failed || slow) {
+        char details[192];
         snprintf(
             details, sizeof(details),
-            "{\"uri\":\"%.47s\",\"duration_ms\":%lu,\"error\":%d}",
-            req->uri, (unsigned long)duration_ms, result
+            "{\"uri\":\"%.31s\",\"ms\":%lu,\"error\":%d,"
+            "\"status\":%d,\"heap\":%lu,\"largest\":%lu,"
+            "\"stack\":%lu,\"min_heap\":%lu}",
+            req->uri, (unsigned long)duration_ms, diagnostic_error,
+            s_current_http_status, (unsigned long)free_heap,
+            (unsigned long)largest_free_block,
+            (unsigned long)task_stack_free,
+            (unsigned long)esp_get_minimum_free_heap_size()
         );
         event_journal_emit(
-            "http", result == ESP_OK ? "slow_request" : "request_failed",
-            result == ESP_OK ? EVENT_SEVERITY_WARN : EVENT_SEVERITY_ERROR,
-            result == ESP_OK ? "duration_threshold" : "handler_error",
-            details, result != ESP_OK, 30000
+            "http", failed ? "request_failed" : "slow_request",
+            failed ? EVENT_SEVERITY_ERROR : EVENT_SEVERITY_WARN,
+            failed ? "response_or_handler_error" : "duration_threshold",
+            details, failed, 30000
         );
     }
     return result;

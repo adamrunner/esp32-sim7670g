@@ -435,6 +435,11 @@ async function refreshOta() {
       $('otamsg').textContent = (s.error || 'update failed') +
         (details.length ? ' · ' + details.join(' · ') : '');
     }
+    else if (!otaMsgLocal && s.last_control_plane_defer_reason &&
+             s.last_control_plane_defer_age_s < 360) {
+      $('otamsg').textContent =
+        'Background check deferred while the local WiFi control plane is in use.';
+    }
     else if (!otaMsgLocal) $('otamsg').textContent = '';
     $('fw_available').textContent = s.update_available ? s.available_version : 'none (up to date)';
     $('fw_lastcheck').textContent = s.last_check_age_s === undefined ? 'never'

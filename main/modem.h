@@ -18,6 +18,12 @@ typedef enum {
     MODEM_RESTART_ERROR,
 } modem_restart_state_t;
 
+typedef enum {
+    MODEM_ACTION_SOURCE_MANUAL = 0,
+    MODEM_ACTION_SOURCE_OTA_TRANSPORT,
+    MODEM_ACTION_SOURCE_SUPERVISOR,
+} modem_action_source_t;
+
 typedef struct {
     bool at_ok;             // modem responds to AT
     bool sim_ready;         // +CPIN: READY
@@ -104,9 +110,12 @@ esp_err_t modem_ping_host(const char *host, modem_netdiag_t *out);
 void modem_suspend_polls(bool suspend);
 
 // Ask the modem task to tear down and redial PPP. This is asynchronous and
-// safe to call from another task after a transport-level failure; callers can
-// observe completion through modem_get_status().ppp_up.
+// safe to call from another task; callers can observe completion through
+// modem_get_status().ppp_up. The compatibility wrapper records a manual
+// source. Automatic callers must use the sourced form so the activation
+// boundary remains observable.
 void modem_request_redial(void);
+void modem_request_redial_from(modem_action_source_t source);
 
 // Ask the modem task to restart the SIM7670G with AT+CRESET, recover its UART,
 // and let the normal supervisor restore GNSS and PPP. Returns

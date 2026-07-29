@@ -29,6 +29,7 @@
 #include "modem.h"
 #include "mqtt.h"
 #include "event_journal.h"
+#include "ota_policy_core.h"
 #include "wifi.h"
 
 static const char *TAG = "ota";
@@ -62,7 +63,6 @@ static const char *TAG = "ota";
 #define RETRY_DELAY_MS          20000
 #define RESUME_SAVE_INTERVAL    (128 * 1024)
 #define TRANSPORT_READY_MS      (3 * 60 * 1000)
-#define TRANSPORT_DROP_MS       (30 * 1000)
 
 #define NVS_NAMESPACE           "otares"    // download-resume state
 #define NVS_KEY_VERSION         "ver"
@@ -331,27 +331,31 @@ static void log_heap_state(const char *stage)
              (unsigned)esp_get_minimum_free_heap_size());
 }
 
-static bool recover_transport(bool force_cellular)
+// A failed HTTPS request is not evidence that PPP needs to be torn down.
+// Wait for the existing modem state machine to restore a genuinely down
+// transport and retry without manipulating the modem or its UART.
+static bool await_passive_transport_retry(
+    bool force_cellular,
+    const char *stage,
+    int next_attempt
+)
 {
-    wifi_ui_status_t wifi;
-    wifi_get_status(&wifi);
-    if (!force_cellular && wifi.state == WIFI_UI_STA_CONNECTED) {
-        vTaskDelay(pdMS_TO_TICKS(RETRY_DELAY_MS));
-        return true;
-    }
-
-    modem_request_redial();
-
-    int64_t drop_deadline = esp_timer_get_time() + (int64_t)TRANSPORT_DROP_MS * 1000;
-    while (esp_timer_get_time() < drop_deadline) {
-        modem_status_t modem;
-        modem_get_status(&modem);
-        if (!modem.ppp_up) {
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-    return wait_for_transport(true, TRANSPORT_READY_MS);
+    st_lock();
+    s_st.passive_retry_count++;
+    st_unlock();
+    char details[144];
+    snprintf(
+        details, sizeof(details),
+        "{\"stage\":\"%s\",\"next_attempt\":%d,"
+        "\"delay_ms\":%d,\"active_modem_action\":false}",
+        stage, next_attempt, RETRY_DELAY_MS
+    );
+    event_journal_emit(
+        "ota", "passive_retry", EVENT_SEVERITY_WARN,
+        "transport_request_failed", details, true, 0
+    );
+    vTaskDelay(pdMS_TO_TICKS(RETRY_DELAY_MS));
+    return wait_for_transport(force_cellular, TRANSPORT_READY_MS);
 }
 
 // ---------------------------------------------------------------------------
@@ -779,9 +783,13 @@ static void run_update(const manifest_t *m, bool force_cellular)
     for (int attempt = 1; attempt <= DOWNLOAD_ATTEMPTS; attempt++) {
         set_download_attempt(attempt);
         if (attempt > 1) {
-            ESP_LOGW(TAG, "recovering transport before download attempt %d/%d: %s",
-                     attempt, DOWNLOAD_ATTEMPTS, errbuf);
-            if (!recover_transport(force_cellular)) {
+            ESP_LOGW(
+                TAG,
+                "waiting passively before download attempt %d/%d: %s",
+                attempt, DOWNLOAD_ATTEMPTS, errbuf
+            );
+            if (!await_passive_transport_retry(
+                    force_cellular, "download", attempt)) {
                 snprintf(errbuf, sizeof(errbuf),
                          "transport did not recover before attempt %d", attempt);
                 err = ESP_ERR_TIMEOUT;
@@ -852,9 +860,13 @@ static void run_check(const check_req_t *req)
             break;
         }
 
-        ESP_LOGW(TAG, "recovering transport before manifest attempt %d/%d: %s",
-                 attempt + 1, MANIFEST_ATTEMPTS, errbuf);
-        if (!recover_transport(cell)) {
+        ESP_LOGW(
+            TAG,
+            "waiting passively before manifest attempt %d/%d: %s",
+            attempt + 1, MANIFEST_ATTEMPTS, errbuf
+        );
+        if (!await_passive_transport_retry(
+                cell, "manifest", attempt + 1)) {
             err = ESP_ERR_TIMEOUT;
             snprintf(errbuf, sizeof(errbuf),
                      "transport did not recover before manifest attempt %d",
@@ -986,8 +998,58 @@ static void ota_task(void *arg)
         st_unlock();
 
         check_req_t req = {0};
-        if (xQueueReceive(s_trigger, &req, pdMS_TO_TICKS(wait_ms)) != pdTRUE) {
+        bool routine_check =
+            xQueueReceive(s_trigger, &req, pdMS_TO_TICKS(wait_ms)) != pdTRUE;
+        if (routine_check) {
             memset(&req, 0, sizeof(req));  // timer-driven check, defaults
+        }
+
+        wifi_ui_status_t wifi;
+        wifi_get_status(&wifi);
+        ota_policy_snapshot_t policy_snapshot = {
+            .routine_check = routine_check,
+            .softap_active = wifi.state == WIFI_UI_AP,
+            .ap_client_count = wifi.ap_client_count,
+            .last_ap_association_uptime_ms =
+                wifi.last_ap_association_uptime_ms,
+            .last_ap_disassociation_uptime_ms =
+                wifi.last_ap_disassociation_uptime_ms,
+            .now_uptime_ms =
+                (uint64_t)esp_timer_get_time() / 1000U,
+        };
+        ota_policy_decision_t policy =
+            ota_policy_evaluate(&policy_snapshot);
+        if (policy != OTA_POLICY_PROCEED) {
+            const char *reason =
+                policy == OTA_POLICY_DEFER_AP_CLIENT
+                    ? "ap_client_active" : "ap_quiet_period";
+            st_lock();
+            s_st.control_plane_defer_count++;
+            s_st.last_control_plane_defer_us = esp_timer_get_time();
+            strlcpy(
+                s_st.last_control_plane_defer_reason, reason,
+                sizeof(s_st.last_control_plane_defer_reason)
+            );
+            st_unlock();
+            char details[128];
+            snprintf(
+                details, sizeof(details),
+                "{\"reason\":\"%s\",\"ap_clients\":%lu,"
+                "\"retry_ms\":%d}",
+                reason, (unsigned long)wifi.ap_client_count,
+                CHECK_RETRY_MS
+            );
+            event_journal_emit(
+                "ota", "deferred", EVENT_SEVERITY_INFO,
+                "local_control_plane_active", details, true, 0
+            );
+            ESP_LOGI(
+                TAG,
+                "routine check deferred for local control plane (%s)",
+                reason
+            );
+            wait_ms = CHECK_RETRY_MS;
+            continue;
         }
 
         st_lock();

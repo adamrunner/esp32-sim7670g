@@ -11,10 +11,12 @@
 #include "freertos/semphr.h"
 #include "driver/uart.h"
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_modem_api.h"
 #include "esp_netif.h"
 #include "esp_netif_ppp.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "cJSON.h"
 #include "lwip/inet.h"
@@ -62,6 +64,7 @@ static esp_netif_t *s_ppp_netif;
 static SemaphoreHandle_t s_at_mutex;      // serializes AT commands through esp_modem
 static SemaphoreHandle_t s_status_mutex;
 static SemaphoreHandle_t s_diag_mutex;
+static TaskHandle_t s_modem_task_handle;
 static modem_status_t s_status;
 static char s_apn[MODEM_APN_MAX] = DEFAULT_APN;
 static bool s_apn_dirty;
@@ -70,6 +73,7 @@ static bool s_apn_dirty;
 static bool s_ppp_up;
 static char s_ppp_ip[40];
 static bool s_redial_requested;
+static modem_action_source_t s_redial_source = MODEM_ACTION_SOURCE_MANUAL;
 static bool s_restart_requested;
 
 typedef struct {
@@ -81,6 +85,10 @@ typedef struct {
     uint32_t packet_attach_change_count;
     uint32_t registration_change_count;
     uint32_t redial_request_count;
+    uint32_t manual_redial_request_count;
+    uint32_t ota_redial_request_count;
+    uint32_t supervisor_redial_request_count;
+    modem_action_source_t last_redial_source;
     uint32_t restart_request_count;
     uint32_t restart_complete_count;
     uint32_t restart_failure_count;
@@ -95,9 +103,73 @@ typedef struct {
     uint64_t last_redial_request_uptime_ms;
     uint64_t last_restart_request_uptime_ms;
     uint64_t last_restart_result_uptime_ms;
+    uint32_t modem_task_min_stack_free;
+    uint32_t min_free_heap;
+    uint32_t min_largest_free_block;
 } modem_observability_t;
 
 static modem_observability_t s_observability;
+
+typedef struct {
+    uint32_t modem_task_stack_free;
+    uint32_t free_heap;
+    uint32_t largest_free_block;
+    uint32_t minimum_free_heap;
+} modem_resource_snapshot_t;
+
+static void update_resource_minimum(uint32_t *minimum, uint32_t value)
+{
+    if (*minimum == 0 || value < *minimum) {
+        *minimum = value;
+    }
+}
+
+static modem_resource_snapshot_t modem_resource_snapshot(void)
+{
+    modem_resource_snapshot_t snapshot = {
+        .modem_task_stack_free = s_modem_task_handle
+            ? (uint32_t)uxTaskGetStackHighWaterMark(s_modem_task_handle) : 0,
+        .free_heap = (uint32_t)esp_get_free_heap_size(),
+        .largest_free_block =
+            (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+        .minimum_free_heap = (uint32_t)esp_get_minimum_free_heap_size(),
+    };
+    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+    if (snapshot.modem_task_stack_free) {
+        update_resource_minimum(
+            &s_observability.modem_task_min_stack_free,
+            snapshot.modem_task_stack_free
+        );
+    }
+    update_resource_minimum(
+        &s_observability.min_free_heap, snapshot.free_heap
+    );
+    update_resource_minimum(
+        &s_observability.min_largest_free_block,
+        snapshot.largest_free_block
+    );
+    xSemaphoreGive(s_status_mutex);
+    return snapshot;
+}
+
+static void format_resource_details(
+    char *details,
+    size_t details_len,
+    const char *stage
+)
+{
+    modem_resource_snapshot_t snapshot = modem_resource_snapshot();
+    snprintf(
+        details, details_len,
+        "{\"stage\":\"%s\",\"free_heap\":%lu,"
+        "\"largest_free_block\":%lu,\"minimum_free_heap\":%lu,"
+        "\"modem_task_stack_free\":%lu}",
+        stage, (unsigned long)snapshot.free_heap,
+        (unsigned long)snapshot.largest_free_block,
+        (unsigned long)snapshot.minimum_free_heap,
+        (unsigned long)snapshot.modem_task_stack_free
+    );
+}
 
 // The UART carries either AT commands or PPP data, never both, and CMUX is
 // off the table (a failed negotiation wedges this modem until a reset — see
@@ -121,20 +193,50 @@ void modem_suspend_polls(bool suspend)
     ESP_LOGI(TAG, "status/GNSS polls %s", suspend ? "suspended" : "resumed");
 }
 
-void modem_request_redial(void)
+static const char *action_source_name(modem_action_source_t source)
+{
+    switch (source) {
+    case MODEM_ACTION_SOURCE_OTA_TRANSPORT: return "ota_transport";
+    case MODEM_ACTION_SOURCE_SUPERVISOR:    return "supervisor";
+    default:                                return "manual";
+    }
+}
+
+void modem_request_redial_from(modem_action_source_t source)
 {
     xSemaphoreTake(s_status_mutex, portMAX_DELAY);
     s_redial_requested = true;
+    s_redial_source = source;
     s_observability.redial_request_count++;
+    if (source == MODEM_ACTION_SOURCE_OTA_TRANSPORT) {
+        s_observability.ota_redial_request_count++;
+    } else if (source == MODEM_ACTION_SOURCE_SUPERVISOR) {
+        s_observability.supervisor_redial_request_count++;
+    } else {
+        s_observability.manual_redial_request_count++;
+    }
+    s_observability.last_redial_source = source;
     s_observability.last_redial_request_uptime_ms =
         (uint64_t)esp_timer_get_time() / 1000U;
     xSemaphoreGive(s_status_mutex);
-    ESP_LOGW(TAG, "PPP redial requested");
+    const char *source_name = action_source_name(source);
+    ESP_LOGW(TAG, "PPP redial requested (source=%s)", source_name);
+    char details[96];
+    snprintf(
+        details, sizeof(details),
+        "{\"source\":\"%s\",\"supervisor_action\":%s}",
+        source_name,
+        source == MODEM_ACTION_SOURCE_SUPERVISOR ? "true" : "false"
+    );
     event_journal_emit(
         "recovery", "redial_requested", EVENT_SEVERITY_WARN,
-        "manual_or_transport_request", "{\"supervisor_action\":false}",
-        true, 0
+        source_name, details, true, 0
     );
+}
+
+void modem_request_redial(void)
+{
+    modem_request_redial_from(MODEM_ACTION_SOURCE_MANUAL);
 }
 
 static bool restart_active(modem_restart_state_t state)
@@ -202,9 +304,13 @@ static bool at_channel_acquire(void)
         s_observability.last_ppp_pause_failure_uptime_ms =
             (uint64_t)esp_timer_get_time() / 1000U;
         xSemaphoreGive(s_status_mutex);
+        char details[192];
+        format_resource_details(
+            details, sizeof(details), "pause_net_enter"
+        );
         event_journal_emit(
             "ppp", "pause_failed", EVENT_SEVERITY_WARN,
-            "command_mode_unavailable", "{\"paused\":false}", true, 30000
+            "command_mode_unavailable", details, true, 30000
         );
         xSemaphoreGive(s_at_mutex);
         return false;
@@ -680,10 +786,32 @@ void modem_status_json(cJSON *root)
 
     cJSON *recovery = cJSON_AddObjectToObject(root, "recovery");
     cJSON_AddBoolToObject(recovery, "automatic_actions_enabled", false);
+    cJSON_AddBoolToObject(
+        recovery, "automatic_supervisor_actions_enabled", false
+    );
     cJSON_AddStringToObject(recovery, "state",
                             "observability_only_phase_1");
     cJSON_AddNumberToObject(recovery, "redial_request_count",
                             observability.redial_request_count);
+    cJSON *redial_sources =
+        cJSON_AddObjectToObject(recovery, "redial_sources");
+    cJSON_AddNumberToObject(
+        redial_sources, "manual",
+        observability.manual_redial_request_count
+    );
+    cJSON_AddNumberToObject(
+        redial_sources, "ota_transport",
+        observability.ota_redial_request_count
+    );
+    cJSON_AddNumberToObject(
+        redial_sources, "supervisor",
+        observability.supervisor_redial_request_count
+    );
+    cJSON_AddStringToObject(
+        redial_sources, "last",
+        observability.redial_request_count
+            ? action_source_name(observability.last_redial_source) : "none"
+    );
     cJSON_AddNumberToObject(recovery, "restart_request_count",
                             observability.restart_request_count);
     cJSON_AddNumberToObject(recovery, "restart_complete_count",
@@ -696,6 +824,19 @@ void modem_status_json(cJSON *root)
                             (double)observability.last_restart_request_uptime_ms);
     cJSON_AddNumberToObject(recovery, "last_restart_result_uptime_ms",
                             (double)observability.last_restart_result_uptime_ms);
+    cJSON *resources =
+        cJSON_AddObjectToObject(recovery, "resources");
+    cJSON_AddNumberToObject(
+        resources, "modem_task_min_stack_free",
+        observability.modem_task_min_stack_free
+    );
+    cJSON_AddNumberToObject(
+        resources, "min_free_heap", observability.min_free_heap
+    );
+    cJSON_AddNumberToObject(
+        resources, "min_largest_free_block",
+        observability.min_largest_free_block
+    );
     cJSON *policy = cJSON_AddObjectToObject(recovery, "policy_defaults");
     cJSON_AddNumberToObject(policy, "mqtt_unhealthy_seconds", 90);
     cJSON_AddNumberToObject(policy, "recovery_attempt_seconds", 90);
@@ -1028,8 +1169,18 @@ static void on_ppp_status(void *arg, esp_event_base_t base, int32_t event_id, vo
             (uint64_t)esp_timer_get_time() / 1000U;
         s_ppp_ip[0] = '\0';
         xSemaphoreGive(s_status_mutex);
-        char details[48];
-        snprintf(details, sizeof(details), "{\"event_id\":%d}", (int)event_id);
+        modem_resource_snapshot_t resources = modem_resource_snapshot();
+        char details[192];
+        snprintf(
+            details, sizeof(details),
+            "{\"event_id\":%d,\"free_heap\":%lu,"
+            "\"largest_free_block\":%lu,\"minimum_free_heap\":%lu,"
+            "\"modem_task_stack_free\":%lu}",
+            (int)event_id, (unsigned long)resources.free_heap,
+            (unsigned long)resources.largest_free_block,
+            (unsigned long)resources.minimum_free_heap,
+            (unsigned long)resources.modem_task_stack_free
+        );
         event_journal_emit(
             "ppp", "error", EVENT_SEVERITY_ERROR, "lwip_ppp_error",
             details, true, 30000
@@ -1144,6 +1295,7 @@ static void modem_task(void *arg)
     int previous_packet_attached = -1;
 
     while (1) {
+        modem_resource_snapshot();
         xSemaphoreTake(s_status_mutex, portMAX_DELAY);
         bool ppp_up = s_ppp_up;
         strlcpy(st.ip_addr, s_ppp_ip, sizeof(st.ip_addr));
@@ -1151,6 +1303,7 @@ static void modem_task(void *arg)
         strlcpy(apn, s_apn, sizeof(apn));
         bool apn_dirty = s_apn_dirty;
         bool redial_requested = s_redial_requested;
+        modem_action_source_t redial_source = s_redial_source;
         bool restart_requested = s_restart_requested;
         s_redial_requested = false;
         s_restart_requested = false;
@@ -1225,7 +1378,10 @@ static void modem_task(void *arg)
         }
 
         if (redial_requested) {
-            ESP_LOGW(TAG, "forcing a clean PPP redial");
+            ESP_LOGW(
+                TAG, "forcing a clean PPP redial (source=%s)",
+                action_source_name(redial_source)
+            );
             if (ppp_up) {
                 data_disconnect();
             }
@@ -1345,6 +1501,15 @@ static void modem_task(void *arg)
                     st.at_ok = false;
                     dead_polls = 0;
                     gnss_on = false;    // modem may have rebooted; re-enable
+                    char details[192];
+                    format_resource_details(
+                        details, sizeof(details), "status_poll"
+                    );
+                    event_journal_emit(
+                        "modem", "at_channel_dead",
+                        EVENT_SEVERITY_ERROR, "consecutive_poll_failures",
+                        details, true, 30000
+                    );
                 }
             } else {
                 dead_polls = 0;
@@ -1390,6 +1555,15 @@ static void modem_task(void *arg)
             st.at_ok = false;
             gnss_on = false;
             healthy_polls = 0;
+            char details[192];
+            format_resource_details(
+                details, sizeof(details), "pause_window"
+            );
+            event_journal_emit(
+                "modem", "at_channel_dead",
+                EVENT_SEVERITY_ERROR, "consecutive_pause_failures",
+                details, true, 30000
+            );
             xSemaphoreTake(s_status_mutex, portMAX_DELAY);
             s_ppp_up = false;
             s_ppp_ip[0] = '\0';
@@ -1518,5 +1692,7 @@ void modem_init(void)
     s_dce = esp_modem_new_dev(ESP_MODEM_DCE_SIM7600, &dte_cfg, &dce_cfg, s_ppp_netif);
     assert(s_dce);
 
-    xTaskCreate(modem_task, "modem", 6144, NULL, 5, NULL);
+    xTaskCreate(
+        modem_task, "modem", 6144, NULL, 5, &s_modem_task_handle
+    );
 }

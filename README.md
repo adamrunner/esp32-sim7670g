@@ -177,8 +177,12 @@ The OTA task waits for an active WiFi or PPP route before checking. On
 cellular it suppresses the modem's periodic AT/GNSS polling from the
 manifest request through the binary transfer, because entering command
 mode briefly pauses PPP. Manifest discovery and image download each get
-bounded retries; after a transient connection failure, firmware performs
-a clean PPP redial and waits for the route to return before trying again.
+bounded passive retries; after a transient connection failure, firmware
+waits for the existing modem state machine to restore a genuinely down
+transport but never requests a PPP redial itself. A routine background check
+is deferred while a SoftAP client is associated and for five minutes after
+the last disassociation, preventing an OTA check from interrupting the local
+control plane. Explicitly requested checks are not deferred.
 Any failed cycle, including a manually requested check, retries after
 5 minutes rather than waiting for the normal hourly poll. HTTP operations
 allow 60 seconds so the modem can tolerate transient cellular latency.
@@ -242,6 +246,10 @@ URL actually embedded in the binary before publishing.
   `fix_age_s`; position persists as last-known when the fix drops). Additive
   `wifi`, `ppp`, `mqtt`, `datalog`, `http`, `recovery`, and `event_journal`
   objects expose boot-scoped counters and monotonic transition timestamps.
+  Responses are encoded in bounded chunks, avoiding a second
+  response-sized contiguous heap allocation; the `http` and `recovery`
+  objects include minimum heap/task-stack evidence and truthful transmitted
+  4xx/5xx counters.
 - `GET /api/events?limit=48` — read-only chronological snapshot of the RAM
   event ring. Unsynchronized events deliberately have `wall_time: null` and
   remain ordered by `boot_id,event_sequence`.
@@ -268,7 +276,8 @@ URL actually embedded in the binary before publishing.
   structured `failure` diagnostics, and current heap diagnostics
   (`free_heap`, `largest_free_block`, `minimum_free_heap`) for
   distinguishing total-memory pressure from fragmentation after a failed
-  transfer
+  transfer. Additive passive-retry and local-control deferral counters make
+  clear that OTA-triggered active modem recovery remains disabled.
 - `POST /api/ota/check` — check for an update now; body optional:
   `{"url":"https://.../manifest.json","transport":"cell"}` to target an
   alternate manifest or pin the transfer to the cellular interface

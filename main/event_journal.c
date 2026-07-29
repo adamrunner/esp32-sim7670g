@@ -61,6 +61,10 @@ static uint32_t s_next_sequence;
 static bool s_initialized;
 static bool s_time_valid;
 static char s_time_source[8];
+// A schema-v1 event is bounded by EVENT_DETAILS_MAX and fits comfortably in
+// this fixed buffer. Avoiding cJSON_PrintUnformatted() removes a second
+// contiguous heap allocation from the low-priority persistence path.
+static char s_journal_json[1024];
 
 
 static const char *severity_string(event_severity_t severity)
@@ -153,9 +157,12 @@ static void journal_task(void *argument)
             continue;
         }
         cJSON *root = record_json(&record);
-        char *json = root ? cJSON_PrintUnformatted(root) : NULL;
+        bool encoded =
+            root && cJSON_PrintPreallocated(
+                root, s_journal_json, sizeof(s_journal_json), false
+            );
         cJSON_Delete(root);
-        if (!json) {
+        if (!encoded) {
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_status.journal_failures++;
             s_status.last_errno = ENOMEM;
@@ -168,16 +175,14 @@ static void journal_task(void *argument)
         if (sdcard_mounted()) {
             result = event_core_append(
                 EVENT_DIRECTORY,
-                json,
-                strlen(json),
+                s_journal_json,
+                strlen(s_journal_json),
                 record.critical,
                 EVENT_JOURNAL_FILE_BYTES,
                 EVENT_JOURNAL_FILE_COUNT
             );
             saved_errno = result == 0 ? 0 : errno;
         }
-        cJSON_free(json);
-
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         if (result == 0) {
             s_status.journal_written++;

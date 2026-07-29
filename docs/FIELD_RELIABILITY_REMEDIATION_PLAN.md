@@ -664,6 +664,49 @@ Rollback activation update — 2026-07-28:
   separate allocation-safety acceptance gap and is not treated as resolved by
   the rollback.
 
+#### Post-rollback field evidence and bounded correction — 2026-07-28
+
+Read-only field evidence:
+
+- The SD journal contained one continuous boot (`1b5e0d656e660e08`) rather
+  than a panic or watchdog loop. Its BMS log remained continuous from
+  04:12:02 through 04:18:32, and production recorded the same field session
+  under boot ID `79ce99f850cd1e33`.
+- The SoftAP started at 04:12:04. Two phone associations at 04:12:09 and
+  04:12:16 both ended at 04:12:35–04:12:36, with no later association. The
+  browser failure after that point therefore cannot establish that the
+  device-side HTTP service was unavailable.
+- The automatic OTA checks at 04:12:51 and 04:15:59 each made three active
+  `modem_request_redial()` calls after HTTPS failures. Across the session,
+  those six requests coincided with four PPP errors, nine MQTT disconnects,
+  and six production `mqtt_reconnected` status events. The OTA retry helper
+  was therefore an unapproved active recovery path and a direct source of
+  transport instability.
+- Data collection remained durable: the SD held 38 BMS rows, production held
+  42 rows representing 41 unique sample timestamps through 04:18:53, and the
+  SD spool cursor was zero. MQTT continuity during the disturbance does not
+  make the local control plane healthy.
+
+Correction boundary:
+
+- OTA retries are passive. They may wait for the existing modem state machine
+  to restore a genuinely down route, but they do not request a PPP teardown
+  or touch the modem UART.
+- Routine OTA checks defer while a SoftAP client is present and for a
+  five-minute quiet period after disassociation. Explicit operator checks
+  preserve their existing immediate behavior.
+- `/api/status`, `/api/events`, and the other JSON APIs stream the existing
+  cJSON trees in fixed-size chunks, removing the second response-sized output
+  allocation without changing endpoint schemas or value types. Transmitted
+  HTTP errors, stream failures, minimum heap/largest-block, and HTTP-task
+  stack high-water evidence are additive.
+- The SD journal also uses a fixed preallocated output buffer. Modem/PPP fault
+  events and `/api/status.recovery` add heap, largest-block, modem-task stack,
+  and redial-source evidence.
+- Automatic supervisor redial and modem-reset escalation remain disabled.
+  Direct flashing, OTA publication, clean-redial activation, and reset
+  escalation remain independent approval and hardware-evidence gates.
+
 ### Phase 3: Repair the local WiFi control plane
 
 Deliverables:
