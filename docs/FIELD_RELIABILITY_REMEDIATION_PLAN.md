@@ -894,6 +894,43 @@ OTA publication update — 2026-07-28:
   rollback verification cleared.
 - Automatic supervisor redial and modem-reset escalation remain disabled.
 
+USB activation update — 2026-07-29:
+
+- Before flashing, the still-running `8ff3076` image reported that it had
+  discovered `4d9759d` and reached 1,110,802 of 1,389,456 bytes (79 percent).
+  Four download attempts ended with `ota begin failed: ESP_FAIL` at
+  `download_begin`; the retained snapshot showed no TLS/socket error and no
+  active modem recovery. The prior firmware therefore attempted the overnight
+  update but did not install it.
+- After explicit USB approval, the public
+  `esp32-sim7670g-4d9759d.bin` artifact was downloaded into a clean detached
+  `4d9759d` activation worktree and reverified at 1,389,456 bytes with SHA-256
+  `841f34201c48f2dd42b1adfad3631bda049aff8b5aa57f28199a7669204b0404`.
+  ESP-IDF auto-selected the native USB-JTAG port, identified the ESP32-S3,
+  flashed that exact application plus the normal boot/partition/OTA-data
+  images, verified every written region, and hard-reset the board. A
+  post-flash comparison confirmed that the local application file still
+  matched the published artifact byte-for-byte.
+- Serial confirmed `4d9759d` running from `ota_0`, SD mounted, and the SoftAP
+  DHCP router/DNS offers disabled. Home WiFi, MQTT, Verizon registration, PPP,
+  and a 4/4 cellular connectivity check recovered normally.
+- The SD spool contained 383,822 bytes from the field session and replayed
+  while validation ran. During that backlog replay, bounded API polling and an
+  explicit OTA check ran together. The HTTPS client created its socket,
+  validated the certificate, fetched the production manifest once, reported
+  `4d9759d` up to date, made zero download attempts, and resumed modem polling.
+- The final snapshot covered 34 HTTP requests with zero HTTP, response, or
+  stream failures. MQTT remained connected and acknowledged 342 messages;
+  340 spooled rows had replayed and the remaining backlog continued to drain.
+  The OTA heap low-water mark was 2,692 bytes with a 7,680-byte minimum
+  largest block, then recovered to 33,732 bytes free and an 18,432-byte
+  largest block after the TLS request. There were zero redial and restart
+  requests.
+- The exact application artifact is now both installed and published as
+  `4d9759d`. The BMS was not attached during this USB test, so the successful
+  field SoftAP/BMS behavior still provides that portion of the evidence.
+  Automatic supervisor redial and modem-reset escalation remain disabled.
+
 ### Phase 3: Repair the local WiFi control plane
 
 Deliverables:
