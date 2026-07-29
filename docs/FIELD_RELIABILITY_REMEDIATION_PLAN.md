@@ -637,6 +637,33 @@ Rollback boundary:
   serialization, the complete weighted schedule, AP+BMS+SD testing, and
   production boot-ID observation beyond the prior failure boundary.
 
+Rollback activation update — 2026-07-28:
+
+- Commit `063075c` restores the Phase 1 source paths exactly while preserving
+  this failure record. Its nine Phase 1 host tests and clean pinned ESP-IDF
+  5.5/Python 3.10 build passed. The application returned to `0x150d30` bytes
+  with 67% free in the smallest app partition.
+- The rollback was published before direct flashing.
+  `esp32-sim7670g-063075c.bin` is 1,379,632 bytes with SHA-256
+  `7d18df0c2ff200adcce736ce3c087f281040bbef2ee532df95272828d2df4bda`.
+  External verification confirmed a fresh manifest, full-download size and
+  checksum, and HTTP Range response `206`.
+- The identical image was flashed over native USB, and esptool verified every
+  written region. Bounded serial observation then confirmed `063075c` from
+  `ota_0` for more than 712 seconds with one unchanged boot, WiFi, Verizon
+  LTE, PPP, MQTT, retained-availability PUBACK, time synchronization, and a
+  successful 90-second OTA manifest check.
+- The 32 GB SD card mounted. The event journal wrote 31 of 31 queued events
+  with no write failures. Repeated `/api/status` requests returned HTTP 200,
+  and Anton recorded exactly one rollback boot ID with reset reason
+  `power_on`. No panic, watchdog, disconnect, redial, or modem restart
+  occurred during the observation.
+- The BMS was not attached during USB testing. `/api/events?limit=48` still
+  reproduced the existing monolithic-cJSON allocation failure at a 13,312-byte
+  largest free block, while `limit=16` returned HTTP 200. This remains a
+  separate allocation-safety acceptance gap and is not treated as resolved by
+  the rollback.
+
 ### Phase 3: Repair the local WiFi control plane
 
 Deliverables:
