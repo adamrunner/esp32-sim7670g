@@ -54,6 +54,30 @@ static char s_pass[WIFI_PASS_MAX];
 // Status snapshot (guarded by s_mutex).
 static wifi_ui_status_t s_status;
 
+// The fallback AP is a local control link, not an internet router. Omitting
+// DHCP options 3 (router) and 6 (DNS) lets clients keep their existing
+// internet route while the directly connected 192.168.4.0/24 route continues
+// to reach the device UI.
+static void configure_ap_dhcp_offers(void)
+{
+    uint8_t disabled = 0;
+    ESP_ERROR_CHECK(esp_netif_dhcps_option(
+        s_ap_netif,
+        ESP_NETIF_OP_SET,
+        ESP_NETIF_ROUTER_SOLICITATION_ADDRESS,
+        &disabled,
+        sizeof(disabled)
+    ));
+    ESP_ERROR_CHECK(esp_netif_dhcps_option(
+        s_ap_netif,
+        ESP_NETIF_OP_SET,
+        ESP_NETIF_DOMAIN_NAME_SERVER,
+        &disabled,
+        sizeof(disabled)
+    ));
+    ESP_LOGI(TAG, "SoftAP DHCP router and DNS offers disabled");
+}
+
 static void set_state(wifi_ui_state_t state)
 {
     bool changed;
@@ -207,7 +231,8 @@ static void start_ap(void)
     set_state(WIFI_UI_AP);
     event_journal_emit(
         "wifi", "ap_started", EVENT_SEVERITY_INFO, "fallback_control_plane",
-        "{\"ip\":\"192.168.4.1\"}", true, 0
+        "{\"ip\":\"192.168.4.1\",\"router_offer\":false,"
+        "\"dns_offer\":false}", true, 0
     );
     ESP_LOGI(TAG, "SoftAP \"%s\" up — http://192.168.4.1/", AP_SSID);
 }
@@ -359,6 +384,7 @@ void wifi_init(void)
     s_sta_netif = esp_netif_create_default_wifi_sta();
     s_ap_netif = esp_netif_create_default_wifi_ap();
     assert(s_sta_netif && s_ap_netif);
+    configure_ap_dhcp_offers();
 
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
@@ -414,6 +440,8 @@ void wifi_status_json(cJSON *root)
                             status.ap_association_count);
     cJSON_AddNumberToObject(wifi, "ap_disassociation_count",
                             status.ap_disassociation_count);
+    cJSON_AddBoolToObject(wifi, "ap_dhcp_router_offer", false);
+    cJSON_AddBoolToObject(wifi, "ap_dhcp_dns_offer", false);
     cJSON_AddNumberToObject(wifi, "transition_count",
                             status.transition_count);
     cJSON_AddNumberToObject(wifi, "last_transition_uptime_ms",

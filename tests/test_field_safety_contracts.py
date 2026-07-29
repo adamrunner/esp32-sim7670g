@@ -40,6 +40,28 @@ class FieldSafetyContractTests(unittest.TestCase):
             modem_source,
         )
 
+    def test_softap_dhcp_omits_router_and_dns_offers(self):
+        wifi_source = (REPOSITORY_ROOT / "main" / "wifi.c").read_text()
+        sdkconfig_defaults = (
+            REPOSITORY_ROOT / "sdkconfig.defaults"
+        ).read_text()
+
+        self.assertIn(
+            "ESP_NETIF_ROUTER_SOLICITATION_ADDRESS",
+            wifi_source,
+        )
+        self.assertIn("ESP_NETIF_DOMAIN_NAME_SERVER", wifi_source)
+        self.assertIn("uint8_t disabled = 0;", wifi_source)
+        self.assertIn(
+            '"ap_dhcp_router_offer", false',
+            wifi_source,
+        )
+        self.assertIn('"ap_dhcp_dns_offer", false', wifi_source)
+        self.assertIn(
+            "# CONFIG_LWIP_DHCPS_ADD_DNS is not set",
+            sdkconfig_defaults,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

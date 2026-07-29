@@ -97,6 +97,9 @@ web UI for monitoring/configuring the cellular connection.
   <http://192.168.4.1/>. Shows live connection status, modem/SIM identity,
   lets you change the APN (persisted in NVS), has a raw AT-command console,
   and can perform a delayed software reboot after acknowledging the browser.
+  The SoftAP DHCP lease intentionally omits router and DNS offers: the local
+  `192.168.4.0/24` route still reaches the UI while phones can retain cellular
+  as their internet route.
 
 ### APN: leave it blank
 

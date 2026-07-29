@@ -16,6 +16,11 @@ CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 # Roomier HTTP headers for browser requests
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 
+# The fallback SoftAP is a local control link. Do not add an implicit DNS
+# server to its DHCP offers; wifi.c also disables the router and explicit DNS
+# offer bits before the DHCP server starts.
+# CONFIG_LWIP_DHCPS_ADD_DNS is not set
+
 # Cellular data: lwIP PPP client over UART to the SIM7670G (esp_modem)
 CONFIG_LWIP_PPP_SUPPORT=y
 CONFIG_LWIP_PPP_PAP_SUPPORT=y
