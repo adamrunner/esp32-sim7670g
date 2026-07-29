@@ -831,6 +831,48 @@ SoftAP local-route activation update — 2026-07-28:
   Clean-redial hardware acceptance and reset-escalation approval remain
   separate gates.
 
+SoftAP OTA socket-pressure correction — 2026-07-28:
+
+- Field testing passed the local-route objective: an iPhone stayed associated
+  with the SoftAP, reached the WebUI and its API reliably, retained cellular
+  internet routing, and observed normal BMS, MQTT, and LTE operation.
+- An accidental WebUI update check exposed a separate bounded resource
+  failure. `/api/ota` recorded four manifest attempts, zero downloaded bytes,
+  `ESP_ERR_ESP_TLS_CANNOT_CREATE_SOCKET`, and socket `errno` 23 (`ENFILE`).
+  The failure occurred before DNS, TCP, or TLS negotiation. Its final snapshot
+  still had 24,044 bytes free and a 7,680-byte largest block, so allocation
+  fragmentation was not the direct socket-create failure; the 840-byte
+  historical minimum heap remains a pressure signal to retain.
+- Events from boot `e2d3b020d4a5c67f` show three passive retries with no
+  active modem action, followed by the terminal OTA error. MQTT reconnected,
+  replayed and drained its spool, then continued receiving QoS 1 PUBACKs while
+  normal bounded PPP AT windows continued. No redial, restart, or boot loop is
+  present in the retained sequence.
+- The configured lwIP budget is ten sockets. The prior default HTTP server
+  configuration permitted seven client sessions and uses three additional
+  internal sockets, so browser activity could consume the entire table before
+  MQTT or OTA requested an outbound socket.
+- Commit `4d9759d` limits HTTP to four client sessions while retaining LRU
+  purging. Including the server's three internal sockets, this reserves three
+  lwIP slots for MQTT, OTA, and transient outbound work. The configured total
+  remains pinned at ten rather than increasing heap pressure.
+- Dashboard status, WiFi, and OTA polling now run sequentially. Each JSON
+  request has a 2.5-second abort deadline and an in-flight guard, preventing
+  interval overlap and abandoned sockets. The WebUI update button stays
+  disabled during SoftAP use; the existing explicit `/api/ota/check` API is
+  unchanged for controlled callers.
+- Retained OTA failures and later background-control-plane deferrals render as
+  separate timestamped messages. This prevents a recent `ap_client_active`
+  deferral from appearing to explain an older explicit HTTPS failure.
+- JavaScript syntax validation and all seventeen host tests passed. An exact
+  full-clean ESP-IDF 5.5/Python 3.10 build of `4d9759d` passed; its application
+  image is 1,389,456 bytes with SHA-256
+  `92cedebbe46b2edfe63d01227b9c1f580b324532c3850ae1e2a98875f74b05c6`.
+- This correction is source/build validated only. The installed and published
+  firmware remain `8ff3076`; direct flashing and OTA publication remain
+  separate approval gates. Automatic supervisor redial and modem-reset
+  escalation remain disabled.
+
 ### Phase 3: Repair the local WiFi control plane
 
 Deliverables:
