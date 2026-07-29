@@ -772,9 +772,20 @@ Validation and activation status:
   there was no manifest TLS allocation attempt or transport interruption. The
   browser populated live modem, GNSS, MQTT, WiFi, and firmware fields, showed
   the local-control deferral, and did not show the API-unavailable banner.
-  This passes the bounded USB control-plane and dry-run transport test. OTA
-  publication, clean-redial activation, and automatic modem-reset escalation
-  remain blocked pending the remaining hardware evidence.
+  This passes the bounded USB control-plane and dry-run transport test.
+- After separate publication approval, exact commit `45b49ac` was published as
+  `esp32-sim7670g-45b49ac.bin`. The public artifact is 1,385,440 bytes with
+  SHA-256
+  `001c64a937df6c31620e612955969e38c51412a0afab63e91d1bff1e26cd79cf`.
+  External verification passed for the fresh manifest, full download size and
+  checksum, and a 1,024-byte HTTP Range request with status 206.
+- An explicit device-local check then fetched the production manifest once,
+  reported `45b49ac` up to date, made zero download attempts, and scheduled
+  the next check for one hour later. Status/GNSS polling suspended and resumed
+  around the manifest request; PPP and MQTT remained connected with zero
+  redial or restart requests.
+- Clean-redial activation and automatic modem-reset escalation remain blocked
+  pending the remaining hardware evidence.
 - The BMS was not attached during this USB test. SD+BMS pressure, vehicle
   power, restored-coverage timing, and clean-redial behavior remain
   hardware-only acceptance gaps.
