@@ -22,7 +22,6 @@ STABLE_RECOVERY_SECONDS = 5 * 60
 class Decision(str, Enum):
     HEALTHY = "healthy"
     WIFI_UPLINK_HEALTHY = "wifi_uplink_healthy"
-    OTA_ACTIVE = "ota_active"
     WAITING_FOR_COVERAGE = "waiting_for_coverage"
     WAITING_FOR_MQTT = "waiting_for_mqtt"
     REQUEST_REDIAL = "request_redial"
@@ -40,7 +39,6 @@ class ConnectivitySnapshot:
     mqtt_connected: bool
     last_puback_at: int | None
     modem_responsive: bool = True
-    ota_active: bool = False
 
 
 class RecoveryPolicy:
@@ -69,10 +67,6 @@ class RecoveryPolicy:
         )
 
     def evaluate(self, *, now: int, state: ConnectivitySnapshot) -> Decision:
-        if state.ota_active:
-            self.recovery_deadline = None
-            self.stable_since = None
-            return Decision.OTA_ACTIVE
         mqtt_healthy = self._mqtt_healthy(now, state)
         if mqtt_healthy:
             if self.stable_since is None:

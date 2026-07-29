@@ -15,12 +15,10 @@
 
 #include "bms.h"
 #include "board_battery.h"
-#include "connectivity_supervisor.h"
 #include "datalog.h"
 #include "event_journal.h"
 #include "modem.h"
 #include "mqtt.h"
-#include "network_pause_gate.h"
 #include "ota.h"
 #include "timesync.h"
 #include "wifi.h"
@@ -150,13 +148,11 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     board_battery_status_json(root); // "internal_battery"
     bms_status_json(root);        // "bms"
     mqtt_status_json(root);       // "mqtt"
-    network_pause_gate_status_json(root); // "network_pause"
     datalog_status_json(root);    // "datalog"
     timesync_status_json(root);   // "time"
     wifi_status_json(root);       // "wifi"
     webui_status_json(root);      // "http"
     event_journal_status_json(root); // "event_journal"
-    connectivity_supervisor_status_json(root); // extends "recovery"
     return send_json(req, root);
 }
 

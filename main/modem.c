@@ -24,7 +24,6 @@
 #include "nvs.h"
 
 #include "event_journal.h"
-#include "network_pause_gate.h"
 
 static const char *TAG = "modem";
 
@@ -56,9 +55,6 @@ static const char *TAG = "modem";
 // couple of seconds ("+++" ... ATO), so pace the polls.
 #define PPP_POLL_INTERVAL_MS 30000
 #define PPP_POLL_GRACE_MS    10000  // let the post-connect connectivity check finish first
-#define PPP_AT_WINDOW_MAX_MS 3000
-#define PPP_AT_QUERY_TIMEOUT_MS 1000
-#define MANUAL_AT_GATE_WAIT_MS 9000
 
 static esp_modem_dce_t *s_dce;
 static esp_netif_t *s_ppp_netif;
@@ -99,13 +95,6 @@ typedef struct {
     uint64_t last_redial_request_uptime_ms;
     uint64_t last_restart_request_uptime_ms;
     uint64_t last_restart_result_uptime_ms;
-    uint32_t at_query_count;
-    uint32_t at_query_success_count;
-    uint32_t at_query_failure_count;
-    uint32_t at_query_deferred_count;
-    uint32_t last_at_query_duration_ms;
-    uint32_t max_at_query_duration_ms;
-    char last_at_query[24];
 } modem_observability_t;
 
 static modem_observability_t s_observability;
@@ -117,7 +106,6 @@ static modem_observability_t s_observability;
 // then resume the same PPP session with ATO. at_channel_acquire/_release
 // wrap that dance; callers own the AT channel exclusively in between.
 static bool s_net_paused;   // guarded by s_at_mutex
-static bool s_network_gate_held; // guarded by s_at_mutex
 
 // While set, the modem task skips its periodic status/GNSS polls whenever
 // they would pause a live PPP session (OTA holds this during a download so
@@ -196,30 +184,14 @@ static bool ppp_is_up(void)
     return up;
 }
 
-typedef enum {
-    AT_CHANNEL_ACQUIRED = 0,
-    AT_CHANNEL_GATE_BUSY,
-    AT_CHANNEL_PAUSE_FAILED,
-} at_channel_result_t;
-
-// Blocks data traffic for ~1-2 s when PPP is up. Periodic callers pass zero
-// gate wait so an active PUBACK transaction wins; manual maintenance uses a
-// bounded wait.
-static at_channel_result_t at_channel_acquire(TickType_t gate_wait_ticks)
+// Blocks data traffic for ~1-2 s when PPP is up. Returns false if the modem
+// refused to drop into command mode (channel not acquired).
+static bool at_channel_acquire(void)
 {
     xSemaphoreTake(s_at_mutex, portMAX_DELAY);
     if (!ppp_is_up()) {
-        return AT_CHANNEL_ACQUIRED;    // UART is already carrying AT
+        return true;    // UART is already carrying AT
     }
-    if (!network_pause_gate_at_begin(gate_wait_ticks)) {
-        xSemaphoreGive(s_at_mutex);
-        xSemaphoreTake(s_status_mutex, portMAX_DELAY);
-        s_observability.at_query_deferred_count++;
-        xSemaphoreGive(s_status_mutex);
-        return AT_CHANNEL_GATE_BUSY;
-    }
-    s_network_gate_held = true;
-    s_net_pause_started_us = esp_timer_get_time();
     if (esp_modem_pause_net(s_dce, true) != ESP_OK) {
         ESP_LOGW(TAG, "pausing PPP for an AT window failed");
         // Best effort un-pause; if the modem never left data mode the ATO
@@ -234,31 +206,26 @@ static at_channel_result_t at_channel_acquire(TickType_t gate_wait_ticks)
             "ppp", "pause_failed", EVENT_SEVERITY_WARN,
             "command_mode_unavailable", "{\"paused\":false}", true, 30000
         );
-        s_network_gate_held = false;
         xSemaphoreGive(s_at_mutex);
-        network_pause_gate_at_end();
-        return AT_CHANNEL_PAUSE_FAILED;
+        return false;
     }
     s_net_paused = true;
+    s_net_pause_started_us = esp_timer_get_time();
     xSemaphoreTake(s_status_mutex, portMAX_DELAY);
     s_observability.ppp_pause_count++;
     s_observability.last_ppp_pause_uptime_ms =
         (uint64_t)s_net_pause_started_us / 1000U;
     xSemaphoreGive(s_status_mutex);
-    return AT_CHANNEL_ACQUIRED;
+    return true;
 }
 
 static void at_channel_release(void)
 {
-    bool resume_failed = false;
     if (s_net_paused) {
-        s_net_paused = false;
-        if (esp_modem_pause_net(s_dce, false) != ESP_OK) {
-            resume_failed = true;
-        }
         uint32_t duration_ms = (uint32_t)(
             (esp_timer_get_time() - s_net_pause_started_us) / 1000
         );
+        s_net_paused = false;
         xSemaphoreTake(s_status_mutex, portMAX_DELAY);
         s_observability.last_ppp_pause_duration_ms = duration_ms;
         xSemaphoreGive(s_status_mutex);
@@ -266,17 +233,12 @@ static void at_channel_release(void)
         snprintf(details, sizeof(details), "{\"duration_ms\":%lu}",
                  (unsigned long)duration_ms);
         event_journal_emit(
-            "ppp",
-            duration_ms > PPP_AT_WINDOW_MAX_MS ? "pause_overrun"
-                                               : "pause_complete",
-            duration_ms > PPP_AT_WINDOW_MAX_MS ? EVENT_SEVERITY_WARN
-                                               : EVENT_SEVERITY_DEBUG,
-            duration_ms > PPP_AT_WINDOW_MAX_MS ? "duration_threshold"
-                                               : "at_window",
-            details, duration_ms > PPP_AT_WINDOW_MAX_MS,
-            duration_ms > PPP_AT_WINDOW_MAX_MS ? 0 : 60000
+            "ppp", duration_ms > 3000 ? "pause_overrun" : "pause_complete",
+            duration_ms > 3000 ? EVENT_SEVERITY_WARN : EVENT_SEVERITY_DEBUG,
+            duration_ms > 3000 ? "duration_threshold" : "at_window",
+            details, duration_ms > 3000, duration_ms > 3000 ? 0 : 60000
         );
-        if (resume_failed) {
+        if (esp_modem_pause_net(s_dce, false) != ESP_OK) {
             // ATO didn't bring the data flow back; mark the link down so the
             // modem task tears the session down and redials cleanly.
             ESP_LOGW(TAG, "resuming PPP after AT window failed; forcing redial");
@@ -293,12 +255,7 @@ static void at_channel_release(void)
             );
         }
     }
-    bool gate_held = s_network_gate_held;
-    s_network_gate_held = false;
     xSemaphoreGive(s_at_mutex);
-    if (gate_held) {
-        network_pause_gate_at_end();
-    }
 }
 
 // Send one AT command and capture the raw response (echo of URCs included).
@@ -327,19 +284,11 @@ static esp_err_t at_cmd(const char *cmd, char *resp, size_t resp_len, uint32_t t
 
 esp_err_t modem_send_at(const char *cmd, char *resp, size_t resp_len, uint32_t timeout_ms)
 {
-    at_channel_result_t acquired =
-        at_channel_acquire(pdMS_TO_TICKS(MANUAL_AT_GATE_WAIT_MS));
-    if (acquired != AT_CHANNEL_ACQUIRED) {
+    if (!at_channel_acquire()) {
         if (resp && resp_len) {
-            snprintf(
-                resp, resp_len,
-                acquired == AT_CHANNEL_GATE_BUSY
-                    ? "unavailable: MQTT PUBACK transaction is active\r\n"
-                    : "unavailable: could not pause the PPP data stream\r\n"
-            );
+            snprintf(resp, resp_len, "unavailable: could not pause the PPP data stream\r\n");
         }
-        return acquired == AT_CHANNEL_GATE_BUSY ? ESP_ERR_NOT_FINISHED
-                                                : ESP_ERR_INVALID_STATE;
+        return ESP_ERR_INVALID_STATE;
     }
     esp_err_t err = at_cmd(cmd, resp, resp_len, timeout_ms);
     at_channel_release();
@@ -670,7 +619,6 @@ void modem_status_json(cJSON *root)
     cJSON_AddBoolToObject(root, "sim_ready", st.sim_ready);
     cJSON_AddNumberToObject(root, "reg_status", st.reg_status);
     cJSON_AddStringToObject(root, "reg_text", reg_status_str(st.reg_status));
-    cJSON_AddBoolToObject(root, "packet_attached", st.packet_attached);
     cJSON_AddBoolToObject(root, "pdp_active", st.pdp_active);
     cJSON_AddBoolToObject(root, "ppp_up", st.ppp_up);
     cJSON_AddNumberToObject(root, "rssi_dbm", st.rssi_dbm);
@@ -729,30 +677,6 @@ void modem_status_json(cJSON *root)
                             observability.packet_attach_change_count);
     cJSON_AddNumberToObject(ppp, "last_packet_attach_change_uptime_ms",
                             (double)observability.last_packet_attach_change_uptime_ms);
-
-    cJSON *scheduler = cJSON_AddObjectToObject(root, "at_scheduler");
-    cJSON_AddBoolToObject(scheduler, "one_query_per_ppp_window", true);
-    cJSON_AddBoolToObject(scheduler, "polls_suspended", s_polls_suspended);
-    cJSON_AddNumberToObject(scheduler, "poll_interval_ms",
-                            PPP_POLL_INTERVAL_MS);
-    cJSON_AddNumberToObject(scheduler, "query_timeout_ms",
-                            PPP_AT_QUERY_TIMEOUT_MS);
-    cJSON_AddNumberToObject(scheduler, "max_window_ms",
-                            PPP_AT_WINDOW_MAX_MS);
-    cJSON_AddNumberToObject(scheduler, "query_count",
-                            observability.at_query_count);
-    cJSON_AddNumberToObject(scheduler, "query_success_count",
-                            observability.at_query_success_count);
-    cJSON_AddNumberToObject(scheduler, "query_failure_count",
-                            observability.at_query_failure_count);
-    cJSON_AddNumberToObject(scheduler, "query_deferred_count",
-                            observability.at_query_deferred_count);
-    cJSON_AddNumberToObject(scheduler, "last_query_duration_ms",
-                            observability.last_at_query_duration_ms);
-    cJSON_AddNumberToObject(scheduler, "max_query_duration_ms",
-                            observability.max_at_query_duration_ms);
-    cJSON_AddStringToObject(scheduler, "last_query",
-                            observability.last_at_query);
 
     cJSON *recovery = cJSON_AddObjectToObject(root, "recovery");
     cJSON_AddBoolToObject(recovery, "automatic_actions_enabled", false);
@@ -896,154 +820,6 @@ static int poll_once(modem_status_t *st)
     return ok;
 }
 
-typedef enum {
-    AT_QUERY_REGISTRATION = 0,
-    AT_QUERY_SIGNAL,
-    AT_QUERY_GNSS,
-    AT_QUERY_SYSTEM,
-    AT_QUERY_OPERATOR,
-    AT_QUERY_SIM,
-} at_query_t;
-
-// Registration and signal appear more often than the heavier operator/system
-// queries. GNSS is intentionally sparse while PPP is healthy; a busy PUBACK
-// gate skips the whole window rather than delaying the publish.
-static const at_query_t s_healthy_ppp_schedule[] = {
-    AT_QUERY_REGISTRATION,
-    AT_QUERY_SIGNAL,
-    AT_QUERY_GNSS,
-    AT_QUERY_REGISTRATION,
-    AT_QUERY_SIGNAL,
-    AT_QUERY_SYSTEM,
-    AT_QUERY_REGISTRATION,
-    AT_QUERY_OPERATOR,
-    AT_QUERY_SIM,
-    AT_QUERY_SIGNAL,
-};
-
-static bool gnss_poll_bounded(uint32_t timeout_ms);
-
-static const char *at_query_name(at_query_t query)
-{
-    switch (query) {
-    case AT_QUERY_REGISTRATION: return "registration";
-    case AT_QUERY_SIGNAL:       return "signal";
-    case AT_QUERY_GNSS:         return "gnss";
-    case AT_QUERY_SYSTEM:       return "system";
-    case AT_QUERY_OPERATOR:     return "operator";
-    case AT_QUERY_SIM:          return "sim";
-    default:                    return "unknown";
-    }
-}
-
-// Exactly one AT command per healthy-PPP window.
-static bool poll_short_query(modem_status_t *st, at_query_t query)
-{
-    char resp[AT_RESP_MAX];
-    char line[256];
-    int64_t started_us = esp_timer_get_time();
-    bool ok = false;
-
-    switch (query) {
-    case AT_QUERY_REGISTRATION:
-        if (at_cmd("AT+CEREG?", resp, sizeof(resp),
-                   PPP_AT_QUERY_TIMEOUT_MS) == ESP_OK &&
-            extract_line_after(resp, "+CEREG:", line, sizeof(line))) {
-            char *comma = strchr(line, ',');
-            if (comma) {
-                st->reg_status = atoi(comma + 1);
-                ok = true;
-            }
-        }
-        break;
-    case AT_QUERY_SIGNAL:
-        if (at_cmd("AT+CSQ", resp, sizeof(resp),
-                   PPP_AT_QUERY_TIMEOUT_MS) == ESP_OK &&
-            extract_line_after(resp, "+CSQ:", line, sizeof(line))) {
-            int rssi = atoi(line);
-            st->rssi_dbm = rssi >= 0 && rssi <= 31
-                         ? -113 + 2 * rssi : 0;
-            ok = true;
-        }
-        break;
-    case AT_QUERY_GNSS:
-        ok = gnss_poll_bounded(PPP_AT_QUERY_TIMEOUT_MS);
-        break;
-    case AT_QUERY_SYSTEM:
-        if (at_cmd("AT+CPSI?", resp, sizeof(resp),
-                   PPP_AT_QUERY_TIMEOUT_MS) == ESP_OK &&
-            extract_line_after(resp, "+CPSI:", line, sizeof(line))) {
-            char *token;
-            char *save = NULL;
-            int index = 0;
-            for (token = strtok_r(line, ",", &save); token;
-                 token = strtok_r(NULL, ",", &save), index++) {
-                if (index == 0) {
-                    strlcpy(st->rat, token, sizeof(st->rat));
-                } else if (strncmp(token, "EUTRAN", 6) == 0 ||
-                           strncmp(token, "NR", 2) == 0 ||
-                           strstr(token, "BAND")) {
-                    strlcpy(st->band, token, sizeof(st->band));
-                }
-            }
-            ok = true;
-        }
-        break;
-    case AT_QUERY_OPERATOR:
-        if (at_cmd("AT+COPS?", resp, sizeof(resp),
-                   PPP_AT_QUERY_TIMEOUT_MS) == ESP_OK &&
-            extract_line_after(resp, "+COPS:", line, sizeof(line))) {
-            char *first_quote = strchr(line, '"');
-            if (first_quote) {
-                char *second_quote = strchr(first_quote + 1, '"');
-                if (second_quote) {
-                    *second_quote = '\0';
-                    strlcpy(st->operator_name, first_quote + 1,
-                            sizeof(st->operator_name));
-                }
-            }
-            ok = true;
-        }
-        break;
-    case AT_QUERY_SIM:
-        if (at_cmd("AT+CPIN?", resp, sizeof(resp),
-                   PPP_AT_QUERY_TIMEOUT_MS) == ESP_OK) {
-            st->sim_ready = strstr(resp, "READY") != NULL;
-            ok = true;
-        }
-        break;
-    }
-
-    uint32_t duration_ms =
-        (uint32_t)((esp_timer_get_time() - started_us) / 1000U);
-    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
-    s_observability.at_query_count++;
-    if (ok) {
-        s_observability.at_query_success_count++;
-    } else {
-        s_observability.at_query_failure_count++;
-    }
-    s_observability.last_at_query_duration_ms = duration_ms;
-    if (duration_ms > s_observability.max_at_query_duration_ms) {
-        s_observability.max_at_query_duration_ms = duration_ms;
-    }
-    strlcpy(s_observability.last_at_query, at_query_name(query),
-            sizeof(s_observability.last_at_query));
-    xSemaphoreGive(s_status_mutex);
-
-    if (!ok) {
-        char details[80];
-        snprintf(details, sizeof(details),
-                 "{\"query\":\"%s\",\"duration_ms\":%lu}",
-                 at_query_name(query), (unsigned long)duration_ms);
-        event_journal_emit(
-            "modem", "at_query_failed", EVENT_SEVERITY_WARN,
-            "bounded_query", details, false, 30000
-        );
-    }
-    return ok;
-}
-
 // ---------------------------------------------------------------------------
 // GNSS: the receiver runs inside the SIM7670G independently of the cellular
 // stack. We poll AT+CGNSSINFO instead of enabling the NMEA stream
@@ -1166,16 +942,14 @@ static void gnss_parse_info(char *line, modem_gnss_t *g)
     g->fix_time_us = esp_timer_get_time();
 }
 
-// Poll the receiver once and publish the result. Caller must hold the AT
-// channel. Healthy PPP uses the bounded timeout; command-mode recovery keeps
-// the historical five-second allowance.
-static bool gnss_poll_bounded(uint32_t timeout_ms)
+// Poll the receiver once and publish the result. Caller must hold the AT channel.
+static void gnss_poll(void)
 {
     char resp[AT_RESP_MAX];
     char line[256];
-    if (at_cmd("AT+CGNSSINFO", resp, sizeof(resp), timeout_ms) != ESP_OK ||
+    if (at_cmd("AT+CGNSSINFO", resp, sizeof(resp), 5000) != ESP_OK ||
         !extract_line_after(resp, "+CGNSSINFO:", line, sizeof(line))) {
-        return false;
+        return;
     }
 
     xSemaphoreTake(s_status_mutex, portMAX_DELAY);
@@ -1188,12 +962,6 @@ static bool gnss_poll_bounded(uint32_t timeout_ms)
     xSemaphoreTake(s_status_mutex, portMAX_DELAY);
     s_gnss = g;
     xSemaphoreGive(s_status_mutex);
-    return true;
-}
-
-static void gnss_poll(void)
-{
-    (void)gnss_poll_bounded(5000);
 }
 
 // ---------------------------------------------------------------------------
@@ -1374,7 +1142,6 @@ static void modem_task(void *arg)
     int pause_fails = 0;
     int previous_reg_status = -1;
     int previous_packet_attached = -1;
-    size_t healthy_schedule_index = 0;
 
     while (1) {
         xSemaphoreTake(s_status_mutex, portMAX_DELAY);
@@ -1391,9 +1158,6 @@ static void modem_task(void *arg)
 
         st.ppp_up = ppp_up;
         st.pdp_active = ppp_up;  // LED turns blue when the data link is up
-        if (ppp_up) {
-            st.packet_attached = true;
-        }
 
         bool restart_issued = false;
         if (restart_requested) {
@@ -1447,7 +1211,6 @@ static void modem_task(void *arg)
                 st.at_ok = false;
                 st.sim_ready = false;
                 st.reg_status = 0;
-                st.packet_attached = false;
                 st.rssi_dbm = 0;
                 st.operator_name[0] = '\0';
                 st.rat[0] = '\0';
@@ -1506,8 +1269,7 @@ static void modem_task(void *arg)
         // Probe the modem until it answers AT (at the target baud; see
         // baud_negotiate). Re-runs whenever the AT channel dies, which also
         // re-bumps the baud after an unexpected modem reboot back to 115200.
-        if (!restart_issued && !st.at_ok && !ppp_up &&
-            at_channel_acquire(0) == AT_CHANNEL_ACQUIRED) {
+        if (!restart_issued && !st.at_ok && !ppp_up && at_channel_acquire()) {
             if (baud_negotiate()) {
                 st.at_ok = true;
                 at_cmd("ATE0", NULL, 0, 2000);         // echo off simplifies parsing
@@ -1567,31 +1329,14 @@ static void modem_task(void *arg)
             // let the pause-fail wedge guard below count skipped windows).
             poll_due = false;
         }
-        at_channel_result_t poll_channel = AT_CHANNEL_GATE_BUSY;
-        if (st.at_ok && poll_due) {
-            poll_channel = at_channel_acquire(0);
-        }
-        if (st.at_ok && poll_due &&
-            poll_channel == AT_CHANNEL_ACQUIRED) {
+        if (st.at_ok && poll_due && at_channel_acquire()) {
             pause_fails = 0;
             last_poll_us = now;
-            bool query_ok;
-            if (ppp_up) {
-                at_query_t query =
-                    s_healthy_ppp_schedule[healthy_schedule_index];
-                healthy_schedule_index =
-                    (healthy_schedule_index + 1) %
-                    (sizeof(s_healthy_ppp_schedule) /
-                     sizeof(s_healthy_ppp_schedule[0]));
-                query_ok = poll_short_query(&st, query);
-            } else {
-                if (!identity_read) {
-                    read_identity(&st);
-                    identity_read = (st.imei[0] != '\0');
-                }
-                query_ok = poll_once(&st) > 0;
+            if (!identity_read) {
+                read_identity(&st);
+                identity_read = (st.imei[0] != '\0');
             }
-            if (!query_ok) {
+            if (poll_once(&st) == 0) {
                 // AT channel went dead (bad mode transition, modem reboot,
                 // leftover PPP...) — force a fresh sync + recovery cycle
                 healthy_polls = 0;
@@ -1608,25 +1353,21 @@ static void modem_task(void *arg)
                 }
             }
 
-            if (!ppp_up && st.at_ok && !gnss_on) {
+            if (st.at_ok && !gnss_on) {
                 gnss_on = gnss_power_on();
                 ESP_LOGI(TAG, "GNSS power-on %s", gnss_on ? "ok" : "failed; will retry");
                 xSemaphoreTake(s_status_mutex, portMAX_DELAY);
                 s_gnss.powered = gnss_on;
                 xSemaphoreGive(s_status_mutex);
             }
-            if (!ppp_up && st.at_ok && gnss_on) {
+            if (st.at_ok && gnss_on) {
                 gnss_poll();
-            }
-
-            if (!ppp_up && st.reg_status != 1 && st.reg_status != 5) {
-                st.packet_attached = false;
             }
 
             // Self-heal a rejected LTE attach: a named APN left in context 1
             // (by a previous dial) makes some networks deny registration
             // after a modem reboot. Blank the attach context and re-scan.
-            if (!ppp_up && st.reg_status == 3) {
+            if (st.reg_status == 3) {
                 if (++denied_polls >= 3) {
                     denied_polls = 0;
                     ESP_LOGW(TAG, "registration denied; blanking attach APN and re-scanning");
@@ -1634,14 +1375,12 @@ static void modem_task(void *arg)
                     at_cmd("AT+COPS=2", NULL, 0, 15000);
                     at_cmd("AT+COPS=0", NULL, 0, 15000);
                 }
-            } else if (!ppp_up) {
+            } else {
                 denied_polls = 0;
             }
 
             at_channel_release();
-        } else if (st.at_ok && poll_due &&
-                   poll_channel == AT_CHANNEL_PAUSE_FAILED &&
-                   ++pause_fails >= 2) {
+        } else if (st.at_ok && poll_due && ++pause_fails >= 2) {
             // Consecutive pause failures with PPP nominally up: the modem
             // stopped honoring "+++", most likely a reboot back to its
             // power-on baud (no LCP echo is configured, so lwIP never
@@ -1679,7 +1418,7 @@ static void modem_task(void *arg)
             esp_timer_get_time() - last_dial_us > (int64_t)CONNECT_RETRY_MS * 1000) {
             last_dial_us = esp_timer_get_time();
             bool attached = false;
-            if (at_channel_acquire(0) == AT_CHANNEL_ACQUIRED) {
+            if (at_channel_acquire()) {
                 attached = ps_attached();
                 at_channel_release();
             }
@@ -1689,7 +1428,6 @@ static void modem_task(void *arg)
             } else {
                 ESP_LOGI(TAG, "registered but PS not attached yet; delaying dial");
             }
-            st.packet_attached = attached;
             if ((int)attached != previous_packet_attached) {
                 char details[48];
                 snprintf(details, sizeof(details), "{\"attached\":%s}",

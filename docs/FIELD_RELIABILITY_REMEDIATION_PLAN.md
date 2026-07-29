@@ -591,6 +591,52 @@ Activation and remaining evidence:
   Automatic modem-reset escalation must remain disabled until both dry-run and
   clean-redial hardware evidence pass.
 
+#### Phase 2 regression and rollback — 2026-07-28
+
+Field evidence:
+
+- Anton recorded the first `7736d39` watchdog reboot 124 seconds after its
+  first boot check-in. Read-only production inspection later found 542 Phase 2
+  check-ins: 5 power-on, 22 interrupt-watchdog, and 515 panic resets. The
+  approximately two-minute panic loop began with the first activation and
+  continued after the field power cycle.
+- Telemetry and spool replay operated only in the short intervals between
+  resets. This explains the observed MQTT bursts without establishing stable
+  delivery or recovery.
+- The field SoftAP was usually unavailable because the existing WiFi state
+  machine disables it while retrying the stored STA network. Repeated panics
+  further shortened the periods in which the AP could become reachable.
+- The static UI loaded after one power cycle, but `/api/status` returned HTTP
+  500. That handler's only explicit 500 path is failure of
+  `cJSON_PrintUnformatted()`, so the full AP+BMS+SD workload exhausted or
+  fragmented the heap needed to encode the aggregate status response.
+
+Root cause and validation gap:
+
+- The third weighted healthy-PPP query called `gnss_poll_bounded()` from
+  `poll_short_query()`. Compiled stack frames for `modem_task`,
+  `poll_short_query`, `gnss_poll_bounded`, and `at_cmd` total 5,856 bytes
+  before entering `esp_modem_at_raw()` and its callees, but the modem task had
+  a 6,144-byte stack. The nested GNSS path therefore overflowed the stack.
+- Compiler stack checking and core dumps were disabled. The resulting memory
+  corruption surfaced as interrupt-watchdog and panic resets instead of a
+  captured stack-overflow diagnostic.
+- The bounded activation monitor ended around 102 seconds, after one
+  successful AT window but before the third weighted query and first reset.
+  Host policy tests did not exercise embedded stack usage, the complete
+  scheduler cycle, full status serialization, or AP+BMS+SD heap pressure.
+
+Rollback boundary:
+
+- Phase 2 runtime changes are withdrawn. The rollback restores the stable
+  Phase 1 runtime before a new artifact is published and flashed.
+- The rollback must be published before USB flashing so the production
+  manifest cannot reinstall `7736d39`.
+- Clean redial and automatic modem-reset escalation remain disabled. A future
+  Phase 2 attempt requires stack high-water evidence, allocation-safe status
+  serialization, the complete weighted schedule, AP+BMS+SD testing, and
+  production boot-ID observation beyond the prior failure boundary.
+
 ### Phase 3: Repair the local WiFi control plane
 
 Deliverables:

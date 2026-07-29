@@ -22,7 +22,6 @@ typedef struct {
     bool at_ok;             // modem responds to AT
     bool sim_ready;         // +CPIN: READY
     int reg_status;         // +CEREG stat: 1=home, 5=roaming, 2=searching, 0/3/4=not registered
-    bool packet_attached;   // last AT+CGATT state (PPP up also implies true)
     bool ppp_up;            // PPP session established, ESP32 has cellular IP connectivity
     bool pdp_active;        // same as ppp_up (kept for the LED / web UI)
     int rssi_dbm;           // 0 = unknown

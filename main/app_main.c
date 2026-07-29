@@ -5,13 +5,11 @@
 
 #include "bms.h"
 #include "board_battery.h"
-#include "connectivity_supervisor.h"
 #include "datalog.h"
 #include "event_journal.h"
 #include "led.h"
 #include "modem.h"
 #include "mqtt.h"
-#include "network_pause_gate.h"
 #include "ota.h"
 #include "sdcard.h"
 #include "timesync.h"
@@ -37,7 +35,6 @@ void app_main(void)
     sdcard_init(); // mount the microSD at /sdcard for later data logging;
                    // logs a warning and continues if no card is present
     event_journal_init(); // RAM diagnostics + non-blocking bounded SD journal
-    network_pause_gate_init(); // coordinates live-PPP AT and MQTT ACK windows
     modem_init();  // creates the status mutex the LED task reads through
     board_battery_init(); // V2.0 MAX17048; rejects USB-forced SOC readings
     led_init();
@@ -50,7 +47,6 @@ void app_main(void)
     mqtt_init();
     datalog_init();
     bms_init();
-    connectivity_supervisor_init(); // Phase 2 policy evidence; dry-run only
 
     ESP_LOGI(TAG, "up — if no home WiFi is stored/reachable, join "
                   "\"ESP32-SIM7670G\" (pass \"waveshare\") and open "

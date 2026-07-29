@@ -6,4 +6,3 @@ managed_components/
 .cache/
 .firecrawl/
 .playwright-mcp/
-__pycache__/
