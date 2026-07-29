@@ -746,10 +746,13 @@ Validation and activation status:
   the complete cJSON event tree.
 - The follow-up implementation visits one event at a time, streams
   `/api/status` one module fragment at a time, and defers routine OTA during
-  recent HTTP use. Fourteen host tests and an incremental pinned ESP-IDF
-  compile pass; an exact clean commit build and a separately approved reflash
-  remain required. OTA publication, clean-redial activation, and automatic
-  modem-reset escalation remain blocked.
+  recent HTTP use. Commit `45b49ac` passes all fourteen host tests and an exact
+  full-clean ESP-IDF 5.5/Python 3.10 build. The resulting application image is
+  1,385,440 bytes with SHA-256
+  `530b011ea40bdf75d015d7242779b6b30312474d8b6074f167ba8b3b3f6c0c74`.
+  A separately approved reflash remains required. OTA publication,
+  clean-redial activation, and automatic modem-reset escalation remain
+  blocked.
 - The BMS was not attached during this USB test. SD+BMS pressure, vehicle
   power, restored-coverage timing, and clean-redial behavior remain
   hardware-only acceptance gaps.
