@@ -750,9 +750,31 @@ Validation and activation status:
   full-clean ESP-IDF 5.5/Python 3.10 build. The resulting application image is
   1,385,440 bytes with SHA-256
   `530b011ea40bdf75d015d7242779b6b30312474d8b6074f167ba8b3b3f6c0c74`.
-  A separately approved reflash remains required. OTA publication,
-  clean-redial activation, and automatic modem-reset escalation remain
-  blocked.
+  After separate approval, exact commit `45b49ac` was rebuilt from a detached
+  clean worktree and directly flashed. The installed build is also 1,385,440
+  bytes and its flashed application artifact has SHA-256
+  `1a5252a73df1cda101df7ee9f937f2f689a3efc7070bac8aa4e98dad3d0c401d`.
+  ESP-IDF selected the native USB-JTAG port, identified the ESP32-S3, verified
+  every written region, and hard-reset the board.
+- Serial confirmed `45b49ac` running from `ota_0` with boot ID
+  `db8554786a27203d`, SD mounted, home WiFi, retained MQTT availability
+  acknowledgement, Verizon registration, PPP, and a successful 4/4 cellular
+  connectivity check. The device remained on that boot past 226 seconds with
+  zero PPP down/error events, zero pause failures, zero redial requests, and
+  zero restart requests.
+- Twenty consecutive `/api/status` plus `/api/events?limit=48` pairs returned
+  complete, valid HTTP 200 JSON responses across the routine OTA window. After
+  the browser UI check, the HTTP telemetry covered 71 requests with zero
+  response, serialization, or stream failures. Minimum free heap was 23,076
+  bytes, minimum largest free block was 10,752 bytes, and HTTP-task minimum
+  stack free was 4,572 bytes.
+- At 90 seconds, routine OTA correctly deferred with `http_quiet_period`;
+  there was no manifest TLS allocation attempt or transport interruption. The
+  browser populated live modem, GNSS, MQTT, WiFi, and firmware fields, showed
+  the local-control deferral, and did not show the API-unavailable banner.
+  This passes the bounded USB control-plane and dry-run transport test. OTA
+  publication, clean-redial activation, and automatic modem-reset escalation
+  remain blocked pending the remaining hardware evidence.
 - The BMS was not attached during this USB test. SD+BMS pressure, vehicle
   power, restored-coverage timing, and clean-redial behavior remain
   hardware-only acceptance gaps.
