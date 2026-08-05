@@ -58,8 +58,8 @@ typedef struct {
 } bms_status_t;
 
 // Start the polling task. Call after datalog_init(). With no BMS wired the
-// task probes quietly every 30 s; once the BMS has answered it polls
-// adaptively (1 s under load, 10 s idle) like esp32-bms-monitor.
+// task probes quietly every 30 s; once the BMS has answered it polls every
+// 10 s, charging or not.
 void bms_init(void);
 
 void bms_get_status(bms_status_t *out);

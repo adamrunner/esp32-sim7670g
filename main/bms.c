@@ -19,12 +19,11 @@ static const char *TAG = "bms";
 
 #define NVS_NS "bmscfg"
 
-// Poll cadence, matching esp32-bms-monitor's adaptive scheme.
-#define POLL_ACTIVE_MS   1000   // charging or discharging
-#define POLL_IDLE_MS     10000
+// Fixed poll cadence. An earlier adaptive scheme dropped to 1 s under load,
+// but the extra readings (and the MQTT/datalog traffic they generate) starve
+// the WebUI exactly when charging is most interesting to watch.
+#define POLL_MS          10000
 #define POLL_PROBE_MS    30000  // BMS has never answered (probably not wired yet)
-#define ACTIVE_CURRENT_A 0.5f
-#define ACTIVE_POWER_W   10.0f
 // Gaps longer than this (comms outage) don't integrate into the energy total.
 #define ENERGY_MAX_GAP_US (120LL * 1000000)
 
@@ -252,7 +251,7 @@ static void sim_reading(jbd_bms_data_t *d)
     bool compressor_on = cycle_s < 180;
     float current = compressor_on ? frand(-4.0f, -3.6f) : frand(-0.2f, -0.1f);
 
-    soc -= fabsf(current) / 100.0f / 36.0f;  // ~100 Ah pack, per ~1 s tick
+    soc -= fabsf(current) / 100.0f / 3.6f;  // ~100 Ah pack, per POLL_MS tick
     if (soc < 20.0f) {
         soc = 87.0f;
     }
@@ -332,7 +331,7 @@ static void bms_task(void *arg)
             s_status.poll_count++;
             xSemaphoreGive(s_mutex);
             publish_reading(&d);
-            vTaskDelay(pdMS_TO_TICKS(POLL_ACTIVE_MS));
+            vTaskDelay(pdMS_TO_TICKS(POLL_MS));
             continue;
         }
 
@@ -360,18 +359,16 @@ static void bms_task(void *arg)
             last_fail_log_us = 0;  // a future outage logs right away
             jbd_bms_handle_t *h = s_bms->handle;
             publish_reading(&h->data);
-            bool active = fabsf(h->data.packCurrent) > ACTIVE_CURRENT_A ||
-                          fabsf(h->data.power) > ACTIVE_POWER_W;
-            delay_ms = active ? POLL_ACTIVE_MS : POLL_IDLE_MS;
+            delay_ms = POLL_MS;
         } else if (ever_ok) {
-            // Was talking, went quiet: keep trying at the idle rate but
+            // Was talking, went quiet: keep trying at the normal rate but
             // don't spam the log.
             if (!last_fail_log_us ||
                 esp_timer_get_time() - last_fail_log_us > 60LL * 1000000) {
                 ESP_LOGW(TAG, "BMS not responding");
                 last_fail_log_us = esp_timer_get_time();
             }
-            delay_ms = POLL_IDLE_MS;
+            delay_ms = POLL_MS;
         } else {
             // Never seen: probably not wired yet. Probe quietly.
             if (!last_fail_log_us ||

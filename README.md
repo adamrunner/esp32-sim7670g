@@ -71,9 +71,8 @@ web UI for monitoring/configuring the cellular connection.
   wired backwards; changing them rebuilds the UART and re-probes from scratch.
   The protocol driver is the shared `jbd_bms` component
   from `../esp32-shared-components` (also used by `esp32-bms-monitor`).
-  Adaptive polling: 1 s while charging/discharging, 10 s idle, quiet 30 s
-  probes while no BMS has ever answered — the firmware runs fine with nothing
-  wired. A sim mode (web UI toggle, NVS `bmscfg/sim`) generates a plausible
+  Polling is a flat 10 s, charging or not, with quiet 30 s probes while no BMS
+  has ever answered — the firmware runs fine with nothing wired. A sim mode (web UI toggle, NVS `bmscfg/sim`) generates a plausible
   fridge-compressor duty cycle to exercise the telemetry pipeline end-to-end.
 - **Telemetry pipeline** (`main/datalog.c`) — every BMS reading becomes a CSV
   row byte-compatible with the `esp32-bms-monitor`/`bms-dashboard` schema
