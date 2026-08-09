@@ -3,11 +3,13 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "esp_event.h"
 #include "esp_http_server.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
@@ -43,7 +45,30 @@ typedef struct {
     uint32_t last_duration_ms;
     int last_error;
     char last_uri[48];
+    // Session/socket-layer evidence (LOCAL_WEBUI_STABILITY_PLAN.md Phase A).
+    uint32_t sessions_open;
+    uint32_t sessions_opened_total;
+    uint32_t sessions_closed_total;
+    uint32_t session_high_water;
+    uint32_t session_table_full_count;
+    uint32_t transport_error_count;
+    int last_transport_error_code;
+    uint32_t send_stall_count;
+    uint32_t max_chunk_send_ms;
+    uint32_t request_during_ota_count;
+    uint32_t duration_le_100ms;
+    uint32_t duration_le_500ms;
+    uint32_t duration_le_1000ms;
+    uint32_t duration_le_2500ms;
+    uint32_t duration_gt_2500ms;
 } webui_observability_t;
+
+// Client sessions the HTTP server may hold at once; the lwIP reservation
+// arithmetic behind this value is documented at the httpd_config below.
+#define WEBUI_MAX_CLIENT_SESSIONS 4
+// One response chunk blocking in send() at least this long counts as a
+// send stall (a slow, dead, or RF-degraded client pinning the HTTP task).
+#define WEBUI_SEND_STALL_THRESHOLD_MS 500
 
 static SemaphoreHandle_t s_http_mutex;
 static webui_observability_t s_http_status;
@@ -54,6 +79,76 @@ static webui_observability_t s_http_status;
 static bool s_current_response_error;
 static int s_current_http_status;
 static esp_err_t s_current_response_error_code;
+// Per-request send()-blocking accounting, same single-server-task pattern.
+static uint32_t s_current_max_chunk_send_ms;
+
+// Session lifecycle hooks. open_fn/close_fn run on the server task around
+// accept() and session teardown, so they see every socket the server holds —
+// including ones LRU purge reclaims. A full table is the precondition for
+// purging a live browser connection, which is one suspected cause of field
+// UI instability, so it is counted and journaled distinctly.
+static esp_err_t session_open_fn(httpd_handle_t server, int sockfd)
+{
+    uint32_t open_count;
+    xSemaphoreTake(s_http_mutex, portMAX_DELAY);
+    s_http_status.sessions_open++;
+    s_http_status.sessions_opened_total++;
+    if (s_http_status.sessions_open > s_http_status.session_high_water) {
+        s_http_status.session_high_water = s_http_status.sessions_open;
+    }
+    open_count = s_http_status.sessions_open;
+    if (open_count >= WEBUI_MAX_CLIENT_SESSIONS) {
+        s_http_status.session_table_full_count++;
+    }
+    xSemaphoreGive(s_http_mutex);
+
+    if (open_count >= WEBUI_MAX_CLIENT_SESSIONS) {
+        char details[96];
+        snprintf(details, sizeof(details),
+                 "{\"open\":%lu,\"max\":%d,\"heap\":%lu}",
+                 (unsigned long)open_count, WEBUI_MAX_CLIENT_SESSIONS,
+                 (unsigned long)esp_get_free_heap_size());
+        event_journal_emit(
+            "http", "session_table_full", EVENT_SEVERITY_WARN,
+            "lru_purge_possible", details, false, 30000
+        );
+    }
+    return ESP_OK;
+}
+
+static void session_close_fn(httpd_handle_t server, int sockfd)
+{
+    xSemaphoreTake(s_http_mutex, portMAX_DELAY);
+    if (s_http_status.sessions_open > 0) {
+        s_http_status.sessions_open--;
+    }
+    s_http_status.sessions_closed_total++;
+    xSemaphoreGive(s_http_mutex);
+    // A custom close_fn owns the descriptor; the server will not close it.
+    if (sockfd >= 0) {
+        close(sockfd);
+    }
+}
+
+static void http_server_event_handler(
+    void *arg, esp_event_base_t base, int32_t id, void *data
+)
+{
+    if (id != HTTP_SERVER_EVENT_ERROR) {
+        return;
+    }
+    int code = data ? (int)*(httpd_err_code_t *)data : -1;
+    xSemaphoreTake(s_http_mutex, portMAX_DELAY);
+    s_http_status.transport_error_count++;
+    s_http_status.last_transport_error_code = code;
+    xSemaphoreGive(s_http_mutex);
+    char details[48];
+    snprintf(details, sizeof(details), "{\"err_code\":%d}", code);
+    event_journal_emit(
+        "http", "server_error_event", EVENT_SEVERITY_WARN,
+        "httpd_transport_error", details, false, 30000
+    );
+}
 
 uint64_t webui_last_request_uptime_ms(void)
 {
@@ -139,6 +234,37 @@ static void webui_status_json(cJSON *root)
                             status.last_duration_ms);
     cJSON_AddNumberToObject(http, "last_error", status.last_error);
     cJSON_AddStringToObject(http, "last_uri", status.last_uri);
+    cJSON_AddNumberToObject(http, "sessions_open", status.sessions_open);
+    cJSON_AddNumberToObject(http, "sessions_opened_total",
+                            status.sessions_opened_total);
+    cJSON_AddNumberToObject(http, "sessions_closed_total",
+                            status.sessions_closed_total);
+    cJSON_AddNumberToObject(http, "session_high_water",
+                            status.session_high_water);
+    cJSON_AddNumberToObject(http, "session_table_full_count",
+                            status.session_table_full_count);
+    cJSON_AddNumberToObject(http, "transport_error_count",
+                            status.transport_error_count);
+    cJSON_AddNumberToObject(http, "last_transport_error_code",
+                            status.last_transport_error_code);
+    cJSON_AddNumberToObject(http, "send_stall_count",
+                            status.send_stall_count);
+    cJSON_AddNumberToObject(http, "max_chunk_send_ms",
+                            status.max_chunk_send_ms);
+    cJSON_AddNumberToObject(http, "request_during_ota_count",
+                            status.request_during_ota_count);
+    cJSON *durations =
+        cJSON_AddObjectToObject(http, "request_duration_counts");
+    cJSON_AddNumberToObject(durations, "le_100ms",
+                            status.duration_le_100ms);
+    cJSON_AddNumberToObject(durations, "le_500ms",
+                            status.duration_le_500ms);
+    cJSON_AddNumberToObject(durations, "le_1000ms",
+                            status.duration_le_1000ms);
+    cJSON_AddNumberToObject(durations, "le_2500ms",
+                            status.duration_le_2500ms);
+    cJSON_AddNumberToObject(durations, "gt_2500ms",
+                            status.duration_gt_2500ms);
 }
 
 static esp_err_t root_get_handler(httpd_req_t *req)
@@ -233,9 +359,15 @@ static bool json_stream_flush(json_stream_t *stream)
     if (stream->used == 0) {
         return true;
     }
+    int64_t send_started_us = esp_timer_get_time();
     stream->error = httpd_resp_send_chunk(
         stream->req, stream->chunk, stream->used
     );
+    uint32_t send_ms =
+        (uint32_t)((esp_timer_get_time() - send_started_us) / 1000);
+    if (send_ms > s_current_max_chunk_send_ms) {
+        s_current_max_chunk_send_ms = send_ms;
+    }
     stream->used = 0;
     if (stream->error == ESP_OK) {
         stream->sent = true;
@@ -1020,12 +1152,33 @@ static esp_err_t observed_handler(httpd_req_t *req)
     s_current_response_error = false;
     s_current_http_status = 200;
     s_current_response_error_code = ESP_OK;
+    s_current_max_chunk_send_ms = 0;
+    bool ota_transport_active = ota_busy();
     xSemaphoreTake(s_http_mutex, portMAX_DELAY);
     s_http_status.request_count++;
     s_http_status.last_request_uptime_ms = (uint64_t)started_us / 1000U;
     strlcpy(s_http_status.last_uri, req->uri,
             sizeof(s_http_status.last_uri));
+    if (ota_transport_active) {
+        s_http_status.request_during_ota_count++;
+    }
     xSemaphoreGive(s_http_mutex);
+    if (ota_transport_active) {
+        // Field hypothesis under test: a routine OTA TLS transfer starts
+        // during a quiet gap (e.g. phone screen lock), then the operator
+        // resumes polling mid-transfer and both paths degrade. Record the
+        // overlap so soak/field evidence can confirm or rule it out.
+        char details[96];
+        snprintf(details, sizeof(details),
+                 "{\"uri\":\"%.31s\",\"heap\":%lu,\"largest\":%lu}",
+                 req->uri, (unsigned long)esp_get_free_heap_size(),
+                 (unsigned long)heap_caps_get_largest_free_block(
+                     MALLOC_CAP_8BIT));
+        event_journal_emit(
+            "http", "request_during_ota", EVENT_SEVERITY_INFO,
+            "ota_transport_overlap", details, false, 60000
+        );
+    }
 
     webui_handler_t handler = (webui_handler_t)req->user_ctx;
     esp_err_t result = handler(req);
@@ -1042,6 +1195,25 @@ static esp_err_t observed_handler(httpd_req_t *req)
         (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     xSemaphoreTake(s_http_mutex, portMAX_DELAY);
     s_http_status.last_duration_ms = duration_ms;
+    if (duration_ms <= 100) {
+        s_http_status.duration_le_100ms++;
+    } else if (duration_ms <= 500) {
+        s_http_status.duration_le_500ms++;
+    } else if (duration_ms <= 1000) {
+        s_http_status.duration_le_1000ms++;
+    } else if (duration_ms <= 2500) {
+        s_http_status.duration_le_2500ms++;
+    } else {
+        s_http_status.duration_gt_2500ms++;
+    }
+    if (s_current_max_chunk_send_ms > s_http_status.max_chunk_send_ms) {
+        s_http_status.max_chunk_send_ms = s_current_max_chunk_send_ms;
+    }
+    bool send_stalled =
+        s_current_max_chunk_send_ms >= WEBUI_SEND_STALL_THRESHOLD_MS;
+    if (send_stalled) {
+        s_http_status.send_stall_count++;
+    }
     update_resource_minimum(
         &s_http_status.min_task_stack_free, task_stack_free
     );
@@ -1086,6 +1258,19 @@ static esp_err_t observed_handler(httpd_req_t *req)
             details, failed, 30000
         );
     }
+    if (send_stalled) {
+        char stall_details[96];
+        snprintf(
+            stall_details, sizeof(stall_details),
+            "{\"uri\":\"%.31s\",\"chunk_ms\":%lu,\"ms\":%lu}",
+            req->uri, (unsigned long)s_current_max_chunk_send_ms,
+            (unsigned long)duration_ms
+        );
+        event_journal_emit(
+            "http", "send_stall", EVENT_SEVERITY_WARN,
+            "slow_client_send", stall_details, false, 30000
+        );
+    }
     return result;
 }
 
@@ -1097,9 +1282,21 @@ void webui_init(void)
     // The server also owns three internal sockets. Four client sessions keep
     // its total at seven of the ten lwIP slots, reserving three for MQTT, OTA,
     // and transient outbound work.
-    cfg.max_open_sockets = 4;
+    cfg.max_open_sockets = WEBUI_MAX_CLIENT_SESSIONS;
     cfg.max_uri_handlers = 18;  // default 8; observability adds /api/events
     cfg.stack_size = 8192;  // ping/DNS handler keeps sizeable buffers on the stack
+    // A dead or RF-degraded client otherwise pins the single server task in
+    // send()/recv() for the default 5 s per call while every other poll
+    // request queues behind it and exceeds the browser's abort deadline.
+    cfg.recv_wait_timeout = 2;
+    cfg.send_wait_timeout = 2;
+    cfg.open_fn = session_open_fn;
+    cfg.close_fn = session_close_fn;
+
+    ESP_ERROR_CHECK(esp_event_handler_register(
+        ESP_HTTP_SERVER_EVENT, HTTP_SERVER_EVENT_ERROR,
+        &http_server_event_handler, NULL
+    ));
 
     httpd_handle_t server = NULL;
     ESP_ERROR_CHECK(httpd_start(&server, &cfg));

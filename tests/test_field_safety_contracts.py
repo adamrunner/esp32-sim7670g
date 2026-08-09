@@ -73,7 +73,11 @@ class FieldSafetyContractTests(unittest.TestCase):
             REPOSITORY_ROOT / "sdkconfig.defaults"
         ).read_text()
 
-        self.assertIn("cfg.max_open_sockets = 4;", webui_source)
+        self.assertIn("#define WEBUI_MAX_CLIENT_SESSIONS 4", webui_source)
+        self.assertIn(
+            "cfg.max_open_sockets = WEBUI_MAX_CLIENT_SESSIONS;",
+            webui_source,
+        )
         self.assertIn(
             "CONFIG_LWIP_MAX_SOCKETS=10",
             sdkconfig_defaults,
@@ -104,6 +108,38 @@ class FieldSafetyContractTests(unittest.TestCase):
         self.assertIn('id="otaerrormsg"', html)
         self.assertIn('id="otadefermsg"', html)
         self.assertIn('"/api/ota/check"', webui_source)
+
+    def test_webui_instruments_the_session_and_socket_layer(self):
+        webui_source = (
+            REPOSITORY_ROOT / "main" / "webui.c"
+        ).read_text()
+
+        # Session lifecycle hooks are wired and the custom close_fn owns
+        # the descriptor (the server does not close it when close_fn is set).
+        self.assertIn("cfg.open_fn = session_open_fn;", webui_source)
+        self.assertIn("cfg.close_fn = session_close_fn;", webui_source)
+        self.assertIn("close(sockfd);", webui_source)
+
+        # A dead client may not pin the single server task for the default
+        # five seconds per send/recv call.
+        self.assertIn("cfg.recv_wait_timeout = 2;", webui_source)
+        self.assertIn("cfg.send_wait_timeout = 2;", webui_source)
+
+        # Distinct journal evidence for each suspected field mechanism:
+        # table saturation (LRU purge precondition), transport errors,
+        # slow-client send stalls, and polling during OTA transport.
+        self.assertIn('"session_table_full"', webui_source)
+        self.assertIn("HTTP_SERVER_EVENT_ERROR", webui_source)
+        self.assertIn('"send_stall"', webui_source)
+        self.assertIn('"request_during_ota"', webui_source)
+
+        # The counters behind the soak-test acceptance metrics are exposed.
+        self.assertIn('"session_high_water"', webui_source)
+        self.assertIn('"session_table_full_count"', webui_source)
+        self.assertIn('"send_stall_count"', webui_source)
+        self.assertIn('"max_chunk_send_ms"', webui_source)
+        self.assertIn('"request_during_ota_count"', webui_source)
+        self.assertIn('"request_duration_counts"', webui_source)
 
 
 if __name__ == "__main__":

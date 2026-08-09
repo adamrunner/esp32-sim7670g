@@ -1,6 +1,7 @@
 build/
 sdkconfig
 sdkconfig.old
+__pycache__/
 managed_components/
 .vscode/
 .cache/
