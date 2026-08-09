@@ -219,6 +219,29 @@ Acceptance definition (used by every later phase):
   only — hardware flash, the first instrumented soak run, and OTA
   publication remain separate approval gates.
 
+OTA publication update — 2026-08-08:
+
+- After explicit approval, the Phase A head `bba2413` was pushed to
+  GitHub and rebuilt/published through `tools/release.sh` with the pinned
+  ESP-IDF 5.5/Python 3.10 environment.
+- The published `esp32-sim7670g-bba2413.bin` is 1,391,296 bytes with
+  SHA-256
+  `cae122ae46f007045dd76faead95bd2ba68617e9d6aab0617855caf6c52e719d`.
+  The atomically replaced manifest was verified externally: fresh version,
+  full-download size and checksum, and a 1,024-byte HTTP Range request
+  answered with status 206.
+- No USB flash occurred. The field device is expected to install
+  `bba2413` at its next OTA window (checks defer while a SoftAP client is
+  associated and during the post-use quiet periods). Acceptance of Phase A
+  requires device-local or production evidence of `bba2413` running,
+  followed by field `/api/status.http` and `/api/events` review after
+  real SoftAP use.
+- The chosen field-evidence path: gather organic SoftAP-session counters
+  first; the controlled `tools/webui_soak.py --churn --slow-reader` bench
+  run (which requires forgetting the stored home network to force SoftAP
+  indoors) is deferred unless field evidence is inconclusive.
+- Automatic supervisor redial and modem-reset escalation remain disabled.
+
 ### Phase B: Enable PSRAM (8 MB)
 
 Promoted to second because it multiplies the margin every other phase
