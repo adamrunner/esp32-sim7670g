@@ -1,8 +1,9 @@
 # Local WebUI Stability Plan
 
-Status: proposed
+Status: in progress — Phase A complete and accepted on field evidence
+(2026-08-17); Phase B is next.
 
-Evidence date: 2026-08-08
+Evidence date: 2026-08-08 (diagnosis), 2026-08-17 (Phase A field results)
 
 Scope: the local control plane only — the SoftAP, the embedded HTTP server,
 and the browser dashboard — when an operator is connected directly to the
@@ -242,6 +243,90 @@ OTA publication update — 2026-08-08:
   indoors) is deferred unless field evidence is inconclusive.
 - Automatic supervisor redial and modem-reset escalation remain disabled.
 
+#### Phase A field evidence — 2026-08-17
+
+Deployment confirmed first: `bba2413` installed by OTA on 2026-08-09 18:29:59
+PDT and reported `ota_verified` nine seconds later, running from `ota_0` with
+`pending_verify: false` and no rollback. `c5c48b4` remains in `ota_1`.
+
+Evidence was then gathered from a genuine operator session rather than a bench
+run: the operator joined the SoftAP in the vehicle, used the dashboard, and
+switched on the fridge while watching pack current respond in the UI. Device
+`gw-e3aba4`, boot `3e55643ee22309c4`, uptime ~75 h at capture. The HTTP
+counters and the 48-slot ring are RAM-only, so these are this boot's totals.
+
+`/api/status.http` after the session:
+
+- 825 requests with `failure_count: 0`, `response_error_count: 0`,
+  `serialization_failure_count: 0`, `stream_failure_count: 0`.
+- `request_duration_counts`: 821 ≤100 ms, 2 ≤500 ms, 1 ≤1000 ms, none above.
+- `min_free_heap: 9944`, `min_largest_free_block: 2560`,
+  `min_task_stack_free: 4512`.
+- `sessions_opened_total: 28`, `sessions_closed_total: 26`,
+  `session_high_water: 4`, `session_table_full_count: 13`.
+- `send_stall_count: 1`, `max_chunk_send_ms: 956`.
+- `transport_error_count: 18`, `last_transport_error_code: 6`.
+- `request_during_ota_count: 0`.
+
+Verdict against the shared acceptance bar: **passes on success rate and
+latency, fails on heap.** p95 is far below the 1 s target and no `ENFILE`
+occurred, but `min_free_heap` of 9,944 bytes is well under the 15 KB floor,
+and one error banner did occur (see below).
+
+What the counters settle:
+
+- **L1 (session/socket fragility) — confirmed.** `session_table_full_count: 13`
+  with `session_high_water` pinned at the maximum of 4 means the table
+  saturated thirteen times, each an interval in which LRU purge can evict the
+  live poll socket. The journal caught one directly:
+  `http/session_table_full` `{"open":4,"max":4,"heap":28020}`. One slow-client
+  stall was also observed — `http/send_stall`
+  `{"uri":"/api/status","chunk_ms":956,"ms":1000}` — a chunk blocked for
+  nearly a second on the single server task.
+- **L2 (thin internal RAM) — confirmed, and worse than the summary counters
+  suggest.** The single failed request journaled
+  `{"uri":"/api/status","ms":41,"error":45062,"heap":21192,"largest":5632,`
+  `"stack":4512,"min_heap":840}`. `error 45062` is `ESP_ERR_HTTPD_RESP_SEND`
+  (0xB006), a client vanishing mid-response. `min_heap` is
+  `esp_get_minimum_free_heap_size()`, i.e. the all-time system low since boot:
+  **840 bytes**. `min_largest_free_block: 2560` also sits inside the
+  1,920–2,944 byte band where this system has historically failed TLS
+  allocations. The historical minimums quoted in L2 above are not stale — they
+  are still current behavior on `bba2413`.
+- **L4 (polling cost) — not a current problem.** 821 of 824 completed requests
+  finished in ≤100 ms, so the 2.5 s client deadline is not being missed on
+  handler latency. Phase D remains worth doing to shrink exposure, but it is
+  not what the operator was feeling.
+- **L5 (blocking AT/ping) — untested by design.** The operator did not use
+  either feature, consistent with the 2026-08-08 evidence.
+- **Quiet-period/TLS collision hypothesis — still unresolved.** An OTA check
+  did run during the session (`ota/state_changed` 0→1→1→0), but
+  `request_during_ota_count: 0` means no WebUI request overlapped it. Neither
+  confirmed nor ruled out.
+
+Independent corroboration from the production side: a broker subscription on
+`bms/status/+` watched the whole session and recorded no `mqtt_reconnected`
+status event. Compare the `c5c48b4` history, which logged fifteen
+`mqtt_reconnected` events between 2026-08-08 21:27 and 2026-08-09 01:29. The
+control-plane deference added in `6cf9a16` and the socket budget from `4d9759d`
+are doing their job: an operator can now use the local UI without destabilizing
+cellular transport. Field telemetry cadence over the same period held at a
+9.88 s average against the flat 10 s poll from `c5c48b4`.
+
+Instrumentation defect found by this capture, to be fixed in Phase C:
+`transport_error_count` and its `httpd_transport_error` journal reason are
+mislabeled. `HTTP_SERVER_EVENT_ERROR` delivers an `httpd_err_code_t`, not a
+socket error, and code `6` is `HTTPD_404_NOT_FOUND` — so the 18 counted
+"transport errors" are ordinary 404s (favicon and similar browser probes).
+Rename to reflect HTTP status errors and count genuine transport failures
+separately, or the counter will keep overstating trouble.
+
+Conclusion: Phase A's deliverable is complete — the suspected mechanisms are
+now observable, and a real field baseline exists. That baseline fails the
+shared acceptance bar on heap headroom and confirms L1 session saturation,
+which together are the entry criteria for Phase B and then Phase C. Phase D
+drops in priority on this evidence.
+
 ### Phase B: Enable PSRAM (8 MB)
 
 Promoted to second because it multiplies the margin every other phase
@@ -273,6 +358,11 @@ Exit criteria:
   the historical contiguous-allocation failures; internal min free heap
   stays comfortably above the Phase A bar; no WiFi/PPP throughput
   regression (PPP transfer rate within 10% of the 460800-baud baseline).
+- Measure against the 2026-08-17 pre-PSRAM field baseline, so the gain is a
+  number rather than an impression: `http.min_free_heap` 9,944 bytes,
+  `http.min_largest_free_block` 2,560 bytes, and an all-time
+  `esp_get_minimum_free_heap_size()` of 840 bytes. The 15 KB acceptance floor
+  is the target for the first of these.
 - Known risk to respect: PSRAM changes cache/timing behavior globally.
   Treat this as its own flash-gated experiment with a straightforward
   rollback (config revert), and run the full soak — not just a boot check —
@@ -301,6 +391,11 @@ Deliverables:
   are associated but no request has completed within a threshold while
   attempts are arriving, journal and `httpd_stop()`/`httpd_start()`.
   Restart-not-reboot.
+- Correct the mislabeled error counter found by the Phase A field capture:
+  `HTTP_SERVER_EVENT_ERROR` carries an `httpd_err_code_t` (status-level, e.g.
+  `HTTPD_404_NOT_FOUND`), not a socket error. Count HTTP status errors and
+  genuine transport failures as separate quantities so 404s stop inflating
+  `transport_error_count`.
 
 Exit criteria:
 
