@@ -1,11 +1,10 @@
 # Local WebUI Stability Plan
 
 Status: in progress — Phase A complete and accepted on field evidence
-(2026-08-17). Phase B is published as `b062302` and passes the shared
-acceptance bar on the WebUI path, but is **not accepted**: an OTA download
-under polling load still reproduced the historical TLS allocation failure
-(2026-08-17). mbedTLS-in-PSRAM is now an evidence-backed next step rather
-than a speculative one.
+(2026-08-17). Phase B: PSRAM plus mbedTLS-in-PSRAM (`646ead9`) now clears
+every heap criterion including the OTA/TLS one that `b062302` failed
+(2026-08-17). `646ead9` is measured but **not published**, so the field
+device still runs `b062302`; the BMS/SD field re-check also remains open.
 
 Evidence date: 2026-08-08 (diagnosis), 2026-08-17 (Phase A field results)
 
@@ -701,6 +700,76 @@ PSRAM — measured by repeating exactly this OTA-under-polling test, since it
 now has a known, reproducible failure to beat. One change, one measurement,
 as before. Lowering `SPIRAM_MALLOC_ALWAYSINTERNAL` is the fallback if that is
 insufficient; `SPIRAM_TRY_ALLOCATE_WIFI_LWIP` remains last.
+
+#### Phase B, mbedTLS in PSRAM — 2026-08-17
+
+The first gated extra, taken on its own as the plan requires. Single knob:
+`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y` replacing the IDF default
+`CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC`; the regenerated `sdkconfig` differs from
+its predecessor by exactly those two lines. `CONFIG_MBEDTLS_DYNAMIC_BUFFER`
+was left alone — it governs *when* TLS buffers are allocated, this governs
+*where*. `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP` remains off and unmeasured.
+
+Measured by repeating the failing test exactly: `646ead9` flashed over USB
+while the manifest still named `b062302`, so a manual check pulled a 1.4 MB
+image over TLS with two poll clients running. Same operation, same load, same
+manifest; the only difference is where TLS allocates.
+
+| | TLS internal (`b062302`) | TLS in PSRAM (`646ead9`) |
+|---|---|---|
+| before download: `largest` | 10,752 | **27,648** |
+| before download: `minimum` | 16,675 | **43,203** |
+| download attempts | 2 (first died at 786,432) | **1** |
+| TLS failure | `mbedtls=0x7f00` `ALLOC_FAILED` | **none** |
+| all-time internal low after | **1,487** | **24,187** |
+| throughput | 24 KB/s | 24 KB/s |
+
+**The criterion passes.** No allocation failure occurred, the image verified
+against the manifest sha256 on the first attempt, and the all-time internal
+low of 24,187 bytes clears the 15 KB floor *under TLS plus polling* — the one
+condition Phase B had previously failed.
+
+The mechanism was observed directly rather than inferred: `psram_free` fell
+8,355,204 → 8,331,712 across the handshake, so roughly 23 KB of TLS
+allocation moved off internal RAM. The option is doing work, not sitting
+inert because a dependency was unmet.
+
+Throughput is unchanged at 24 KB/s against the 25–34 KB/s baseline, still
+measured under concurrent poll load the baseline never had, so moving TLS
+buffers into slower external RAM cost no measurable transfer rate here.
+
+The WebUI stayed healthy for the whole download: 330 polls, zero failures,
+p95 rising from ~109 ms idle to ~336 ms during the transfer — a third of the
+1 s target. The first sample of the transfer hit 1,228 ms as it spun up,
+which is the OTA/polling contention this plan predicted under L2, and it
+recovered immediately.
+
+Caveat on the measurement, recorded rather than buried: the attempt resumed
+from a stale 262,144-byte offset held in the `otares` NVS namespace (keyed by
+version and sha, and NVS survives a USB flash), so it transferred 1,136,688
+bytes rather than the full image. That is still 1.45× the 786,432 bytes the
+failing build managed before dying, and the internal minimum never came near
+the failure band — but a from-zero download would remove the caveat entirely
+and is worth doing when the resume state is next clear.
+
+Consequence of testing this way: on success the device installed `b062302` —
+the build the manifest names — and rebooted into it, self-tested over HTTPS
+and marked itself valid. So the improvement is **measured but not deployed**;
+`646ead9` sits in `ota_0` and the running image is still the one with the
+known TLS failure. Publishing `646ead9` is the outstanding decision.
+
+Phase B exit criteria, revised again:
+
+| criterion | result |
+|---|---|
+| clean boot, memory test passes | pass |
+| soak with BMS + SD active | still not run (BMS/SD absent) |
+| explicit OTA check during polling, no allocation failure | **pass on `646ead9`** |
+| internal min free heap above the Phase A bar | pass, WebUI *and* TLS |
+| no PPP throughput regression | pass (24 KB/s, unchanged) |
+
+The only criterion still outstanding is the BMS + SD load, which needs the
+gateway back on the pack in the vehicle.
 
 ### Phase C: Session and socket robustness
 
