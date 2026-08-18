@@ -1,9 +1,11 @@
 # Local WebUI Stability Plan
 
 Status: in progress — Phase A complete and accepted on field evidence
-(2026-08-17); Phase B conditionally accepted (2026-08-17): the shared
-acceptance bar passes on a bench SoftAP soak, with a BMS/SD load gap recorded
-below that a field re-check must close.
+(2026-08-17). Phase B is published as `b062302` and passes the shared
+acceptance bar on the WebUI path, but is **not accepted**: an OTA download
+under polling load still reproduced the historical TLS allocation failure
+(2026-08-17). mbedTLS-in-PSRAM is now an evidence-backed next step rather
+than a speculative one.
 
 Evidence date: 2026-08-08 (diagnosis), 2026-08-17 (Phase A field results)
 
@@ -618,6 +620,87 @@ field re-check with the pack connected must confirm the heap result under real
 BMS + SD load before the phase is closed outright. A synthetic-BMS re-soak
 (`POST /api/bms {"sim":true}`) was considered and deliberately declined, to
 keep fabricated rows out of the SD log and the production broker.
+
+#### Phase B OTA and TLS evidence — 2026-08-17
+
+`b062302` was published through `tools/release.sh` (1,398,832 bytes, sha256
+`c72f9ee0b5424cf340b8620e04864cb2ef206518815a31bcf08eac1f4d847fb6`, manifest
+verified externally with a Range request answering 206). Publishing first was
+a deliberate inversion of the plan's ordering: a manual OTA check bypasses all
+deference *and* auto-installs any version mismatch, so the "explicit check
+during polling" criterion can only be exercised non-destructively once the
+manifest names the running build. The install itself then supplied the
+cellular-transfer measurement.
+
+The check ran with two poll clients active and the device on cellular only
+(STA credentials cleared for the soak, so PPP was the only route).
+
+**The criterion failed.** The manifest fetch and the first 786,432 bytes
+succeeded, then:
+
+```
+ota: download_transfer failed: esp=ESP_FAIL
+     tls=ESP_ERR_MBEDTLS_SSL_HANDSHAKE_FAILED mbedtls=0x7f00
+     flags=0x0 errno=0 heap=21383 largest=4608 minimum=1743
+```
+
+`mbedtls=0x7f00` is `MBEDTLS_ERR_SSL_ALLOC_FAILED` — an out-of-memory failure
+inside the TLS handshake, i.e. **exactly the historical failure mode Phase B
+was meant to remove**, reproduced with PSRAM enabled and 8.35 MB of external
+heap free at the time. The all-time internal low reached 1,743 bytes during
+the attempt and 1,487 bytes by the end of the cycle, against the 840-byte
+pre-PSRAM record. Enabling PSRAM did not move this failure, because mbedTLS
+allocations are still internal by construction:
+`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC` is deliberately off as an evidence-gated
+extra. That gate is now backed by evidence.
+
+The corollary matters for how the soak result is read: the 15 KB floor holds
+comfortably for WebUI polling alone (19,095 bytes all-time in the soak), but
+not once TLS is in the picture. Even the post-reboot self-test — one HTTPS
+connection with light polling — drove the all-time internal low to 13,367
+bytes, already under the floor. **Phase B raised the WebUI path well clear of
+the bar and left the TLS path essentially where it was.**
+
+What worked, and is worth keeping on the record:
+
+- The passive-retry and resume architecture from the earlier phases handled a
+  real allocation failure exactly as designed: no modem redial, a passive
+  wait, then `resuming download at 786432/1398832 bytes`, completing with
+  `sha256 verified against manifest`. The failure cost a retry, not a
+  transport teardown.
+- **PPP throughput shows no regression.** The resumed transfer moved 612,400
+  bytes in 24,703 ms — **24 KB/s**, against the 25–34 KB/s baseline for
+  460800 baud, and measured *under concurrent poll load* the baseline never
+  had. Earlier mid-flight samples suggesting 6–13 KB/s were spanning the
+  stall and failure window, not clean throughput. The cache/timing regression
+  this phase's risk note warned about did not materialise.
+- Rollback safety behaved: the new image booted pending-verify, self-tested
+  over HTTPS, and marked itself valid 38 s in.
+
+Instrumentation defect found by this run, for Phase C alongside the
+mislabeled error counter: `request_during_ota_count` is RAM-only, so when an
+OTA check ends in an install the reboot destroys the very counter that
+recorded the overlap. It read 0 afterwards despite polling having run
+throughout the download. The quiet-period/TLS collision probe needs to
+survive the event it measures — journal it (the SD journal spans boots)
+rather than relying on the counter alone.
+
+Revised verdict on the Phase B exit criteria:
+
+| criterion | result |
+|---|---|
+| clean boot, memory test passes | pass |
+| soak with BMS + SD active | not run (BMS/SD absent; see above) |
+| explicit OTA check during polling, no allocation failure | **fail** |
+| internal min free heap above the Phase A bar | pass for WebUI, fail under TLS |
+| no PPP throughput regression | pass (24 KB/s under load) |
+
+Phase B therefore **stays open**. The next step is the first gated extra on
+its own — `CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC`, moving TLS allocations to
+PSRAM — measured by repeating exactly this OTA-under-polling test, since it
+now has a known, reproducible failure to beat. One change, one measurement,
+as before. Lowering `SPIRAM_MALLOC_ALWAYSINTERNAL` is the fallback if that is
+insufficient; `SPIRAM_TRY_ALLOCATE_WIFI_LWIP` remains last.
 
 ### Phase C: Session and socket robustness
 
