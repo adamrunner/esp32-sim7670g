@@ -1,10 +1,10 @@
 # Local WebUI Stability Plan
 
 Status: in progress — Phase A complete and accepted on field evidence
-(2026-08-17). Phase B: PSRAM plus mbedTLS-in-PSRAM (`646ead9`) now clears
-every heap criterion including the OTA/TLS one that `b062302` failed
-(2026-08-17). `646ead9` is measured but **not published**, so the field
-device still runs `b062302`; the BMS/SD field re-check also remains open.
+(2026-08-17). Phase B: PSRAM plus mbedTLS-in-PSRAM is published as `bffd324`
+and running on the device (2026-08-17). Four of five exit criteria pass; only
+the BMS + SD load soak is outstanding, pending the gateway's return to the
+pack.
 
 Evidence date: 2026-08-08 (diagnosis), 2026-08-17 (Phase A field results)
 
@@ -754,9 +754,23 @@ and is worth doing when the resume state is next clear.
 
 Consequence of testing this way: on success the device installed `b062302` —
 the build the manifest names — and rebooted into it, self-tested over HTTPS
-and marked itself valid. So the improvement is **measured but not deployed**;
-`646ead9` sits in `ota_0` and the running image is still the one with the
-known TLS failure. Publishing `646ead9` is the outstanding decision.
+and marked itself valid, leaving the improvement measured but not deployed.
+
+Publication followed, after approval: `bffd324` (the mbedTLS change plus this
+record) was published through `tools/release.sh` — 1,398,816 bytes, sha256
+`cdeeeb8409f80461bcb4c780acce3f57b9fc07a0397e7915f7e28c6913083446`, manifest
+verified externally with a Range request answering 206. The device pulled and
+installed it over WiFi in about 75 seconds, self-tested, and marked itself
+valid.
+
+Deployed-build confirmation, which is the check that matters more than the
+bench numbers: `free_psram` reads 8,345,296 rather than the full 8,388,608,
+so mbedTLS is allocating externally on the shipped image — roughly 10 KB of
+TLS state living in PSRAM. The all-time internal low sits at 58,963 bytes on
+a boot with TLS active, against 13,367 for a single HTTPS connection on
+`b062302`, and `largest_free_block` reads 31,744 where the previous build
+showed 7,936 mid-TLS. WiFi, cellular (PPP re-dialled to Verizon, RSSI −57),
+MQTT and SD all healthy afterwards.
 
 Phase B exit criteria, revised again:
 
