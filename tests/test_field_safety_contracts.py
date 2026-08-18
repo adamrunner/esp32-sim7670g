@@ -157,13 +157,21 @@ class FieldSafetyContractTests(unittest.TestCase):
         for option in required:
             self.assertIn(option, sdkconfig_defaults)
 
-        # Each of these is a separate evidence-gated measurement, not part of
-        # the Phase B bring-up bundle.
-        for deferred in (
-            "CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y",
-            "CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y",
-        ):
-            self.assertNotIn(deferred, sdkconfig_defaults)
+        # Still a separate evidence-gated measurement, not yet taken.
+        self.assertNotIn(
+            "CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y", sdkconfig_defaults
+        )
+
+        # mbedTLS in PSRAM was the first gated extra, enabled once an OTA
+        # download under polling reproduced MBEDTLS_ERR_SSL_ALLOC_FAILED with
+        # PSRAM on. It replaces the internal-alloc default, so both halves of
+        # the choice must agree or the build silently keeps TLS internal.
+        self.assertIn("CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y", sdkconfig_defaults)
+        self.assertIn(
+            "# CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC is not set",
+            sdkconfig_defaults,
+        )
+        required = required + ("CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y",)
 
         # The standing gotcha: sdkconfig.defaults does not propagate into an
         # already-generated sdkconfig. When one exists locally it must agree,

@@ -84,7 +84,20 @@ CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
 # SPI cache is down; not handed out to ordinary malloc() (IDF default).
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
 #
-# Deliberately NOT enabled here — each is its own evidence-gated measurement
-# once the PSRAM baseline is recorded (see the Phase B deliverables):
+# Deliberately NOT enabled here — its own evidence-gated measurement, still
+# unmeasured (see the Phase B deliverables):
 # CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP is not set
-# CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC is not set
+
+# mbedTLS allocates from PSRAM instead of internal RAM. This is the first
+# gated extra, enabled on evidence rather than expectation: with PSRAM on but
+# this off, an OTA download under WebUI polling still died with
+# mbedtls=0x7f00 (MBEDTLS_ERR_SSL_ALLOC_FAILED) at an internal low of 1,743
+# bytes while 8.35 MB of external heap sat free — the TLS handshake allocates
+# internally by construction, so PSRAM could not help it. Full evidence in
+# docs/LOCAL_WEBUI_STABILITY_PLAN.md, "Phase B OTA and TLS evidence".
+#
+# Replaces the IDF default CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC. Kept alongside
+# CONFIG_MBEDTLS_DYNAMIC_BUFFER above, which is an independent option: it
+# controls *when* TLS buffers are allocated, this controls *where*.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+# CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC is not set
