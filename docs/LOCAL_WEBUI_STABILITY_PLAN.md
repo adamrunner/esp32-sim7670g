@@ -1,8 +1,9 @@
 # Local WebUI Stability Plan
 
 Status: in progress — Phase A complete and accepted on field evidence
-(2026-08-17); Phase B built, flashed, and confirmed on hardware (2026-08-17),
-with the acceptance soak deferred and OTA publication not performed.
+(2026-08-17); Phase B conditionally accepted (2026-08-17): the shared
+acceptance bar passes on a bench SoftAP soak, with a BMS/SD load gap recorded
+below that a field re-check must close.
 
 Evidence date: 2026-08-08 (diagnosis), 2026-08-17 (Phase A field results)
 
@@ -550,6 +551,73 @@ Deliberately not done, and why:
   routine check. That is the intended config-revert rollback rather than a
   failure — but it means the PSRAM build does not persist in the field
   without a publication, and a future soak needs a fresh USB flash first.
+
+#### Phase B acceptance soak — 2026-08-17 (bench, SoftAP)
+
+Run indoors on the same unit, forced onto SoftAP by clearing the stored STA
+credentials (`POST /api/wifi {"ssid":""}`) — the indoor STA network otherwise
+takes the AP down. The laptop joined the SoftAP for the soak while keeping
+internet on ethernet; the local-only SoftAP design from `8ff3076` is what made
+that possible, since the AP offers no router or DNS and therefore never became
+the default route. Device rebooted first, so all counters below are this run.
+
+`tools/webui_soak.py --host 192.168.4.1 --minutes 30 --clients 2 --churn
+--slow-reader`:
+
+| metric | Phase A (`bba2413`) | this soak (`9a1bc10`) |
+|---|---|---|
+| polls succeeded | — | 5,388 / 5,388 (100%) |
+| p50 / p95 / max latency | — | 57.8 / 109.8 / 322 ms |
+| `min_free_heap` | 9,944 | **33,531** |
+| `min_largest_free_block` | 2,560 | **10,240** |
+| all-time internal low | **840** | **19,095** |
+| `max_chunk_send_ms` | 956 | 11 |
+| `send_stall_count` | 1 | 0 |
+| `session_high_water` | 4 | 4 |
+| `session_table_full_count` | 13 | 5 |
+
+Verdict against the shared acceptance bar: **passes on every clause.** 100% of
+polls succeeded, p95 is an order of magnitude inside the 1 s target, no
+`ENFILE` occurred, and the 15 KB internal-heap floor is cleared by the
+*all-time* low of 19,095 bytes, not merely by the per-request minimum. Server
+side, 5,508 of 5,509 requests completed in ≤100 ms with none above.
+
+The 87 `failure_count` entries are all `error 45062`
+(`ESP_ERR_HTTPD_RESP_SEND`) from the `--churn` client aborting mid-response on
+purpose; the journal shows no other failure reason and the client observed
+zero failures. `min_largest_free_block` never approached the 1,920–2,944 byte
+band where this system has historically failed TLS — the journaled failure
+details report `largest` between 13,312 and 22,528 bytes throughout. The modem
+was healthy across the run: PPP up, 60 AT/GNSS pause windows, zero pause
+failures, no redials or restarts.
+
+How to read the gain honestly. PSRAM absorbed only ~33 KB (`psram_free`
+8,355,204 of 8,388,608), so this is **not** eight megabytes of pressure relief.
+Most of the internal headroom comes from `SPIRAM_MALLOC_RESERVE_INTERNAL`
+fencing 32 KB off from ordinary `malloc()` — that reserve is still counted by
+the internal metrics because it remains internal 8-bit RAM, and it is exactly
+the DMA/stack/TLS headroom the acceptance bar exists to protect, but the
+mechanism is a protected reserve rather than bulk relocation. This matches the
+expectation recorded before the run rather than beating it, and it means the
+`ALWAYSINTERNAL` and mbedTLS knobs still have room to give more if a later
+phase needs it.
+
+L1 is unchanged by this phase, as expected: `session_table_full_count` of 5
+with `session_high_water` pinned at 4 means the table still saturates and LRU
+purge can still evict a live socket. That is Phase C's work, not Phase B's.
+
+**Gap in the exit criteria, recorded rather than glossed:** the criterion says
+"soak test passes with BMS + SD active", and this run had neither. The battery
+pack stayed in the vehicle while the gateway came indoors, so the BMS UART
+talked to nothing (`polls: 63, fails: 63, ever_ok: false`) and the datalog
+never wrote (`rows: 0`, `sd_flush_count: 0`) despite the card being mounted.
+The SD/FATFS allocation path — the one `FATFS_ALLOC_PREFER_EXTRAM` was
+expected to relieve — was therefore never exercised, and the soak load was
+lighter than the field. Phase B is accepted **conditionally** on that basis: a
+field re-check with the pack connected must confirm the heap result under real
+BMS + SD load before the phase is closed outright. A synthetic-BMS re-soak
+(`POST /api/bms {"sim":true}`) was considered and deliberately declined, to
+keep fabricated rows out of the SD log and the production broker.
 
 ### Phase C: Session and socket robustness
 
