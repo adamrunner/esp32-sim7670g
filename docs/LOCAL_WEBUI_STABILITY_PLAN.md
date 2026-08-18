@@ -1,8 +1,8 @@
 # Local WebUI Stability Plan
 
 Status: in progress — Phase A complete and accepted on field evidence
-(2026-08-17); Phase B built and validated at source/build level, awaiting the
-hardware gates (PSRAM variant confirmation, USB flash, soak).
+(2026-08-17); Phase B built, flashed, and confirmed on hardware (2026-08-17),
+with the acceptance soak deferred and OTA publication not performed.
 
 Evidence date: 2026-08-08 (diagnosis), 2026-08-17 (Phase A field results)
 
@@ -484,6 +484,72 @@ must be checked at the USB gate before trusting the build; then flash over
 USB; then the full `tools/webui_soak.py` run with BMS + SD active plus an
 explicit OTA check during polling; then, only on those numbers, OTA
 publication. Rollback remains a config revert.
+
+#### Phase B hardware confirmation — 2026-08-17
+
+Flashed over USB in the field, on the same unit that produced the Phase A
+baseline (MAC `a0:f2:62:e3:ab:a4` = `gw-e3aba4`).
+
+Variant confirmed before trusting the build, as the deliverable required.
+`esptool.py flash_id` reported `Chip is ESP32-S3 (QFN56) (revision v0.2)`,
+`Features: WiFi, BLE, Embedded PSRAM 8MB (AP_3v3)`, 16 MB flash with the
+eFuse flash type set to quad. The S3 ships no 8 MB *quad* in-package PSRAM
+variant, so "Embedded PSRAM 8MB" identifies the ESP32-S3R8 and settles octal
+mode; the boot log then confirmed it directly rather than by inference.
+
+Boot log on `9a1bc10`, the lines that matter:
+
+- `octal_psram: vendor id : 0x0d (AP)`, `dev id : 0x02 (generation 3)`,
+  `density : 0x03 (64 Mbit)`, `VCC : 0x01 (3V)`,
+  `Readlatency : 0x02 (10 cycles@Fixed)`.
+- `esp_psram: Found 8MB PSRAM device`, `esp_psram: Speed: 40MHz`.
+- **`esp_psram: SPI SRAM memory test OK`** — the memory test the config
+  deliberately left enabled, passing.
+- `esp_psram: Adding pool of 8192K of PSRAM memory to heap allocator` and
+  `esp_psram: Reserving pool of 32K of internal memory for DMA/internal
+  allocations`, i.e. `SPIRAM_MALLOC_RESERVE_INTERNAL` doing its job.
+- Internal heap at init: 206 KiB + 21 KiB + a 32 KiB DRAM pool + 7 KiB
+  RTCRAM. No boot warnings or aborts; SD mounted, BMS and MAX17048 online,
+  PPP up on Verizon LTE, MQTT connected.
+
+First `/api/status.http` read, light load, minutes after boot — indicative
+only, **not** a soak result and not comparable to a 75-hour field session:
+
+| metric | Phase A (`bba2413`) | `9a1bc10` first read |
+|---|---|---|
+| all-time internal low | 840 B | **31,907 B** |
+| `psram_total` / `psram_free` | — | 8,388,608 / 8,355,204 |
+| `min_free_psram_all_time` | — | 8,354,048 |
+
+Only ~33 KB of PSRAM was in use at that point, which is consistent with the
+expectation recorded above: at `ALWAYSINTERNAL` 16 KB the WebUI's own small
+allocations still prefer internal RAM, so most of the internal gain here
+comes from large allocations (SD/FAT buffers) moving out. Note that
+`min_free_heap` and `min_free_psram` read zero on the very first request of a
+boot: `observed_handler()` updates the minima after the response fragment is
+built, so they populate from the second request onward. Expected, not a
+defect.
+
+Control-plane deference also confirmed on the new build: the routine OTA
+check at 91.5 s logged `routine check deferred for local control plane
+(ap_client_active)`.
+
+Deliberately not done, and why:
+
+- **The acceptance soak was deferred**, so Phase B is *not* accepted. The
+  field laptop reaches the internet through a mobile hotspot; joining the
+  device's SoftAP for the 30-minute run would have cut its only route. The
+  soak, and the explicit OTA check during polling, remain the open exit
+  criteria.
+- **No OTA publication.** The plan gates publication on the full soak, and
+  the soak has not run.
+- Consequence to expect: `9a1bc10` was flashed locally while the published
+  manifest still names `bba2413`. Version selection is a plain string
+  comparison, not an ordering, so once no SoftAP client is associated and the
+  quiet periods lapse the device will install `bba2413` over this build at a
+  routine check. That is the intended config-revert rollback rather than a
+  failure — but it means the PSRAM build does not persist in the field
+  without a publication, and a future soak needs a fresh USB flash first.
 
 ### Phase C: Session and socket robustness
 
