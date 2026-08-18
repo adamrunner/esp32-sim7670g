@@ -141,6 +141,92 @@ class FieldSafetyContractTests(unittest.TestCase):
         self.assertIn('"request_during_ota_count"', webui_source)
         self.assertIn('"request_duration_counts"', webui_source)
 
+    def test_psram_is_enabled_in_octal_mode_with_internal_reserves(self):
+        sdkconfig_defaults = (
+            REPOSITORY_ROOT / "sdkconfig.defaults"
+        ).read_text()
+
+        required = (
+            "CONFIG_SPIRAM=y",
+            "CONFIG_SPIRAM_MODE_OCT=y",
+            "CONFIG_SPIRAM_USE_MALLOC=y",
+            "CONFIG_SPIRAM_MEMTEST=y",
+            "CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384",
+            "CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768",
+        )
+        for option in required:
+            self.assertIn(option, sdkconfig_defaults)
+
+        # Each of these is a separate evidence-gated measurement, not part of
+        # the Phase B bring-up bundle.
+        for deferred in (
+            "CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y",
+            "CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y",
+        ):
+            self.assertNotIn(deferred, sdkconfig_defaults)
+
+        # The standing gotcha: sdkconfig.defaults does not propagate into an
+        # already-generated sdkconfig. When one exists locally it must agree,
+        # or the build silently keeps PSRAM off. The file is gitignored, so
+        # this half of the contract only runs where it is present.
+        generated = REPOSITORY_ROOT / "sdkconfig"
+        if generated.exists():
+            sdkconfig = generated.read_text()
+            for option in required:
+                self.assertIn(
+                    option,
+                    sdkconfig,
+                    f"{option} missing from the generated sdkconfig; "
+                    "run idf.py fullclean or set it there too",
+                )
+
+    def test_resource_evidence_separates_internal_ram_from_psram(self):
+        webui_source = (
+            REPOSITORY_ROOT / "main" / "webui.c"
+        ).read_text()
+        ota_source = (REPOSITORY_ROOT / "main" / "ota.c").read_text()
+        modem_source = (
+            REPOSITORY_ROOT / "main" / "modem.c"
+        ).read_text()
+
+        # With PSRAM enabled these queries span both pools, which would put an
+        # 8 MB number where the field baseline expects internal-RAM headroom.
+        for source in (webui_source, ota_source, modem_source):
+            self.assertNotIn("esp_get_free_heap_size()", _code(source))
+            self.assertNotIn(
+                "esp_get_minimum_free_heap_size()", _code(source)
+            )
+            self.assertNotIn(
+                "heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)",
+                _code(source),
+            )
+
+        self.assertIn(
+            "#define WEBUI_INTERNAL_CAPS "
+            "(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)",
+            webui_source,
+        )
+
+        # Both pools are observable in the field from /api/status.http.
+        for field in (
+            '"min_free_heap"',
+            '"min_largest_free_block"',
+            '"min_free_heap_all_time"',
+            '"psram_total"',
+            '"psram_free"',
+            '"min_free_psram"',
+            '"min_largest_free_psram_block"',
+        ):
+            self.assertIn(field, webui_source)
+
+
+def _code(source):
+    """Source with // comment bodies stripped, so prose about a call does
+    not read as the call itself."""
+    return "\n".join(
+        line.split("//", 1)[0] for line in source.splitlines()
+    )
+
 
 if __name__ == "__main__":
     unittest.main()

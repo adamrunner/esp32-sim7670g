@@ -29,6 +29,15 @@
 extern const uint8_t index_html_start[] asm("_binary_index_html_start");
 extern const uint8_t index_html_end[]   asm("_binary_index_html_end");
 
+// Every "heap" quantity reported here is the *internal* pool. With PSRAM
+// enabled, esp_get_free_heap_size() and MALLOC_CAP_8BIT queries span both
+// pools, so an 8 MB external heap would mask the internal-RAM pressure these
+// counters exist to measure and break continuity with the pre-PSRAM field
+// baseline recorded in docs/LOCAL_WEBUI_STABILITY_PLAN.md. PSRAM is reported
+// as its own fields instead. With PSRAM disabled these queries return exactly
+// what the previous ones did, so the recorded baseline stays comparable.
+#define WEBUI_INTERNAL_CAPS (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+
 typedef struct {
     uint32_t request_count;
     uint32_t failure_count;
@@ -39,6 +48,8 @@ typedef struct {
     uint32_t min_task_stack_free;
     uint32_t min_free_heap;
     uint32_t min_largest_free_block;
+    uint32_t min_free_psram;
+    uint32_t min_largest_free_psram_block;
     uint64_t last_request_uptime_ms;
     uint64_t last_success_uptime_ms;
     uint64_t last_error_uptime_ms;
@@ -107,7 +118,8 @@ static esp_err_t session_open_fn(httpd_handle_t server, int sockfd)
         snprintf(details, sizeof(details),
                  "{\"open\":%lu,\"max\":%d,\"heap\":%lu}",
                  (unsigned long)open_count, WEBUI_MAX_CLIENT_SESSIONS,
-                 (unsigned long)esp_get_free_heap_size());
+                 (unsigned long)heap_caps_get_free_size(
+                     WEBUI_INTERNAL_CAPS));
         event_journal_emit(
             "http", "session_table_full", EVENT_SEVERITY_WARN,
             "lru_purge_possible", details, false, 30000
@@ -224,6 +236,29 @@ static void webui_status_json(cJSON *root)
                             status.min_free_heap);
     cJSON_AddNumberToObject(http, "min_largest_free_block",
                             status.min_largest_free_block);
+    // All-time internal low-water since boot, not just at request
+    // boundaries: the number the Phase A capture could only recover from a
+    // journaled failure detail (840 bytes on bba2413).
+    cJSON_AddNumberToObject(
+        http, "min_free_heap_all_time",
+        (double)heap_caps_get_minimum_free_size(WEBUI_INTERNAL_CAPS)
+    );
+    // External pool. Zero on a build with PSRAM disabled.
+    cJSON_AddNumberToObject(
+        http, "psram_total",
+        (double)heap_caps_get_total_size(MALLOC_CAP_SPIRAM)
+    );
+    cJSON_AddNumberToObject(
+        http, "psram_free",
+        (double)heap_caps_get_free_size(MALLOC_CAP_SPIRAM)
+    );
+    cJSON_AddNumberToObject(http, "min_free_psram", status.min_free_psram);
+    cJSON_AddNumberToObject(http, "min_largest_free_psram_block",
+                            status.min_largest_free_psram_block);
+    cJSON_AddNumberToObject(
+        http, "min_free_psram_all_time",
+        (double)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM)
+    );
     cJSON_AddNumberToObject(http, "last_request_uptime_ms",
                             (double)status.last_request_uptime_ms);
     cJSON_AddNumberToObject(http, "last_success_uptime_ms",
@@ -902,11 +937,14 @@ static esp_err_t ota_get_handler(httpd_req_t *req)
     } else {
         cJSON_AddNullToObject(root, "failure");
     }
-    cJSON_AddNumberToObject(root, "free_heap", (double)esp_get_free_heap_size());
+    cJSON_AddNumberToObject(root, "free_heap",
+                            (double)heap_caps_get_free_size(WEBUI_INTERNAL_CAPS));
     cJSON_AddNumberToObject(root, "largest_free_block",
-                            (double)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+                            (double)heap_caps_get_largest_free_block(WEBUI_INTERNAL_CAPS));
     cJSON_AddNumberToObject(root, "minimum_free_heap",
-                            (double)esp_get_minimum_free_heap_size());
+                            (double)heap_caps_get_minimum_free_size(WEBUI_INTERNAL_CAPS));
+    cJSON_AddNumberToObject(root, "free_psram",
+                            (double)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     return send_json(req, root);
 }
 
@@ -1171,9 +1209,10 @@ static esp_err_t observed_handler(httpd_req_t *req)
         char details[96];
         snprintf(details, sizeof(details),
                  "{\"uri\":\"%.31s\",\"heap\":%lu,\"largest\":%lu}",
-                 req->uri, (unsigned long)esp_get_free_heap_size(),
+                 req->uri,
+                 (unsigned long)heap_caps_get_free_size(WEBUI_INTERNAL_CAPS),
                  (unsigned long)heap_caps_get_largest_free_block(
-                     MALLOC_CAP_8BIT));
+                     WEBUI_INTERNAL_CAPS));
         event_journal_emit(
             "http", "request_during_ota", EVENT_SEVERITY_INFO,
             "ota_transport_overlap", details, false, 60000
@@ -1190,9 +1229,13 @@ static esp_err_t observed_handler(httpd_req_t *req)
         s_current_response_error ? s_current_response_error_code : result;
     uint32_t task_stack_free =
         (uint32_t)uxTaskGetStackHighWaterMark(NULL);
-    uint32_t free_heap = (uint32_t)esp_get_free_heap_size();
+    uint32_t free_heap =
+        (uint32_t)heap_caps_get_free_size(WEBUI_INTERNAL_CAPS);
     uint32_t largest_free_block =
-        (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+        (uint32_t)heap_caps_get_largest_free_block(WEBUI_INTERNAL_CAPS);
+    uint32_t free_psram = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    uint32_t largest_free_psram_block =
+        (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
     xSemaphoreTake(s_http_mutex, portMAX_DELAY);
     s_http_status.last_duration_ms = duration_ms;
     if (duration_ms <= 100) {
@@ -1221,6 +1264,12 @@ static esp_err_t observed_handler(httpd_req_t *req)
     update_resource_minimum(
         &s_http_status.min_largest_free_block, largest_free_block
     );
+    // update_resource_minimum() treats zero as "never sampled", so on a
+    // build without PSRAM these two simply stay zero.
+    update_resource_minimum(&s_http_status.min_free_psram, free_psram);
+    update_resource_minimum(
+        &s_http_status.min_largest_free_psram_block, largest_free_psram_block
+    );
     if (!failed) {
         s_http_status.last_success_uptime_ms =
             (uint64_t)esp_timer_get_time() / 1000U;
@@ -1239,17 +1288,25 @@ static esp_err_t observed_handler(httpd_req_t *req)
     xSemaphoreGive(s_http_mutex);
 
     if (failed || slow) {
-        char details[192];
+        // Larger than the widest expansion of the format below (189 bytes:
+        // a 31-char URI plus eight decimals) so the detail is never
+        // truncated into invalid JSON here, and still inside the journal's
+        // own 192-byte EVENT_DETAILS_MAX — over that, event_journal_emit()
+        // discards the whole detail as a redaction error, which would lose
+        // exactly the resource evidence this event exists to carry.
+        char details[256];
         snprintf(
             details, sizeof(details),
             "{\"uri\":\"%.31s\",\"ms\":%lu,\"error\":%d,"
             "\"status\":%d,\"heap\":%lu,\"largest\":%lu,"
-            "\"stack\":%lu,\"min_heap\":%lu}",
+            "\"stack\":%lu,\"min_heap\":%lu,\"psram\":%lu}",
             req->uri, (unsigned long)duration_ms, diagnostic_error,
             s_current_http_status, (unsigned long)free_heap,
             (unsigned long)largest_free_block,
             (unsigned long)task_stack_free,
-            (unsigned long)esp_get_minimum_free_heap_size()
+            (unsigned long)heap_caps_get_minimum_free_size(
+                WEBUI_INTERNAL_CAPS),
+            (unsigned long)free_psram
         );
         event_journal_emit(
             "http", failed ? "request_failed" : "slow_request",

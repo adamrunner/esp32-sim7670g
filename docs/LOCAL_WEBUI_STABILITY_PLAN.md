@@ -1,7 +1,8 @@
 # Local WebUI Stability Plan
 
 Status: in progress — Phase A complete and accepted on field evidence
-(2026-08-17); Phase B is next.
+(2026-08-17); Phase B built and validated at source/build level, awaiting the
+hardware gates (PSRAM variant confirmation, USB flash, soak).
 
 Evidence date: 2026-08-08 (diagnosis), 2026-08-17 (Phase A field results)
 
@@ -367,6 +368,122 @@ Exit criteria:
   Treat this as its own flash-gated experiment with a straightforward
   rollback (config revert), and run the full soak — not just a boot check —
   before publication.
+
+#### Phase B implementation record — 2026-08-17
+
+Source and build level only. The hardware gates — PSRAM variant confirmation,
+USB flash, soak — are still open; nothing has been flashed or published.
+
+Configuration (`sdkconfig.defaults`, and the generated `sdkconfig`
+regenerated from it so the standing propagation gotcha cannot bite):
+
+- `CONFIG_SPIRAM=y`, `CONFIG_SPIRAM_MODE_OCT=y`, `CONFIG_SPIRAM_TYPE_AUTO=y`,
+  `CONFIG_SPIRAM_SPEED_40M=y` (the default; 80 MHz is a separate experiment),
+  `CONFIG_SPIRAM_USE_MALLOC=y`, `CONFIG_SPIRAM_MEMTEST=y`,
+  `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384`,
+  `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768`.
+- Kconfig pulled in four derived options, all wanted:
+  `CONFIG_FATFS_ALLOC_PREFER_EXTRAM` (SD/FAT buffers move off internal RAM —
+  a direct win for this build, which logs to microSD),
+  `CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY` with
+  `CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM` (opt-in per task; no existing
+  task moves), and the standard
+  `CONFIG_ESP_SLEEP_PSRAM_LEAKAGE_WORKAROUND` /
+  `CONFIG_STDATOMIC_S32C1I_SPIRAM_WORKAROUND` errata workarounds. Diffing the
+  regenerated `sdkconfig` against the pre-Phase-B copy showed **only** PSRAM
+  symbols added and nothing dropped, so no local configuration drift was lost.
+- `CONFIG_SPIRAM_IGNORE_NOTFOUND` deliberately left off: a mode or variant
+  mismatch aborts at the boot memory test instead of running degraded. On a
+  bootloader with `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` that failure mode
+  is self-recovering — the new image never marks itself valid, so the
+  bootloader reverts to the previous slot.
+- The evidence-gated extras stay off and are recorded as such in
+  `sdkconfig.defaults`: `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP` and
+  `CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC`.
+
+Delivery finding, checked rather than assumed: **nothing in the ESP-IDF 5.5
+bootloader depends on `CONFIG_SPIRAM`** (a `CONFIG_SPIRAM` grep over
+`components/bootloader`, `components/bootloader_support` and
+`components/esp_rom` returns nothing; PSRAM is brought up by the app during
+startup). Enabling PSRAM therefore reaches the field device through an
+ordinary app-only OTA update — no bootloader reflash, and the rollback slot
+stays valid. The bootloader binary is unchanged at `0x52c0` bytes.
+
+Observability — the important correctness consequence of enabling PSRAM.
+`esp_get_free_heap_size()`, `esp_get_minimum_free_heap_size()` and
+`heap_caps_*(MALLOC_CAP_8BIT)` all span *both* pools once PSRAM is on, so
+every recorded resource metric would have jumped to an 8 MB number and the
+2026-08-17 baseline would have become uncomparable overnight — while the
+internal-RAM pressure those metrics exist to catch went unmeasured. Every
+resource query in `main/webui.c`, `main/ota.c` and `main/modem.c` is now
+explicitly `MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT` (named
+`WEBUI_INTERNAL_CAPS` / `OTA_INTERNAL_CAPS` / `MODEM_INTERNAL_CAPS`). With
+PSRAM disabled these return exactly what the previous calls returned, so
+`bba2413`'s numbers remain a valid before-picture. Field names are unchanged;
+no endpoint schema was broken.
+
+New additive fields, all in `/api/status.http` unless noted:
+
+- `min_free_heap_all_time` — `heap_caps_get_minimum_free_size()` over the
+  internal pool, i.e. the all-time low since boot. Phase A could only recover
+  this number (840 bytes) from a journaled failure detail that happened to
+  fire; it is now readable on demand.
+- `psram_total`, `psram_free`, `min_free_psram`,
+  `min_largest_free_psram_block`, `min_free_psram_all_time` — the external
+  pool, tracked at request boundaries the same way the internal minima are.
+  All read zero on a build with PSRAM disabled, so the fields are safe either
+  way.
+- `/api/ota` gains `free_psram` beside its existing internal-heap footer.
+- The `http/request_failed` and `http/slow_request` journal details gain
+  `psram`, and their `min_heap` is now the internal all-time low. The detail
+  buffer moved 192 → 256 bytes so the widest expansion (189 bytes) cannot
+  truncate; that still fits the journal's own 192-byte `EVENT_DETAILS_MAX`,
+  over which `event_journal_emit()` would discard the whole detail as a
+  redaction error and lose precisely this evidence.
+
+Validation: 20 host tests pass (18 prior plus two new contracts — one
+asserting the PSRAM options in both `sdkconfig.defaults` and any generated
+`sdkconfig`, which is the standing gotcha made into a test failure rather
+than a field surprise; one asserting no resource query reaches for the
+pool-spanning APIs and that both pools appear in `/api/status`).
+`node --check` passes on the embedded JS (unchanged this phase). The pinned
+ESP-IDF 5.5 / Python 3.10 build is clean and warning-free.
+
+Build-level memory evidence, measured against a control build of the same
+source with PSRAM off (`idf.py size`, same toolchain):
+
+| | PSRAM off | PSRAM on | delta |
+|---|---|---|---|
+| DIRAM used | 184,387 | 188,083 | **+3,696** |
+| DIRAM remaining | 157,373 | 153,677 | −3,696 |
+| App image | 1,391,609 | 1,398,709 | +7,100 |
+
+So PSRAM support costs ~3.7 KB of internal RAM statically before it returns
+anything, and `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL` fences a further 32 KB
+of internal heap off from ordinary `malloc()` (still counted by the internal
+metrics above — that reserve is exactly the DMA/stack/TLS headroom the
+acceptance bar cares about).
+
+Expectation to hold honestly before the soak, so the result is judged rather
+than hoped for: with `ALWAYSINTERNAL` at the 16 KB default, small allocations
+— including the per-request cJSON fragments — still prefer internal RAM. The
+gain in this configuration comes from large allocations moving out (FATFS/SD
+buffers via `FATFS_ALLOC_PREFER_EXTRAM`, and any allocation over 16 KB), not
+from the WebUI's own traffic. If the first soak leaves `min_free_heap` short
+of the 15 KB floor, the ordered next knobs are: lower `ALWAYSINTERNAL`
+(4096, then 2048), then the two gated extras — mbedTLS allocations in PSRAM
+first, since the recorded failures are TLS-shaped, then
+`SPIRAM_TRY_ALLOCATE_WIFI_LWIP`. One change, one measurement.
+
+Still open, in order: confirm the PSRAM variant on hardware
+(`esptool.py flash_id` should report "Embedded PSRAM 8MB" and the boot line
+should show octal mode) — the device is vehicle-resident and was not
+connected when this was built, so the octal assumption rests on the
+ESP32-S3R8 module identification and the user confirmation of 2026-08-08 and
+must be checked at the USB gate before trusting the build; then flash over
+USB; then the full `tools/webui_soak.py` run with BMS + SD active plus an
+explicit OTA check during polling; then, only on those numbers, OTA
+publication. Rollback remains a config revert.
 
 ### Phase C: Session and socket robustness
 

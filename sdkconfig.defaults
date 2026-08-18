@@ -53,3 +53,38 @@ CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 # microSD data logging: FATFS long filenames (stored on the heap) so date- or
 # timestamp-based names like "2026-07-14.csv" aren't truncated to 8.3.
 CONFIG_FATFS_LFN_HEAP=y
+
+# 8 MB octal PSRAM (LOCAL_WEBUI_STABILITY_PLAN.md Phase B). Internal RAM is
+# the binding constraint on this build: the 2026-08-17 field capture recorded
+# an all-time internal low of 840 bytes and a 2,560-byte largest free block,
+# inside the band where TLS allocations have historically failed. The external
+# pool absorbs the large, non-DMA allocations so internal RAM keeps headroom.
+#
+# Nothing in the IDF 5.5 bootloader depends on CONFIG_SPIRAM (PSRAM is brought
+# up by the app at startup), so this reaches the field device by an app-only
+# OTA update without reflashing the bootloader.
+CONFIG_SPIRAM=y
+# Waveshare ESP32-S3-SIM7670G-4G carries an ESP32-S3R8: in-package octal
+# PSRAM. Confirm against `esptool.py flash_id` ("Embedded PSRAM 8MB") and the
+# boot line before trusting a build on hardware — a mode mismatch aborts at
+# the memory test below rather than running degraded.
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+# Leave the clock at the 40 MHz default; 80 MHz is a separate experiment.
+CONFIG_SPIRAM_SPEED_40M=y
+# malloc() may return external RAM, so existing allocations benefit without
+# code changes.
+CONFIG_SPIRAM_USE_MALLOC=y
+# Abort at boot on a bad PSRAM bring-up instead of running with silent
+# corruption. Costs some startup time; worth it for a vehicle-resident device.
+CONFIG_SPIRAM_MEMTEST=y
+# Allocations at or below this size still prefer internal RAM (IDF default).
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+# Guaranteed internal pool for DMA, task stacks, and anything needed while the
+# SPI cache is down; not handed out to ordinary malloc() (IDF default).
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+#
+# Deliberately NOT enabled here — each is its own evidence-gated measurement
+# once the PSRAM baseline is recorded (see the Phase B deliverables):
+# CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP is not set
+# CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC is not set

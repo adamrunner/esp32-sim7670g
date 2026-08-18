@@ -28,6 +28,13 @@
 #include "event_journal.h"
 
 static const char *TAG = "modem";
+// Resource evidence tracks the *internal* heap explicitly: with PSRAM
+// enabled, esp_get_free_heap_size() and MALLOC_CAP_8BIT queries would
+// include the 8 MB external pool and hide the internal-RAM pressure these
+// minima exist to measure. See docs/LOCAL_WEBUI_STABILITY_PLAN.md (L2,
+// Phase B).
+#define MODEM_INTERNAL_CAPS (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+
 
 // Waveshare ESP32-S3-SIM7670G-4G: SIM7670G on UART1
 #define MODEM_UART      UART_NUM_1
@@ -129,10 +136,11 @@ static modem_resource_snapshot_t modem_resource_snapshot(void)
     modem_resource_snapshot_t snapshot = {
         .modem_task_stack_free = s_modem_task_handle
             ? (uint32_t)uxTaskGetStackHighWaterMark(s_modem_task_handle) : 0,
-        .free_heap = (uint32_t)esp_get_free_heap_size(),
+        .free_heap = (uint32_t)heap_caps_get_free_size(MODEM_INTERNAL_CAPS),
         .largest_free_block =
-            (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
-        .minimum_free_heap = (uint32_t)esp_get_minimum_free_heap_size(),
+            (uint32_t)heap_caps_get_largest_free_block(MODEM_INTERNAL_CAPS),
+        .minimum_free_heap =
+            (uint32_t)heap_caps_get_minimum_free_size(MODEM_INTERNAL_CAPS),
     };
     xSemaphoreTake(s_status_mutex, portMAX_DELAY);
     if (snapshot.modem_task_stack_free) {

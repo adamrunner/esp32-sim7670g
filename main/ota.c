@@ -34,6 +34,13 @@
 #include "wifi.h"
 
 static const char *TAG = "ota";
+// Resource evidence tracks the *internal* heap explicitly: with PSRAM
+// enabled, plain esp_get_free_heap_size() and MALLOC_CAP_8BIT queries
+// would include the 8 MB external pool and hide the contiguous-internal
+// allocation pressure that has historically broken TLS here. See
+// docs/LOCAL_WEBUI_STABILITY_PLAN.md (L2, Phase B).
+#define OTA_INTERNAL_CAPS (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+
 
 // Overridable at build time (idf.py -DOTA_MANIFEST_URL=https://...) so test
 // builds can track a staging manifest without touching the code.
@@ -162,9 +169,9 @@ static void failure_snapshot(ota_failure_t *failure, const char *stage, esp_err_
     memset(failure, 0, sizeof(*failure));
     strlcpy(failure->stage, stage, sizeof(failure->stage));
     failure->esp_err = err;
-    failure->free_heap = esp_get_free_heap_size();
-    failure->largest_free_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-    failure->minimum_free_heap = esp_get_minimum_free_heap_size();
+    failure->free_heap = heap_caps_get_free_size(OTA_INTERNAL_CAPS);
+    failure->largest_free_block = heap_caps_get_largest_free_block(OTA_INTERNAL_CAPS);
+    failure->minimum_free_heap = heap_caps_get_minimum_free_size(OTA_INTERNAL_CAPS);
 }
 
 static void failure_capture_http(ota_failure_t *failure, const char *stage,
@@ -194,9 +201,9 @@ static void failure_restage(ota_failure_t *failure, const char *stage, esp_err_t
     }
     strlcpy(failure->stage, stage, sizeof(failure->stage));
     failure->esp_err = err;
-    failure->free_heap = esp_get_free_heap_size();
-    failure->largest_free_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-    failure->minimum_free_heap = esp_get_minimum_free_heap_size();
+    failure->free_heap = heap_caps_get_free_size(OTA_INTERNAL_CAPS);
+    failure->largest_free_block = heap_caps_get_largest_free_block(OTA_INTERNAL_CAPS);
+    failure->minimum_free_heap = heap_caps_get_minimum_free_size(OTA_INTERNAL_CAPS);
 }
 
 static void record_failure(const ota_failure_t *failure)
@@ -327,9 +334,9 @@ static bool wait_for_transport(bool force_cellular, uint32_t timeout_ms)
 static void log_heap_state(const char *stage)
 {
     ESP_LOGI(TAG, "%s: heap free=%u largest=%u minimum=%u", stage,
-             (unsigned)esp_get_free_heap_size(),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
-             (unsigned)esp_get_minimum_free_heap_size());
+             (unsigned)heap_caps_get_free_size(OTA_INTERNAL_CAPS),
+             (unsigned)heap_caps_get_largest_free_block(OTA_INTERNAL_CAPS),
+             (unsigned)heap_caps_get_minimum_free_size(OTA_INTERNAL_CAPS));
 }
 
 // A failed HTTPS request is not evidence that PPP needs to be torn down.
