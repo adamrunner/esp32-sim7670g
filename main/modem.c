@@ -79,8 +79,6 @@ static bool s_apn_dirty;
 // Written by esp_event handlers, read by the modem task (s_status_mutex).
 static bool s_ppp_up;
 static char s_ppp_ip[40];
-static bool s_redial_requested;
-static modem_action_source_t s_redial_source = MODEM_ACTION_SOURCE_MANUAL;
 static bool s_restart_requested;
 
 typedef struct {
@@ -91,11 +89,6 @@ typedef struct {
     uint32_t ppp_pause_failure_count;
     uint32_t packet_attach_change_count;
     uint32_t registration_change_count;
-    uint32_t redial_request_count;
-    uint32_t manual_redial_request_count;
-    uint32_t ota_redial_request_count;
-    uint32_t supervisor_redial_request_count;
-    modem_action_source_t last_redial_source;
     uint32_t restart_request_count;
     uint32_t restart_complete_count;
     uint32_t restart_failure_count;
@@ -107,7 +100,6 @@ typedef struct {
     uint32_t last_ppp_pause_duration_ms;
     uint64_t last_packet_attach_change_uptime_ms;
     uint64_t last_registration_change_uptime_ms;
-    uint64_t last_redial_request_uptime_ms;
     uint64_t last_restart_request_uptime_ms;
     uint64_t last_restart_result_uptime_ms;
     uint32_t modem_task_min_stack_free;
@@ -199,52 +191,6 @@ void modem_suspend_polls(bool suspend)
 {
     s_polls_suspended = suspend;
     ESP_LOGI(TAG, "status/GNSS polls %s", suspend ? "suspended" : "resumed");
-}
-
-static const char *action_source_name(modem_action_source_t source)
-{
-    switch (source) {
-    case MODEM_ACTION_SOURCE_OTA_TRANSPORT: return "ota_transport";
-    case MODEM_ACTION_SOURCE_SUPERVISOR:    return "supervisor";
-    default:                                return "manual";
-    }
-}
-
-void modem_request_redial_from(modem_action_source_t source)
-{
-    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
-    s_redial_requested = true;
-    s_redial_source = source;
-    s_observability.redial_request_count++;
-    if (source == MODEM_ACTION_SOURCE_OTA_TRANSPORT) {
-        s_observability.ota_redial_request_count++;
-    } else if (source == MODEM_ACTION_SOURCE_SUPERVISOR) {
-        s_observability.supervisor_redial_request_count++;
-    } else {
-        s_observability.manual_redial_request_count++;
-    }
-    s_observability.last_redial_source = source;
-    s_observability.last_redial_request_uptime_ms =
-        (uint64_t)esp_timer_get_time() / 1000U;
-    xSemaphoreGive(s_status_mutex);
-    const char *source_name = action_source_name(source);
-    ESP_LOGW(TAG, "PPP redial requested (source=%s)", source_name);
-    char details[96];
-    snprintf(
-        details, sizeof(details),
-        "{\"source\":\"%s\",\"supervisor_action\":%s}",
-        source_name,
-        source == MODEM_ACTION_SOURCE_SUPERVISOR ? "true" : "false"
-    );
-    event_journal_emit(
-        "recovery", "redial_requested", EVENT_SEVERITY_WARN,
-        source_name, details, true, 0
-    );
-}
-
-void modem_request_redial(void)
-{
-    modem_request_redial_from(MODEM_ACTION_SOURCE_MANUAL);
 }
 
 static bool restart_active(modem_restart_state_t state)
@@ -799,35 +745,22 @@ void modem_status_json(cJSON *root)
     );
     cJSON_AddStringToObject(recovery, "state",
                             "observability_only_phase_1");
-    cJSON_AddNumberToObject(recovery, "redial_request_count",
-                            observability.redial_request_count);
+    // Compatibility-only fields for the withdrawn automatic-recovery design.
+    // No explicit-redial producer is active, so these remain fixed defaults.
+    cJSON_AddNumberToObject(recovery, "redial_request_count", 0);
     cJSON *redial_sources =
         cJSON_AddObjectToObject(recovery, "redial_sources");
-    cJSON_AddNumberToObject(
-        redial_sources, "manual",
-        observability.manual_redial_request_count
-    );
-    cJSON_AddNumberToObject(
-        redial_sources, "ota_transport",
-        observability.ota_redial_request_count
-    );
-    cJSON_AddNumberToObject(
-        redial_sources, "supervisor",
-        observability.supervisor_redial_request_count
-    );
-    cJSON_AddStringToObject(
-        redial_sources, "last",
-        observability.redial_request_count
-            ? action_source_name(observability.last_redial_source) : "none"
-    );
+    cJSON_AddNumberToObject(redial_sources, "manual", 0);
+    cJSON_AddNumberToObject(redial_sources, "ota_transport", 0);
+    cJSON_AddNumberToObject(redial_sources, "supervisor", 0);
+    cJSON_AddStringToObject(redial_sources, "last", "none");
     cJSON_AddNumberToObject(recovery, "restart_request_count",
                             observability.restart_request_count);
     cJSON_AddNumberToObject(recovery, "restart_complete_count",
                             observability.restart_complete_count);
     cJSON_AddNumberToObject(recovery, "restart_failure_count",
                             observability.restart_failure_count);
-    cJSON_AddNumberToObject(recovery, "last_redial_request_uptime_ms",
-                            (double)observability.last_redial_request_uptime_ms);
+    cJSON_AddNumberToObject(recovery, "last_redial_request_uptime_ms", 0);
     cJSON_AddNumberToObject(recovery, "last_restart_request_uptime_ms",
                             (double)observability.last_restart_request_uptime_ms);
     cJSON_AddNumberToObject(recovery, "last_restart_result_uptime_ms",
@@ -1310,10 +1243,7 @@ static void modem_task(void *arg)
         char apn[MODEM_APN_MAX];
         strlcpy(apn, s_apn, sizeof(apn));
         bool apn_dirty = s_apn_dirty;
-        bool redial_requested = s_redial_requested;
-        modem_action_source_t redial_source = s_redial_source;
         bool restart_requested = s_restart_requested;
-        s_redial_requested = false;
         s_restart_requested = false;
         xSemaphoreGive(s_status_mutex);
 
@@ -1383,27 +1313,6 @@ static void modem_task(void *arg)
                 s_gnss.has_fix = false;
                 xSemaphoreGive(s_status_mutex);
             }
-        }
-
-        if (redial_requested) {
-            ESP_LOGW(
-                TAG, "forcing a clean PPP redial (source=%s)",
-                action_source_name(redial_source)
-            );
-            if (ppp_up) {
-                data_disconnect();
-            }
-            xSemaphoreTake(s_status_mutex, portMAX_DELAY);
-            s_ppp_up = false;
-            s_ppp_ip[0] = '\0';
-            xSemaphoreGive(s_status_mutex);
-            ppp_up = false;
-            st.ppp_up = false;
-            st.pdp_active = false;
-            st.ip_addr[0] = '\0';
-            was_up = false;
-            healthy_polls = 0;
-            last_dial_us = 0;
         }
 
         // PPP just dropped (carrier hangup, LCP failure): leave data mode so
