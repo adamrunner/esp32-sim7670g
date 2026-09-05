@@ -307,6 +307,12 @@ python3 tools/event_report.py /path/to/copied/events --output outage.json
 python3 -m unittest discover -s tests -v
 ```
 
+The [host test inventory](tests/README.md) separates firmware production-code
+harnesses, browser behavior, tooling checks, static guardrails, and the
+host-only recovery design model. The embedded browser script can also be run
+directly with `node tests/webui_browser_test.js`; it is included automatically
+by the Python discovery command above.
+
 `event_report.py` reads rotated journal files oldest-to-newest, verifies
 boot-scoped sequence order and redaction, and summarizes PPP/MQTT outage
 intervals plus spool/recovery transitions without serial logs.
