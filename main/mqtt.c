@@ -11,7 +11,6 @@
 #include "esp_app_desc.h"
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
-#include "esp_random.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "mqtt_client.h"
@@ -46,7 +45,6 @@ static mqtt_status_t s_status;
 static volatile bool s_connected;
 static volatile int s_pending_msg_id = -1;
 static volatile int s_rollback_msg_id = -1;
-static char s_boot_id[17];
 static uint32_t s_status_seq;
 static bool s_ever_connected;
 static bool s_time_status_published;
@@ -98,7 +96,8 @@ static void availability_document(bool online,
     snprintf(payload, payload_len,
              "{\"schema_version\":1,\"device_id\":\"%s\","
              "\"online\":%s,\"boot_id\":\"%s\"}",
-             device_id, online ? "true" : "false", s_boot_id);
+             device_id, online ? "true" : "false",
+             event_journal_boot_id());
 }
 
 static const char *reset_reason_str(esp_reset_reason_t reason)
@@ -344,9 +343,6 @@ void mqtt_init(void)
     s_mutex = xSemaphoreCreateMutex();
     s_pub_mutex = xSemaphoreCreateMutex();
     s_events = xEventGroupCreate();
-    snprintf(s_boot_id, sizeof(s_boot_id), "%08" PRIx32 "%08" PRIx32,
-             esp_random(), esp_random());
-
     load_config();
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     restart_client_locked();
@@ -545,7 +541,7 @@ static esp_err_t publish_status_event(status_reason_t reason)
     cJSON_AddStringToObject(root, "firmware_version", ota.running_version);
     cJSON_AddStringToObject(root, "ota_slot", ota.running_slot);
     cJSON_AddBoolToObject(root, "pending_verify", ota.pending_verify);
-    cJSON_AddStringToObject(root, "boot_id", s_boot_id);
+    cJSON_AddStringToObject(root, "boot_id", event_journal_boot_id());
     cJSON_AddStringToObject(root, "reset_reason", reset_reason_str(esp_reset_reason()));
     cJSON_AddStringToObject(root, "idf_version", app->idf_ver);
     cJSON_AddStringToObject(root, "build_date", app->date);

@@ -392,16 +392,19 @@ const char *event_journal_boot_id(void)
 
 void event_journal_init(void)
 {
+    // Own the boot identity independently of the fallible runtime resources.
+    // MQTT starts later and must still receive a valid ID when the journal's
+    // mutex or queue cannot be allocated.
+    snprintf(
+        s_status.boot_id, sizeof(s_status.boot_id),
+        "%08" PRIx32 "%08" PRIx32, esp_random(), esp_random()
+    );
     s_mutex = xSemaphoreCreateMutex();
     s_queue = xQueueCreate(EVENT_QUEUE_DEPTH, sizeof(event_record_t));
     if (!s_mutex || !s_queue) {
         ESP_LOGE(TAG, "could not initialize event journal");
         return;
     }
-    snprintf(
-        s_status.boot_id, sizeof(s_status.boot_id),
-        "%08" PRIx32 "%08" PRIx32, esp_random(), esp_random()
-    );
     s_initialized = true;
 
     if (sdcard_mounted()) {

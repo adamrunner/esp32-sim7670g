@@ -70,4 +70,6 @@ bool event_journal_visit_events_json(
     void *context
 );
 
+// Boot-scoped identity shared by journal and MQTT payloads. It is available
+// after event_journal_init() even when journal resource allocation failed.
 const char *event_journal_boot_id(void);

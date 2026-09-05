@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cJSON.h"
 #include "mqtt.h"
 #include "esp_app_desc.h"
 #include "esp_system.h"
@@ -12,6 +13,7 @@
 #include "ota.h"
 #include "timesync.h"
 #include "freertos/event_groups.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "mqtt_client.h"
@@ -25,6 +27,12 @@ struct fake_event_group {
     EventBits_t bits;
 };
 
+struct fake_queue {
+    size_t item_size;
+    bool occupied;
+    unsigned char item[1024];
+};
+
 struct fake_mqtt_client {
     int unused;
 };
@@ -35,6 +43,15 @@ static int s_recursive_take_count;
 static int s_invalid_give_count;
 static int s_client_start_count;
 static mqtt_config_t s_nvs_config;
+static bool s_fail_next_queue_create;
+static bool s_ack_publishes;
+static esp_event_handler_t s_mqtt_event_handler;
+static char s_will_payloads[4][256];
+static size_t s_will_payload_count;
+static char s_enqueued_payload[1024];
+static char s_published_payloads[4][256];
+static size_t s_published_payload_count;
+static uint32_t s_random_state;
 
 static void reset_fakes(void)
 {
@@ -42,10 +59,54 @@ static void reset_fakes(void)
     s_recursive_take_count = 0;
     s_invalid_give_count = 0;
     s_client_start_count = 0;
+    s_fail_next_queue_create = false;
+    s_ack_publishes = false;
+    s_mqtt_event_handler = NULL;
+    s_will_payload_count = 0;
+    s_published_payload_count = 0;
+    s_enqueued_payload[0] = '\0';
     memset(&s_nvs_config, 0, sizeof(s_nvs_config));
     s_nvs_config.enabled = true;
     strcpy(s_nvs_config.uri, "mqtt://test.invalid:1883");
     strcpy(s_nvs_config.base_topic, "bms/telemetry");
+}
+
+QueueHandle_t xQueueCreate(UBaseType_t length, UBaseType_t item_size)
+{
+    (void)length;
+    if (s_fail_next_queue_create) {
+        s_fail_next_queue_create = false;
+        return NULL;
+    }
+    assert(item_size <= sizeof(((struct fake_queue *)0)->item));
+    struct fake_queue *queue = calloc(1, sizeof(*queue));
+    assert(queue);
+    queue->item_size = item_size;
+    return queue;
+}
+
+BaseType_t xQueueSend(QueueHandle_t queue, const void *item, TickType_t ticks)
+{
+    (void)ticks;
+    assert(queue);
+    if (queue->occupied) {
+        return pdFALSE;
+    }
+    memcpy(queue->item, item, queue->item_size);
+    queue->occupied = true;
+    return pdTRUE;
+}
+
+BaseType_t xQueueReceive(QueueHandle_t queue, void *item, TickType_t ticks)
+{
+    (void)ticks;
+    assert(queue);
+    if (!queue->occupied) {
+        return pdFALSE;
+    }
+    memcpy(item, queue->item, queue->item_size);
+    queue->occupied = false;
+    return pdTRUE;
 }
 
 SemaphoreHandle_t xSemaphoreCreateMutex(void)
@@ -101,6 +162,9 @@ EventBits_t xEventGroupWaitBits(EventGroupHandle_t group, EventBits_t bits,
     (void)wait_for_all;
     (void)ticks;
     EventBits_t result = group->bits & bits;
+    if (s_ack_publishes) {
+        result |= bits;
+    }
     if (clear_on_exit) {
         group->bits &= ~bits;
     }
@@ -139,6 +203,11 @@ esp_mqtt_client_handle_t esp_mqtt_client_init(
     const esp_mqtt_client_config_t *config)
 {
     assert(config);
+    assert(s_will_payload_count < 4);
+    snprintf(s_will_payloads[s_will_payload_count],
+             sizeof(s_will_payloads[s_will_payload_count]), "%s",
+             config->session.last_will.msg);
+    s_will_payload_count++;
     return s_client_init_fails ? NULL : &s_fake_client;
 }
 
@@ -149,7 +218,7 @@ esp_err_t esp_mqtt_client_register_event(esp_mqtt_client_handle_t client,
 {
     (void)client;
     (void)event_id;
-    (void)handler;
+    s_mqtt_event_handler = handler;
     (void)handler_args;
     return ESP_OK;
 }
@@ -179,11 +248,15 @@ int esp_mqtt_client_publish(esp_mqtt_client_handle_t client,
 {
     (void)client;
     (void)topic;
-    (void)data;
+    assert(s_published_payload_count < 4);
+    snprintf(s_published_payloads[s_published_payload_count],
+             sizeof(s_published_payloads[s_published_payload_count]), "%s",
+             data);
+    s_published_payload_count++;
     (void)len;
     (void)qos;
     (void)retain;
-    return -1;
+    return 20 + (int)s_published_payload_count;
 }
 
 int esp_mqtt_client_enqueue(esp_mqtt_client_handle_t client,
@@ -192,12 +265,12 @@ int esp_mqtt_client_enqueue(esp_mqtt_client_handle_t client,
 {
     (void)client;
     (void)topic;
-    (void)data;
+    snprintf(s_enqueued_payload, sizeof(s_enqueued_payload), "%s", data);
     (void)len;
     (void)qos;
     (void)retain;
     (void)store;
-    return -1;
+    return 40;
 }
 
 esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *handle)
@@ -271,23 +344,41 @@ void datalog_device_id(char *out, size_t out_len)
     snprintf(out, out_len, "gw-host-test");
 }
 
-void event_journal_emit(const char *component, const char *event_name,
-                        event_severity_t severity, const char *reason,
-                        const char *details_json, bool critical,
-                        uint32_t interval_ms)
+bool sdcard_mounted(void)
 {
-    (void)component;
-    (void)event_name;
-    (void)severity;
-    (void)reason;
-    (void)details_json;
-    (void)critical;
-    (void)interval_ms;
+    return false;
 }
 
-const char *event_journal_boot_id(void)
+bool event_core_redact_json(const char *input, char *output, size_t output_len)
 {
-    return "0123456789abcdef";
+    snprintf(output, output_len, "%s", input);
+    return true;
+}
+
+bool event_core_rate_limited(bool previously_emitted,
+                             uint64_t last_emitted_ms, uint64_t now_ms,
+                             uint32_t interval_ms)
+{
+    return previously_emitted && now_ms - last_emitted_ms < interval_ms;
+}
+
+int event_core_repair_tail(const char *path)
+{
+    (void)path;
+    return 0;
+}
+
+int event_core_append(const char *directory, const char *json,
+                      size_t json_len, bool critical, size_t max_file_bytes,
+                      unsigned file_count)
+{
+    (void)directory;
+    (void)json;
+    (void)json_len;
+    (void)critical;
+    (void)max_file_bytes;
+    (void)file_count;
+    return 0;
 }
 
 void ota_get_status(ota_status_t *out)
@@ -325,7 +416,8 @@ const esp_app_desc_t *esp_app_get_description(void)
 
 uint32_t esp_random(void)
 {
-    return 0x12345678;
+    s_random_state = s_random_state * 1664525U + 1013904223U;
+    return s_random_state;
 }
 
 esp_reset_reason_t esp_reset_reason(void)
@@ -369,9 +461,94 @@ static void test_init_failure_does_not_reacquire_mutex(void)
     assert(s_invalid_give_count == 0);
 }
 
-int main(void)
+static const char *json_boot_id(const char *document)
 {
-    test_init_failure_does_not_reacquire_mutex();
+    cJSON *root = cJSON_Parse(document);
+    assert(root);
+    cJSON *boot_id = cJSON_GetObjectItemCaseSensitive(root, "boot_id");
+    assert(cJSON_IsString(boot_id));
+    static char value[17];
+    snprintf(value, sizeof(value), "%s", boot_id->valuestring);
+    cJSON_Delete(root);
+    return value;
+}
+
+static void assert_boot_id_document(const char *document,
+                                    const char *expected_boot_id)
+{
+    assert(strcmp(json_boot_id(document), expected_boot_id) == 0);
+}
+
+static bool assert_journal_event_boot_id(const cJSON *event, size_t index,
+                                         void *context)
+{
+    const char *expected_boot_id = context;
+    const cJSON *boot_id = cJSON_GetObjectItemCaseSensitive(event, "boot_id");
+    assert(index == 0);
+    assert(cJSON_IsString(boot_id));
+    assert(strcmp(boot_id->valuestring, expected_boot_id) == 0);
+    return true;
+}
+
+static void test_shared_boot_identity(bool journal_setup_fails)
+{
+    reset_fakes();
+    s_ack_publishes = true;
+    s_fail_next_queue_create = journal_setup_fails;
+
+    event_journal_init();
+    const char *journal_boot_id = event_journal_boot_id();
+    assert(strlen(journal_boot_id) == 16);
+    char expected_boot_id[17];
+    snprintf(expected_boot_id, sizeof(expected_boot_id), "%s",
+             journal_boot_id);
+    if (!journal_setup_fails) {
+        event_journal_status_t journal_status;
+        event_journal_get_status(&journal_status);
+        assert(strcmp(journal_status.boot_id, expected_boot_id) == 0);
+        assert(event_journal_visit_events_json(
+            1, assert_journal_event_boot_id, expected_boot_id));
+    }
+
+    mqtt_init();
+    assert(s_will_payload_count == 1);
+    assert_boot_id_document(s_will_payloads[0], expected_boot_id);
+
+    assert(s_mqtt_event_handler);
+    esp_mqtt_event_t connected = {0};
+    s_mqtt_event_handler(NULL, NULL, MQTT_EVENT_CONNECTED, &connected);
+    assert_boot_id_document(s_enqueued_payload, expected_boot_id);
+
+    mqtt_maintenance_tick();
+    assert(s_published_payload_count == 1);
+    assert_boot_id_document(s_published_payloads[0], expected_boot_id);
+
+    mqtt_config_t config = s_nvs_config;
+    assert(mqtt_set_config(&config) == ESP_OK);
+    assert(s_published_payload_count == 2);
+    assert_boot_id_document(s_published_payloads[1], expected_boot_id);
+    assert(s_will_payload_count == 2);
+    assert_boot_id_document(s_will_payloads[1], expected_boot_id);
+    assert(strcmp(event_journal_boot_id(), expected_boot_id) == 0);
+
+    printf("BOOT_ID=%s\n", expected_boot_id);
+}
+
+int main(int argc, char **argv)
+{
+    if (argc == 1 || strcmp(argv[1], "a1") == 0) {
+        test_init_failure_does_not_reacquire_mutex();
+    } else if (strcmp(argv[1], "boot-normal") == 0) {
+        assert(argc == 3);
+        s_random_state = (uint32_t)strtoul(argv[2], NULL, 0);
+        test_shared_boot_identity(false);
+    } else if (strcmp(argv[1], "boot-journal-fail") == 0) {
+        assert(argc == 3);
+        s_random_state = (uint32_t)strtoul(argv[2], NULL, 0);
+        test_shared_boot_identity(true);
+    } else {
+        return 2;
+    }
     puts("MQTT lifecycle tests: ok");
     return 0;
 }
