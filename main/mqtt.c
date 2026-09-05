@@ -1,6 +1,7 @@
 #include "mqtt.h"
 
 #include <inttypes.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -325,7 +326,11 @@ static void restart_client_locked(void)
 
     s_client = esp_mqtt_client_init(&cfg);
     if (!s_client) {
-        set_last_error("client init failed (bad URI?)");
+        // restart_client_locked() owns s_mutex for the whole client swap.
+        // Calling the public/event-callback helper here would reacquire the
+        // nonrecursive mutex and deadlock both boot and reconfiguration.
+        strlcpy(s_status.last_error, "client init failed (bad URI?)",
+                sizeof(s_status.last_error));
         ESP_LOGE(TAG, "esp_mqtt_client_init failed for %s", s_cfg.uri);
         return;
     }
