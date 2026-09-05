@@ -19,4 +19,3 @@ esp_err_t nvs_set_str(nvs_handle_t handle, const char *key,
 esp_err_t nvs_set_u8(nvs_handle_t handle, const char *key, uint8_t value);
 esp_err_t nvs_commit(nvs_handle_t handle);
 void nvs_close(nvs_handle_t handle);
-

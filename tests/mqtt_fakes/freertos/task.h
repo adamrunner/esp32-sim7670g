@@ -11,4 +11,3 @@ BaseType_t xTaskCreate(TaskFunction_t task, const char *name,
 TickType_t xTaskGetTickCount(void);
 void vTaskDelay(TickType_t ticks);
 void vTaskDelete(TaskHandle_t task);
-

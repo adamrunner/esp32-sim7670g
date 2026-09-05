@@ -80,4 +80,3 @@ int esp_mqtt_client_publish(esp_mqtt_client_handle_t client,
 int esp_mqtt_client_enqueue(esp_mqtt_client_handle_t client,
                             const char *topic, const char *data, int len,
                             int qos, int retain, bool store);
-

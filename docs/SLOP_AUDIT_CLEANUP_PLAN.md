@@ -1,9 +1,10 @@
 # Slop Audit Cleanup and Agent Handoff Plan
 
-Status: planning complete; implementation not started.
+Status: local implementation complete; hardware acceptance remains pending.
 
 Audit and plan date: 2026-09-04.
 Audited source revision: `2ced12f62dbd1d37dce4e09c1d1a787b6d2c5db4` on `main`.
+Implementation baseline: `50e0fa8256602a3bf777011884aaf0ba481c8c2a` on `main`.
 Repository: `/Users/adamrunner/Code/esp32-sim7670g`.
 
 ## Objective and completion boundary
@@ -513,16 +514,45 @@ If a finding is no longer true, return current caller/behavior evidence rather
 than forcing the planned deletion. The coordinator updates this table once
 per completed package; preserve existing historical reliability records.
 
+### Local implementation record — 2026-09-04
+
+- I0 revalidated the newer implementation baseline without resetting it. The
+  tracked tree was clean and the pre-existing untracked `claudes.txt` was
+  preserved. The original 20 host tests passed with Python 3.14.7, Node
+  20.11.1, and the Command Line Tools compiler selected through
+  `DEVELOPER_DIR`. The pinned ESP-IDF 5.5/Python 3.10.3 build passed before
+  edits with a 1,398,705-byte image and 188,083 bytes of DIRAM use.
+- The integrated suite passes all 29 Python-discovered tests. That includes the
+  shipped browser script, production MQTT/journal paths, production JSON
+  streaming, production spool replay functions, the retained OTA/journal
+  harnesses, tooling checks, honestly labeled static guardrails, and the
+  explicitly separate recovery design model.
+- The A1 harness fails against the pre-fix MQTT implementation because it
+  observes a recursive mutex acquisition, and passes against `0086d47`. The B1
+  browser harness fails for each in-memory missing-startup, parallel-polling,
+  missing-timeout, and missing-SoftAP-guard mutation.
+- The final pinned build and `idf.py size` pass. Total image size is 1,398,345
+  bytes, 360 bytes smaller than baseline; DIRAM use is 188,019 bytes, 64 bytes
+  smaller. The response buffer remains 512 bytes. No new heap allocation,
+  task, queue, timer, dependency, schema, route, MQTT topic, NVS key, CSV
+  ordering, or spool format was introduced. The extracted JSON encoder adds a
+  small callback/context wrapper to the existing HTTP request stack.
+- D2 was intentionally omitted: its optional wrapper/switch/getter cleanups do
+  not block the core objective and were not worth additional integration churn.
+- No firmware was flashed, published, pushed, installed, or activated, and no
+  live SD card or production service was mutated. The hardware acceptance table
+  above remains fully pending, including the existing BMS-plus-SD workload gap.
+
 | Package | Status | Commit(s) | Validation / remaining evidence |
 | --- | --- | --- | --- |
-| I0 | Pending | — | Audit host baseline exists; implementation baseline still required |
-| A1 | Pending | — | MQTT lock ownership |
-| A2 | Pending | — | Shared boot identity, including journal failure |
-| A3 | Pending | — | One-shot task lifecycle |
-| B1 | Pending | — | Browser execution and mutation checks |
-| B2 | Pending | — | Streaming behavior and static-check inventory |
-| C1 | Pending | — | Dead code removal with compatibility |
-| C2 | Pending | — | Cursor persistence equivalence |
-| D1 | Pending | — | Model/test documentation |
-| D2 | Optional | — | Small wrappers/mappings only |
-| I1 | Pending | — | Combined checks/build; hardware acceptance separate |
+| I0 | Complete | — | Baseline `50e0fa8`; 20 host tests and pinned build/size passed; `claudes.txt` preserved |
+| A1 | Complete | `0086d47` | Old implementation triggers recursive-acquisition assertion; fixed failure and subsequent success paths pass |
+| A2 | Complete | `b4702b3` | Journal/status/availability/will IDs agree; setup failure, reconfiguration, and fresh startup cases pass |
+| A3 | Complete | `678603f` | Delayed time, disconnect/reconnect, enqueue failure, later success, and task exit pass |
+| B1 | Complete | `ba692ac` | Shipped-script execution and all four mutation checks pass |
+| B2 | Complete | `3f34dab` | Independent JSON parse, chunk/failure cases, and fragment/event allocation lifetime pass |
+| C1 | Complete | `416b779` | Dormant redial mechanism removed; compatibility guardrails/build pass; hardware recovery pending |
+| C2 | Complete | `12e1207` | Equivalent temporary-file replay cases pass; isolated hardware-storage replay pending |
+| D1 | Complete | `713fa1f` | Test inventory separates production, browser, tooling, static, and design-model evidence |
+| D2 | Omitted (optional) | — | Deferred to avoid nonessential cleanup churn |
+| I1 | Complete locally | This record | 29 host/browser tests and pinned build/size pass; all hardware acceptance remains separate |
