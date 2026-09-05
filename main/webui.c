@@ -24,6 +24,7 @@
 #include "mqtt.h"
 #include "ota.h"
 #include "timesync.h"
+#include "webui_json_stream.h"
 #include "wifi.h"
 
 extern const uint8_t index_html_start[] asm("_binary_index_html_start");
@@ -360,14 +361,11 @@ static esp_err_t modem_restart_post_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, "{\"ok\":true,\"state\":\"requested\"}");
 }
 
-#define JSON_STREAM_CHUNK_BYTES 512
-
 typedef struct {
     httpd_req_t *req;
-    char chunk[JSON_STREAM_CHUNK_BYTES];
-    size_t used;
     esp_err_t error;
     bool sent;
+    webui_json_stream_t encoder;
 } json_stream_t;
 
 static void record_serialization_failure(void)
@@ -377,190 +375,49 @@ static void record_serialization_failure(void)
     xSemaphoreGive(s_http_mutex);
 }
 
-static void json_stream_begin(json_stream_t *stream, httpd_req_t *req)
+static bool send_json_chunk(
+    void *context,
+    const char *data,
+    size_t length
+)
 {
-    memset(stream, 0, sizeof(*stream));
-    stream->req = req;
-    stream->error = ESP_OK;
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-}
-
-static bool json_stream_flush(json_stream_t *stream)
-{
+    json_stream_t *stream = context;
     if (stream->error != ESP_OK) {
         return false;
     }
-    if (stream->used == 0) {
-        return true;
-    }
     int64_t send_started_us = esp_timer_get_time();
     stream->error = httpd_resp_send_chunk(
-        stream->req, stream->chunk, stream->used
+        stream->req, data, length
     );
     uint32_t send_ms =
         (uint32_t)((esp_timer_get_time() - send_started_us) / 1000);
     if (send_ms > s_current_max_chunk_send_ms) {
         s_current_max_chunk_send_ms = send_ms;
     }
-    stream->used = 0;
     if (stream->error == ESP_OK) {
         stream->sent = true;
     }
     return stream->error == ESP_OK;
 }
 
-static bool json_stream_write(
-    json_stream_t *stream,
-    const char *data,
-    size_t length
-)
+static void json_stream_begin(json_stream_t *stream, httpd_req_t *req)
 {
-    while (length > 0) {
-        size_t available = sizeof(stream->chunk) - stream->used;
-        if (available == 0 && !json_stream_flush(stream)) {
-            return false;
-        }
-        available = sizeof(stream->chunk) - stream->used;
-        size_t count = length < available ? length : available;
-        memcpy(stream->chunk + stream->used, data, count);
-        stream->used += count;
-        data += count;
-        length -= count;
-    }
-    return true;
+    memset(stream, 0, sizeof(*stream));
+    stream->req = req;
+    stream->error = ESP_OK;
+    webui_json_stream_init(&stream->encoder, send_json_chunk, stream);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 }
 
 static bool json_stream_literal(json_stream_t *stream, const char *literal)
 {
-    return json_stream_write(stream, literal, strlen(literal));
-}
-
-static bool json_stream_string(json_stream_t *stream, const char *value)
-{
-    if (!json_stream_literal(stream, "\"")) {
-        return false;
-    }
-    const unsigned char *cursor =
-        (const unsigned char *)(value ? value : "");
-    while (*cursor) {
-        const char *escape = NULL;
-        switch (*cursor) {
-        case '"':  escape = "\\\""; break;
-        case '\\': escape = "\\\\"; break;
-        case '\b': escape = "\\b";  break;
-        case '\f': escape = "\\f";  break;
-        case '\n': escape = "\\n";  break;
-        case '\r': escape = "\\r";  break;
-        case '\t': escape = "\\t";  break;
-        default: break;
-        }
-        if (escape) {
-            if (!json_stream_literal(stream, escape)) {
-                return false;
-            }
-        } else if (*cursor < 0x20) {
-            char encoded[7];
-            snprintf(encoded, sizeof(encoded), "\\u%04x", *cursor);
-            if (!json_stream_literal(stream, encoded)) {
-                return false;
-            }
-        } else {
-            char byte = (char)*cursor;
-            if (!json_stream_write(stream, &byte, 1)) {
-                return false;
-            }
-        }
-        cursor++;
-    }
-    return json_stream_literal(stream, "\"");
+    return webui_json_stream_literal(&stream->encoder, literal);
 }
 
 static bool json_stream_value(json_stream_t *stream, const cJSON *item)
 {
-    if (!item || cJSON_IsNull(item) || cJSON_IsInvalid(item)) {
-        return json_stream_literal(stream, "null");
-    }
-    if (cJSON_IsFalse(item)) {
-        return json_stream_literal(stream, "false");
-    }
-    if (cJSON_IsTrue(item)) {
-        return json_stream_literal(stream, "true");
-    }
-    if (cJSON_IsNumber(item)) {
-        if (!isfinite(item->valuedouble)) {
-            return json_stream_literal(stream, "null");
-        }
-        char number[32];
-        int length = snprintf(
-            number, sizeof(number), "%.17g", item->valuedouble
-        );
-        return length > 0 && (size_t)length < sizeof(number) &&
-               json_stream_write(stream, number, (size_t)length);
-    }
-    if (cJSON_IsString(item)) {
-        return json_stream_string(stream, item->valuestring);
-    }
-    if (cJSON_IsRaw(item)) {
-        return json_stream_literal(
-            stream, item->valuestring ? item->valuestring : "null"
-        );
-    }
-    if (cJSON_IsArray(item)) {
-        if (!json_stream_literal(stream, "[")) {
-            return false;
-        }
-        const cJSON *child = item->child;
-        bool first = true;
-        while (child) {
-            if ((!first && !json_stream_literal(stream, ",")) ||
-                !json_stream_value(stream, child)) {
-                return false;
-            }
-            first = false;
-            child = child->next;
-        }
-        return json_stream_literal(stream, "]");
-    }
-    if (cJSON_IsObject(item)) {
-        if (!json_stream_literal(stream, "{")) {
-            return false;
-        }
-        const cJSON *child = item->child;
-        bool first = true;
-        while (child) {
-            if ((!first && !json_stream_literal(stream, ",")) ||
-                !json_stream_string(stream, child->string) ||
-                !json_stream_literal(stream, ":") ||
-                !json_stream_value(stream, child)) {
-                return false;
-            }
-            first = false;
-            child = child->next;
-        }
-        return json_stream_literal(stream, "}");
-    }
-    return json_stream_literal(stream, "null");
-}
-
-static bool json_stream_object_members(
-    json_stream_t *stream,
-    const cJSON *object,
-    bool *first
-)
-{
-    const cJSON *child = object ? object->child : NULL;
-    while (child) {
-        if ((!*first && !json_stream_literal(stream, ",")) ||
-            !json_stream_string(stream, child->string) ||
-            !json_stream_literal(stream, ":") ||
-            !json_stream_value(stream, child)) {
-            return false;
-        }
-        *first = false;
-        child = child->next;
-    }
-    return true;
+    return webui_json_stream_value(&stream->encoder, item);
 }
 
 static esp_err_t json_stream_finish(
@@ -569,7 +426,7 @@ static esp_err_t json_stream_finish(
 )
 {
     if (encoded) {
-        encoded = json_stream_flush(stream);
+        encoded = webui_json_stream_flush(&stream->encoder);
     }
     if (encoded) {
         stream->error = httpd_resp_send_chunk(stream->req, NULL, 0);
@@ -614,32 +471,12 @@ static esp_err_t send_json(httpd_req_t *req, cJSON *root)
     return json_stream_finish(&stream, encoded);
 }
 
-typedef void (*status_json_builder_t)(cJSON *root);
-
-static bool json_stream_status_fragment(
-    json_stream_t *stream,
-    status_json_builder_t builder,
-    bool *first
-)
-{
-    cJSON *fragment = cJSON_CreateObject();
-    if (!fragment) {
-        record_serialization_failure();
-        stream->error = ESP_ERR_NO_MEM;
-        return false;
-    }
-    builder(fragment);
-    bool encoded = json_stream_object_members(stream, fragment, first);
-    cJSON_Delete(fragment);
-    return encoded;
-}
-
 // Each module still owns the schema and types of its status fields, but only
 // one module fragment exists at a time. This preserves the aggregate response
 // while bounding peak cJSON heap independently of the total document size.
 static esp_err_t status_get_handler(httpd_req_t *req)
 {
-    static const status_json_builder_t builders[] = {
+    static const webui_json_fragment_builder_t builders[] = {
         modem_status_json,
         board_battery_status_json,
         bms_status_json,
@@ -652,17 +489,12 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     };
     json_stream_t stream;
     json_stream_begin(&stream, req);
-    bool first = true;
-    bool encoded = json_stream_literal(&stream, "{");
-    for (size_t i = 0;
-         encoded && i < sizeof(builders) / sizeof(builders[0]);
-         i++) {
-        encoded = json_stream_status_fragment(
-            &stream, builders[i], &first
-        );
-    }
-    if (encoded) {
-        encoded = json_stream_literal(&stream, "}");
+    bool encoded = webui_json_stream_object_fragments(
+        &stream.encoder, builders, sizeof(builders) / sizeof(builders[0])
+    );
+    if (stream.encoder.allocation_failed) {
+        record_serialization_failure();
+        stream.error = ESP_ERR_NO_MEM;
     }
     return json_stream_finish(&stream, encoded);
 }

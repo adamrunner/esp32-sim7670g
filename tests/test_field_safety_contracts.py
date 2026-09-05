@@ -1,3 +1,4 @@
+import re
 import unittest
 from pathlib import Path
 
@@ -12,7 +13,7 @@ class FieldSafetyContractTests(unittest.TestCase):
         self.assertNotIn("modem_request_redial_from(", ota_source)
         self.assertIn("active_modem_action", ota_source)
 
-    def test_web_api_does_not_allocate_a_full_printed_document(self):
+    def test_static_streaming_wiring_avoids_full_document_print(self):
         webui_source = (
             REPOSITORY_ROOT / "main" / "webui.c"
         ).read_text()
@@ -20,9 +21,9 @@ class FieldSafetyContractTests(unittest.TestCase):
             webui_source,
             r"\bcJSON_PrintUnformatted\s*\(\s*root",
         )
-        self.assertIn("httpd_resp_send_chunk", webui_source)
-        self.assertIn("response_error_count", webui_source)
-        self.assertIn("json_stream_status_fragment", webui_source)
+        self.assertIn(
+            "webui_json_stream_object_fragments(", _code(webui_source)
+        )
         self.assertIn("event_journal_visit_events_json", webui_source)
         self.assertNotIn("event_journal_events_json(", webui_source)
 
@@ -57,9 +58,10 @@ class FieldSafetyContractTests(unittest.TestCase):
             wifi_source,
         )
         self.assertIn('"ap_dhcp_dns_offer", false', wifi_source)
-        self.assertIn(
-            "# CONFIG_LWIP_DHCPS_ADD_DNS is not set",
-            sdkconfig_defaults,
+        self.assertTrue(
+            _config_is_disabled(
+                sdkconfig_defaults, "CONFIG_LWIP_DHCPS_ADD_DNS"
+            )
         )
 
     def test_static_socket_capacity_configuration(self):
@@ -69,16 +71,14 @@ class FieldSafetyContractTests(unittest.TestCase):
         sdkconfig_defaults = (
             REPOSITORY_ROOT / "sdkconfig.defaults"
         ).read_text()
+        defaults = _config_assignments(sdkconfig_defaults)
 
         self.assertIn("#define WEBUI_MAX_CLIENT_SESSIONS 4", webui_source)
         self.assertIn(
             "cfg.max_open_sockets = WEBUI_MAX_CLIENT_SESSIONS;",
             webui_source,
         )
-        self.assertIn(
-            "CONFIG_LWIP_MAX_SOCKETS=10",
-            sdkconfig_defaults,
-        )
+        self.assertEqual(defaults.get("CONFIG_LWIP_MAX_SOCKETS"), "10")
 
     def test_static_manual_ota_api_route_is_registered(self):
         webui_source = (
@@ -122,33 +122,35 @@ class FieldSafetyContractTests(unittest.TestCase):
         sdkconfig_defaults = (
             REPOSITORY_ROOT / "sdkconfig.defaults"
         ).read_text()
+        defaults = _config_assignments(sdkconfig_defaults)
 
-        required = (
-            "CONFIG_SPIRAM=y",
-            "CONFIG_SPIRAM_MODE_OCT=y",
-            "CONFIG_SPIRAM_USE_MALLOC=y",
-            "CONFIG_SPIRAM_MEMTEST=y",
-            "CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384",
-            "CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768",
-        )
-        for option in required:
-            self.assertIn(option, sdkconfig_defaults)
+        required = {
+            "CONFIG_SPIRAM": "y",
+            "CONFIG_SPIRAM_MODE_OCT": "y",
+            "CONFIG_SPIRAM_USE_MALLOC": "y",
+            "CONFIG_SPIRAM_MEMTEST": "y",
+            "CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL": "16384",
+            "CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL": "32768",
+        }
+        for option, value in required.items():
+            self.assertEqual(defaults.get(option), value)
 
         # Still a separate evidence-gated measurement, not yet taken.
-        self.assertNotIn(
-            "CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y", sdkconfig_defaults
+        self.assertNotEqual(
+            defaults.get("CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP"), "y"
         )
 
         # mbedTLS in PSRAM was the first gated extra, enabled once an OTA
         # download under polling reproduced MBEDTLS_ERR_SSL_ALLOC_FAILED with
         # PSRAM on. It replaces the internal-alloc default, so both halves of
         # the choice must agree or the build silently keeps TLS internal.
-        self.assertIn("CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y", sdkconfig_defaults)
-        self.assertIn(
-            "# CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC is not set",
-            sdkconfig_defaults,
+        self.assertEqual(defaults.get("CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC"), "y")
+        self.assertTrue(
+            _config_is_disabled(
+                sdkconfig_defaults, "CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC"
+            )
         )
-        required = required + ("CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y",)
+        required["CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC"] = "y"
 
         # The standing gotcha: sdkconfig.defaults does not propagate into an
         # already-generated sdkconfig. When one exists locally it must agree,
@@ -157,11 +159,12 @@ class FieldSafetyContractTests(unittest.TestCase):
         generated = REPOSITORY_ROOT / "sdkconfig"
         if generated.exists():
             sdkconfig = generated.read_text()
-            for option in required:
-                self.assertIn(
-                    option,
-                    sdkconfig,
-                    f"{option} missing from the generated sdkconfig; "
+            generated_values = _config_assignments(sdkconfig)
+            for option, value in required.items():
+                self.assertEqual(
+                    generated_values.get(option),
+                    value,
+                    f"{option}={value} missing from the generated sdkconfig; "
                     "run idf.py fullclean or set it there too",
                 )
 
@@ -210,6 +213,23 @@ def _code(source):
     not read as the call itself."""
     return "\n".join(
         line.split("//", 1)[0] for line in source.splitlines()
+    )
+
+
+def _config_assignments(source):
+    """Return only active CONFIG_NAME=value assignments."""
+    assignments = {}
+    for line in source.splitlines():
+        match = re.fullmatch(r"(CONFIG_[A-Z0-9_]+)=(.*)", line.strip())
+        if match:
+            assignments[match.group(1)] = match.group(2)
+    return assignments
+
+
+def _config_is_disabled(source, name):
+    return any(
+        line.strip() == f"# {name} is not set"
+        for line in source.splitlines()
     )
 
 

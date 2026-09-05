@@ -1,5 +1,6 @@
 idf_component_register(
-    SRCS "wifi.c" "app_main.c" "modem.c" "webui.c" "led.c" "ota.c" "sdcard.c"
+    SRCS "wifi.c" "app_main.c" "modem.c" "webui.c" "webui_json_stream.c"
+         "led.c" "ota.c" "sdcard.c"
          "bms.c" "board_battery.c" "datalog.c" "mqtt.c" "timesync.c"
          "event_journal.c" "event_journal_core.c" "ota_policy_core.c"
     INCLUDE_DIRS "."
