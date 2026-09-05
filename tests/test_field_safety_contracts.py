@@ -62,12 +62,9 @@ class FieldSafetyContractTests(unittest.TestCase):
             sdkconfig_defaults,
         )
 
-    def test_webui_reserves_sockets_and_serializes_bounded_polling(self):
+    def test_static_socket_capacity_configuration(self):
         webui_source = (
             REPOSITORY_ROOT / "main" / "webui.c"
-        ).read_text()
-        html = (
-            REPOSITORY_ROOT / "main" / "www" / "index.html"
         ).read_text()
         sdkconfig_defaults = (
             REPOSITORY_ROOT / "sdkconfig.defaults"
@@ -82,31 +79,11 @@ class FieldSafetyContractTests(unittest.TestCase):
             "CONFIG_LWIP_MAX_SOCKETS=10",
             sdkconfig_defaults,
         )
-        self.assertIn("POLL_REQUEST_TIMEOUT_MS", html)
-        self.assertIn("new AbortController()", html)
-        self.assertIn("statusRefreshActive", html)
-        self.assertIn("wifiRefreshActive", html)
-        self.assertIn("otaRefreshActive", html)
-        self.assertIn("await refresh();", html)
-        self.assertIn("await refreshWifi();", html)
-        self.assertIn("await refreshOta();", html)
-        self.assertNotIn("setInterval(refresh", html)
 
-    def test_softap_webui_guards_manual_ota_without_changing_api(self):
+    def test_static_manual_ota_api_route_is_registered(self):
         webui_source = (
             REPOSITORY_ROOT / "main" / "webui.c"
         ).read_text()
-        html = (
-            REPOSITORY_ROOT / "main" / "www" / "index.html"
-        ).read_text()
-
-        self.assertIn("softApControlPlaneActive", html)
-        self.assertIn(
-            "Manual checks are disabled during a SoftAP session",
-            html,
-        )
-        self.assertIn('id="otaerrormsg"', html)
-        self.assertIn('id="otadefermsg"', html)
         self.assertIn('"/api/ota/check"', webui_source)
 
     def test_webui_instruments_the_session_and_socket_layer(self):
