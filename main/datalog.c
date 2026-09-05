@@ -35,7 +35,6 @@ static const char *TAG = "datalog";
 #define SPOOL_CURSOR_FILE  SPOOL_DIR "/bms.cursor"
 #define SPOOL_MAX_BYTES    (50ULL * 1024 * 1024)
 #define SPOOL_REPLAY_PER_TICK 2   // ticks are ~500 ms => ~4 msg/s ceiling
-#define SPOOL_CURSOR_EVERY 16     // acked lines between cursor persists
 
 static QueueHandle_t s_queue;
 static SemaphoreHandle_t s_mutex;
@@ -51,7 +50,6 @@ static bool s_sd_full;
 // Spool state (datalog task only)
 static long s_spool_size = -1;    // -1 = not yet loaded from disk
 static long s_spool_cursor;
-static int s_spool_unsaved_acks;
 static bool s_spool_replay_active;
 
 static void note_storage_failure(
@@ -365,7 +363,6 @@ static void spool_save_cursor(void)
         note_storage_failure("spool_cursor_failed", "cursor_open_failed",
                              errno);
     }
-    s_spool_unsaved_acks = 0;
 }
 
 static void spool_reset(void)
@@ -424,8 +421,10 @@ static void spool_append(const char *line)
     }
 }
 
-// Replay a few spooled lines per tick while the broker is reachable. Returns
-// once the budget is used, the spool is drained, or a publish fails.
+// Replay a few spooled lines per tick while the broker is reachable. Cursor
+// progress is checkpointed after each partial tick; a drained spool resets
+// both files. Returns once the budget is used, the spool is drained, or a
+// publish fails.
 static void spool_replay_tick(void)
 {
     spool_load_state();
@@ -461,6 +460,7 @@ static void spool_replay_tick(void)
     fseek(f, s_spool_cursor, SEEK_SET);
 
     char line[DL_LINE_MAX];
+    bool cursor_advanced = false;
     for (int i = 0; i < SPOOL_REPLAY_PER_TICK; i++) {
         long line_start = ftell(f);
         if (!fgets(line, sizeof(line), f)) {
@@ -475,6 +475,7 @@ static void spool_replay_tick(void)
             break;  // broker went away again; cursor stays at this line
         }
         s_spool_cursor = line_start + len;
+        cursor_advanced = true;
         if (line[0]) {
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_status.spool_replayed++;
@@ -485,9 +486,6 @@ static void spool_replay_tick(void)
                 "spool", "replay_progress", EVENT_SEVERITY_INFO,
                 "row_acknowledged", "{\"progress\":true}", false, 60000
             );
-        }
-        if (++s_spool_unsaved_acks >= SPOOL_CURSOR_EVERY) {
-            spool_save_cursor();
         }
     }
     fclose(f);
@@ -505,7 +503,7 @@ static void spool_replay_tick(void)
             "spool", "drained", EVENT_SEVERITY_INFO, "replay_complete",
             "{\"pending_bytes\":0}", true, 0
         );
-    } else if (s_spool_unsaved_acks) {
+    } else if (cursor_advanced) {
         spool_save_cursor();
     }
 }
