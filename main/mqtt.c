@@ -610,6 +610,8 @@ static void status_task(void *arg)
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_time_status_published = true;
             xSemaphoreGive(s_mutex);
+            vTaskDelete(NULL);
+            return;
         }
         vTaskDelay(pdMS_TO_TICKS(STATUS_TIME_POLL_MS));
     }

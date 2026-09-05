@@ -84,6 +84,24 @@ class MqttLifecycleHostTests(unittest.TestCase):
                 boot_ids.append(boot_line.removeprefix("BOOT_ID="))
             self.assertEqual(len(set(boot_ids)), 3)
 
+    def test_time_status_task_retries_then_exits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executable = self.build_harness(directory)
+            for scenario in [
+                "status-delayed-time",
+                "status-disconnected",
+                "status-enqueue-failure",
+            ]:
+                result = subprocess.run(
+                    [str(executable), scenario],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                self.assertEqual(
+                    result.returncode, 0, f"{scenario}: {result.stderr}"
+                )
 
 if __name__ == "__main__":
     unittest.main()

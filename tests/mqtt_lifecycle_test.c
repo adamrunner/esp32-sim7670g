@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,12 +47,48 @@ static mqtt_config_t s_nvs_config;
 static bool s_fail_next_queue_create;
 static bool s_ack_publishes;
 static esp_event_handler_t s_mqtt_event_handler;
+static TaskFunction_t s_status_task;
 static char s_will_payloads[4][256];
 static size_t s_will_payload_count;
-static char s_enqueued_payload[1024];
+static char s_enqueued_payloads[8][1024];
+static bool s_enqueued_success[8];
+static size_t s_enqueued_payload_count;
 static char s_published_payloads[4][256];
 static size_t s_published_payload_count;
 static uint32_t s_random_state;
+static bool s_timesync_valid;
+static int s_enqueue_failures_remaining;
+static int s_task_delete_count;
+static int s_task_delay_count;
+static int s_task_scenario;
+static jmp_buf s_task_exit;
+static bool s_track_event_allocations;
+static bool s_expect_next_event_allocation;
+static size_t s_event_allocations_outstanding;
+static size_t s_event_allocation_starts;
+
+static void *tracked_cjson_malloc(size_t size)
+{
+    if (s_track_event_allocations && s_expect_next_event_allocation) {
+        assert(s_event_allocations_outstanding == 0);
+        s_expect_next_event_allocation = false;
+        s_event_allocation_starts++;
+    }
+    void *memory = malloc(size);
+    if (memory && s_track_event_allocations) {
+        s_event_allocations_outstanding++;
+    }
+    return memory;
+}
+
+static void tracked_cjson_free(void *memory)
+{
+    if (memory && s_track_event_allocations) {
+        assert(s_event_allocations_outstanding > 0);
+        s_event_allocations_outstanding--;
+    }
+    free(memory);
+}
 
 static void reset_fakes(void)
 {
@@ -62,9 +99,19 @@ static void reset_fakes(void)
     s_fail_next_queue_create = false;
     s_ack_publishes = false;
     s_mqtt_event_handler = NULL;
+    s_status_task = NULL;
     s_will_payload_count = 0;
+    s_enqueued_payload_count = 0;
     s_published_payload_count = 0;
-    s_enqueued_payload[0] = '\0';
+    s_timesync_valid = false;
+    s_enqueue_failures_remaining = 0;
+    s_task_delete_count = 0;
+    s_task_delay_count = 0;
+    s_task_scenario = 0;
+    s_track_event_allocations = false;
+    s_expect_next_event_allocation = false;
+    s_event_allocations_outstanding = 0;
+    s_event_allocation_starts = 0;
     memset(&s_nvs_config, 0, sizeof(s_nvs_config));
     s_nvs_config.enabled = true;
     strcpy(s_nvs_config.uri, "mqtt://test.invalid:1883");
@@ -175,8 +222,9 @@ BaseType_t xTaskCreate(TaskFunction_t task, const char *name,
                        uint32_t stack_depth, void *argument,
                        UBaseType_t priority, TaskHandle_t *handle)
 {
-    (void)task;
-    (void)name;
+    if (strcmp(name, "mqtt_status") == 0) {
+        s_status_task = task;
+    }
     (void)stack_depth;
     (void)argument;
     (void)priority;
@@ -192,11 +240,24 @@ TickType_t xTaskGetTickCount(void)
 void vTaskDelay(TickType_t ticks)
 {
     (void)ticks;
+    s_task_delay_count++;
+    assert(s_task_delay_count <= 2);
+    if (s_task_scenario == 1) {
+        s_timesync_valid = true;
+    } else if (s_task_scenario == 2) {
+        assert(s_mqtt_event_handler);
+        esp_mqtt_event_t connected = {0};
+        s_mqtt_event_handler(NULL, NULL, MQTT_EVENT_CONNECTED, &connected);
+    } else if (s_task_scenario == 3) {
+        s_enqueue_failures_remaining = 0;
+    }
 }
 
 void vTaskDelete(TaskHandle_t task)
 {
-    (void)task;
+    assert(task == NULL);
+    s_task_delete_count++;
+    longjmp(s_task_exit, 1);
 }
 
 esp_mqtt_client_handle_t esp_mqtt_client_init(
@@ -265,12 +326,20 @@ int esp_mqtt_client_enqueue(esp_mqtt_client_handle_t client,
 {
     (void)client;
     (void)topic;
-    snprintf(s_enqueued_payload, sizeof(s_enqueued_payload), "%s", data);
+    assert(s_enqueued_payload_count < 8);
+    size_t index = s_enqueued_payload_count++;
+    snprintf(s_enqueued_payloads[index], sizeof(s_enqueued_payloads[index]),
+             "%s", data);
     (void)len;
     (void)qos;
     (void)retain;
     (void)store;
-    return 40;
+    bool succeeds = s_enqueue_failures_remaining == 0;
+    if (!succeeds) {
+        s_enqueue_failures_remaining--;
+    }
+    s_enqueued_success[index] = succeeds;
+    return succeeds ? 40 + (int)index : -1;
 }
 
 esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *handle)
@@ -395,7 +464,7 @@ esp_err_t ota_acknowledge_rollback_evidence(void)
 
 bool timesync_valid(void)
 {
-    return false;
+    return s_timesync_valid;
 }
 
 void timesync_get_status(timesync_status_t *out)
@@ -484,10 +553,33 @@ static bool assert_journal_event_boot_id(const cJSON *event, size_t index,
 {
     const char *expected_boot_id = context;
     const cJSON *boot_id = cJSON_GetObjectItemCaseSensitive(event, "boot_id");
-    assert(index == 0);
+    assert(index < 2);
     assert(cJSON_IsString(boot_id));
     assert(strcmp(boot_id->valuestring, expected_boot_id) == 0);
+    s_expect_next_event_allocation = true;
     return true;
+}
+
+static void assert_event_visit_lifetime(const char *expected_boot_id)
+{
+    event_journal_emit(
+        "test", "second_event", EVENT_SEVERITY_INFO,
+        "lifetime", "{}", false, 0
+    );
+    cJSON_Hooks hooks = {
+        .malloc_fn = tracked_cjson_malloc,
+        .free_fn = tracked_cjson_free,
+    };
+    cJSON_InitHooks(&hooks);
+    s_track_event_allocations = true;
+    s_expect_next_event_allocation = true;
+    assert(event_journal_visit_events_json(
+        2, assert_journal_event_boot_id, (void *)expected_boot_id
+    ));
+    assert(s_event_allocation_starts == 2);
+    assert(s_event_allocations_outstanding == 0);
+    s_track_event_allocations = false;
+    cJSON_InitHooks(NULL);
 }
 
 static void test_shared_boot_identity(bool journal_setup_fails)
@@ -506,8 +598,7 @@ static void test_shared_boot_identity(bool journal_setup_fails)
         event_journal_status_t journal_status;
         event_journal_get_status(&journal_status);
         assert(strcmp(journal_status.boot_id, expected_boot_id) == 0);
-        assert(event_journal_visit_events_json(
-            1, assert_journal_event_boot_id, expected_boot_id));
+        assert_event_visit_lifetime(expected_boot_id);
     }
 
     mqtt_init();
@@ -517,7 +608,8 @@ static void test_shared_boot_identity(bool journal_setup_fails)
     assert(s_mqtt_event_handler);
     esp_mqtt_event_t connected = {0};
     s_mqtt_event_handler(NULL, NULL, MQTT_EVENT_CONNECTED, &connected);
-    assert_boot_id_document(s_enqueued_payload, expected_boot_id);
+    assert(s_enqueued_payload_count == 1);
+    assert_boot_id_document(s_enqueued_payloads[0], expected_boot_id);
 
     mqtt_maintenance_tick();
     assert(s_published_payload_count == 1);
@@ -534,6 +626,76 @@ static void test_shared_boot_identity(bool journal_setup_fails)
     printf("BOOT_ID=%s\n", expected_boot_id);
 }
 
+static bool payload_has_reason(const char *document, const char *reason)
+{
+    cJSON *root = cJSON_Parse(document);
+    assert(root);
+    cJSON *value = cJSON_GetObjectItemCaseSensitive(root, "status_reason");
+    bool matches = cJSON_IsString(value) &&
+                   strcmp(value->valuestring, reason) == 0;
+    cJSON_Delete(root);
+    return matches;
+}
+
+static size_t successful_status_count(const char *reason)
+{
+    size_t count = 0;
+    for (size_t i = 0; i < s_enqueued_payload_count; i++) {
+        if (s_enqueued_success[i] &&
+            payload_has_reason(s_enqueued_payloads[i], reason)) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static void run_status_task_until_delete(void)
+{
+    assert(s_status_task);
+    if (setjmp(s_task_exit) == 0) {
+        s_status_task(NULL);
+        assert(false);
+    }
+    assert(s_task_delete_count == 1);
+    assert(successful_status_count("time_synchronized") == 1);
+}
+
+static void test_status_task_retries_then_exits(int scenario)
+{
+    reset_fakes();
+    s_task_scenario = scenario;
+    event_journal_init();
+    mqtt_init();
+    assert(s_mqtt_event_handler);
+
+    if (scenario == 1) {
+        esp_mqtt_event_t connected = {0};
+        s_mqtt_event_handler(NULL, NULL, MQTT_EVENT_CONNECTED, &connected);
+        assert(!s_timesync_valid);
+    } else if (scenario == 2) {
+        esp_mqtt_event_t connected = {0};
+        s_mqtt_event_handler(NULL, NULL, MQTT_EVENT_CONNECTED, &connected);
+        esp_mqtt_event_t disconnected = {0};
+        s_mqtt_event_handler(NULL, NULL, MQTT_EVENT_DISCONNECTED,
+                             &disconnected);
+        s_timesync_valid = true;
+    } else {
+        assert(scenario == 3);
+        s_timesync_valid = true;
+        s_enqueue_failures_remaining = 2;
+        esp_mqtt_event_t connected = {0};
+        s_mqtt_event_handler(NULL, NULL, MQTT_EVENT_CONNECTED, &connected);
+        assert(s_enqueue_failures_remaining == 1);
+    }
+
+    run_status_task_until_delete();
+    assert(s_task_delay_count == 1);
+    if (scenario == 2) {
+        assert(successful_status_count("boot") == 1);
+        assert(successful_status_count("mqtt_reconnected") == 1);
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 1 || strcmp(argv[1], "a1") == 0) {
@@ -546,6 +708,12 @@ int main(int argc, char **argv)
         assert(argc == 3);
         s_random_state = (uint32_t)strtoul(argv[2], NULL, 0);
         test_shared_boot_identity(true);
+    } else if (strcmp(argv[1], "status-delayed-time") == 0) {
+        test_status_task_retries_then_exits(1);
+    } else if (strcmp(argv[1], "status-disconnected") == 0) {
+        test_status_task_retries_then_exits(2);
+    } else if (strcmp(argv[1], "status-enqueue-failure") == 0) {
+        test_status_task_retries_then_exits(3);
     } else {
         return 2;
     }
