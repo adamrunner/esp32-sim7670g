@@ -35,6 +35,7 @@ DO_BUILD=1
 ALLOW_DIRTY=0
 FORCE=0
 DRY_RUN=0
+BUILT_VERSION=""
 
 die() { echo "release.sh: error: $*" >&2; exit 1; }
 
@@ -55,12 +56,26 @@ done
 # --- build ------------------------------------------------------------------
 
 if [[ $DO_BUILD -eq 1 ]]; then
+    # ESP-IDF falls back to project version "1" when its cached Git executable
+    # is unavailable. Resolve a working Git explicitly and inject the version
+    # so a release can never silently lose its commit identity.
+    if [[ -x /opt/homebrew/bin/git ]]; then
+        GIT_BIN=/opt/homebrew/bin/git
+    else
+        GIT_BIN="$(command -v git || true)"
+    fi
+    [[ -n "$GIT_BIN" ]] || die "git not found; cannot derive release version"
+    "$GIT_BIN" --version >/dev/null 2>&1 || die "git is not usable: $GIT_BIN"
+    BUILT_VERSION="$("$GIT_BIN" -C "$REPO_ROOT" describe --always --dirty)"
+    [[ -n "$BUILT_VERSION" ]] || die "git returned an empty release version"
+    export PATH="$(dirname "$GIT_BIN"):$PATH"
+
     # Pin the known-good IDF environment rather than inheriting whichever
     # idf.py happens to be on PATH. The py3.13 environment intentionally has
     # an esptool development build that IDF's stable constraints reject.
     export IDF_PYTHON_ENV_PATH="${RELEASE_IDF_PYTHON_ENV_PATH:-$HOME/.espressif/python_env/idf5.5_py3.10_env}"
     source "$HOME/esp/v5.5/esp-idf/export.sh"
-    (cd "$REPO_ROOT" && idf.py build)
+    (cd "$REPO_ROOT" && idf.py -DGIT_EXECUTABLE="$GIT_BIN" -DPROJECT_VER="$BUILT_VERSION" build)
 fi
 
 BIN="${BIN:-$REPO_ROOT/build/$PROJECT.bin}"
@@ -72,6 +87,9 @@ DESC="${DESC:-$REPO_ROOT/build/project_description.json}"
 
 VERSION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["project_version"])' "$DESC")"
 [[ -n "$VERSION" ]] || die "empty project_version in $DESC"
+if [[ -n "$BUILT_VERSION" && "$VERSION" != "$BUILT_VERSION" ]]; then
+    die "built version '$VERSION' does not match Git version '$BUILT_VERSION'"
+fi
 
 # The manifest version must equal the esp_app_desc version baked into this
 # exact binary, or the fleet will update in a loop. Guard against a stale
