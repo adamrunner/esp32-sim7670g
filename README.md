@@ -11,6 +11,8 @@ web UI for monitoring/configuring the cellular connection.
   deduplication, durable diagnostics, and field validation.
 - [Supervised modem restart](docs/MODEM_RESTART_PLAN.md)
 - [OTA reliability and failure traceability](docs/OTA_RELIABILITY_PLAN.md)
+- [Slop audit cleanup and agent handoff](docs/SLOP_AUDIT_CLEANUP_PLAN.md) —
+  scoped cleanup packages, ownership, regression checks, and acceptance criteria.
 
 ## What it does
 
