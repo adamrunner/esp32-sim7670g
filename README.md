@@ -10,6 +10,9 @@ web UI for monitoring/configuring the cellular connection.
   phased work for cellular recovery, local WiFi access, delivery
   deduplication, durable diagnostics, and field validation.
 - [Supervised modem restart](docs/MODEM_RESTART_PLAN.md)
+- [Low-power operation](docs/LOW_POWER_PLAN.md) — battery-aware radio
+  duty-cycling, the board's modem power switch (GPIO21 / DIP SW2-3), and a
+  dedicated gateway battery.
 - [OTA reliability and failure traceability](docs/OTA_RELIABILITY_PLAN.md)
 - [Slop audit cleanup and agent handoff](docs/SLOP_AUDIT_CLEANUP_PLAN.md) —
   scoped cleanup packages, ownership, regression checks, and acceptance criteria.
