@@ -207,6 +207,31 @@ class FieldSafetyContractTests(unittest.TestCase):
         ):
             self.assertIn(field, webui_source)
 
+    def test_modem_power_is_enabled_and_held_before_the_modem_starts(self):
+        # Once DIP SW2-3 is turned OFF, an image that does not drive GPIO21
+        # high boots with an unpowered modem and no cellular path for OTA.
+        modem_source = _code(
+            (REPOSITORY_ROOT / "main" / "modem.c").read_text()
+        )
+        self.assertRegex(
+            modem_source, r"#define\s+MODEM_POWER_EN_PIN\s+21\b"
+        )
+        power_enable = modem_source.split(
+            "static void modem_power_enable(void)", 1
+        )[1].split("\n}", 1)[0]
+        set_high = power_enable.index(
+            "gpio_set_level(MODEM_POWER_EN_PIN, 1)"
+        )
+        self.assertLess(set_high, power_enable.index("gpio_config("))
+        self.assertIn("gpio_hold_en(MODEM_POWER_EN_PIN)", power_enable)
+        self.assertNotIn("gpio_hold_dis(", power_enable)
+
+        init = modem_source.split("void modem_init(void)", 1)[1]
+        self.assertLess(
+            init.index("modem_power_enable();"),
+            init.index("esp_modem_new_dev("),
+        )
+
 
 def _code(source):
     """Source with // comment bodies stripped, so prose about a call does

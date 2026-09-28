@@ -9,6 +9,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
@@ -40,6 +41,12 @@ static const char *TAG = "modem";
 #define MODEM_UART      UART_NUM_1
 #define MODEM_TX_PIN    18
 #define MODEM_RX_PIN    17
+// GPIO21 drives the M2A/M2B load switch from VBAT onto the modem's VVBAT
+// supply; R33 pulls it off by default. DIP SW2-3 ("4G") ON forces the switch
+// on regardless of this pin, which is how boards ship. PWRKEY is not routed to
+// the ESP32 — Q9 asserts it whenever VVBAT is present, so the modem boots as
+// soon as this pin applies power. See docs/LOW_POWER_PLAN.md, "Board hardware".
+#define MODEM_POWER_EN_PIN  21
 // 460800 is the fastest rate this modem offers (AT+IPR=? — no 921600).
 // MODEM_BAUD_SAFE is its power-on default; we never persist IPR (AT&W), so
 // AT+CRESET or a power cycle always brings the modem back to 115200.
@@ -1570,8 +1577,36 @@ static void modem_task(void *arg)
     }
 }
 
+// Take software ownership of modem power. With DIP SW2-3 ON this is a no-op
+// electrically; it exists so the DIP can later be turned OFF without the modem
+// losing power. The level is set before the pin becomes an output so it never
+// drives low, and the pad hold keeps it high across software, watchdog and OTA
+// resets (only a power-down clears it), so the modem is not power-cycled on
+// every ESP32 reboot and an older image booted by rollback after a soft reset
+// still finds the modem powered. Code that later switches the modem off must
+// configure it as a high output before calling gpio_hold_dis(); releasing the
+// hold while the pad is still an input lets R33 cut the modem's power.
+static void modem_power_enable(void)
+{
+    ESP_ERROR_CHECK(gpio_set_level(MODEM_POWER_EN_PIN, 1));
+    const gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << MODEM_POWER_EN_PIN,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&cfg));
+    ESP_ERROR_CHECK(gpio_set_level(MODEM_POWER_EN_PIN, 1));
+    ESP_ERROR_CHECK(gpio_hold_en(MODEM_POWER_EN_PIN));
+    ESP_LOGI(TAG, "modem power enable (GPIO%d) driven high and held",
+             MODEM_POWER_EN_PIN);
+}
+
 void modem_init(void)
 {
+    modem_power_enable();
+
     s_at_mutex = xSemaphoreCreateMutex();
     s_status_mutex = xSemaphoreCreateMutex();
     s_diag_mutex = xSemaphoreCreateMutex();
