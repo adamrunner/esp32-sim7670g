@@ -62,8 +62,22 @@ so it can be repeated.
   replays at ~4 msg/s (`SPOOL_REPLAY_PER_TICK` 2 per ~500 ms tick). Thirty
   minutes of 10 s rows is 180 rows, about 45 s of replay.
 - Delivery duplicates (~5%, FIELD plan Phase 4) will now show up at every
-  upload window, not only after coverage gaps. Delivery identity becomes more
-  valuable but is not a prerequisite.
+  upload window, not only after coverage gaps. They are harmless as long as a
+  replayed row is **identical** to the original. Since 2026-09-28 the backend
+  logger (`bms-dashboard-server` 973ce52) drops a legacy CSV row that matches a
+  stored row in every value column. That catches both the sub-second
+  duplicate publishes and spool replays, because `spool_append()` stores the
+  exact CSV line and replay re-sends it unchanged. Delivery identity is
+  therefore not a prerequisite for this plan, **with one condition**: the spool
+  must keep storing and replaying the original line byte-for-byte. Any change
+  that re-renders a row at replay time makes the backend count the replay as a
+  new sample. Examples: storing values instead of text, compacting or batching
+  rows into a new format, changing float formatting or the CSV layout, or
+  recomputing `elapsed_seconds`. Such a change must ship together with, or
+  after, delivery identity (schema-v2 envelope with `boot_id` + `sequence`
+  assigned at capture and reused on every retry and replay; see
+  `bms-dashboard-server/TELEMETRY-DEDUPLICATION-PLAN.md`). The backend already
+  accepts that envelope.
 - The backend flags `telemetry_stale` after 900 s
   (`TELEMETRY_STALE_AFTER_SECONDS`). Every eco interval exceeds that.
 
