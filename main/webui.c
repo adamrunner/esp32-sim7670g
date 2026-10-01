@@ -63,8 +63,15 @@ typedef struct {
     uint32_t sessions_closed_total;
     uint32_t session_high_water;
     uint32_t session_table_full_count;
+    // HTTP_SERVER_EVENT_ERROR fires for every 4xx/5xx the server sends
+    // (its payload is an httpd_err_code_t), so it measures error *responses*
+    // — mostly 404s for browser probes like /favicon.ico — not socket trouble.
+    uint32_t error_response_count;
+    int last_error_response_code;
+    // Genuine transport failures: a response send() that failed because the
+    // client vanished or stalled past send_wait_timeout.
     uint32_t transport_error_count;
-    int last_transport_error_code;
+    uint64_t last_transport_error_uptime_ms;
     uint32_t send_stall_count;
     uint32_t max_chunk_send_ms;
     uint32_t request_during_ota_count;
@@ -73,11 +80,34 @@ typedef struct {
     uint32_t duration_le_1000ms;
     uint32_t duration_le_2500ms;
     uint32_t duration_gt_2500ms;
+    // Web-service watchdog: liveness of the single server task, measured by
+    // how long a queued heartbeat work item waits before it runs.
+    uint32_t heartbeat_count;
+    uint32_t heartbeat_max_latency_ms;
+    uint32_t heartbeat_queue_failure_count;
+    uint32_t heartbeat_stall_count;
+    uint64_t last_heartbeat_uptime_ms;
+    bool heartbeat_pending;
+    bool heartbeat_stalled;
+    int64_t heartbeat_queued_us;
 } webui_observability_t;
 
 // Client sessions the HTTP server may hold at once; the lwIP reservation
 // arithmetic behind this value is documented at the httpd_config below.
-#define WEBUI_MAX_CLIENT_SESSIONS 4
+#define WEBUI_MAX_CLIENT_SESSIONS 8
+// TCP keepalive on accepted sessions: a phone that walks away or locks its
+// screen without closing is probed after 5 s idle and dropped after three
+// unanswered probes 2 s apart (~11 s), instead of holding its socket until
+// LRU pressure reclaims it.
+#define WEBUI_KEEPALIVE_IDLE_S 5
+#define WEBUI_KEEPALIVE_INTERVAL_S 2
+#define WEBUI_KEEPALIVE_COUNT 3
+// Watchdog cadence and stall threshold. The threshold sits well above the
+// slowest legitimate handler (/api/ping: DNS plus four 1 s + 3 s timeout
+// probes and a 5 s margin, ~40 s worst case with mutex waits), so only a
+// genuinely wedged server task trips it.
+#define WEBUI_WATCHDOG_PERIOD_MS 10000
+#define WEBUI_WATCHDOG_STALL_MS 60000
 // One response chunk blocking in send() at least this long counts as a
 // send stall (a slow, dead, or RF-degraded client pinning the HTTP task).
 #define WEBUI_SEND_STALL_THRESHOLD_MS 500
@@ -152,14 +182,16 @@ static void http_server_event_handler(
     }
     int code = data ? (int)*(httpd_err_code_t *)data : -1;
     xSemaphoreTake(s_http_mutex, portMAX_DELAY);
-    s_http_status.transport_error_count++;
-    s_http_status.last_transport_error_code = code;
+    s_http_status.error_response_count++;
+    s_http_status.last_error_response_code = code;
     xSemaphoreGive(s_http_mutex);
     char details[48];
     snprintf(details, sizeof(details), "{\"err_code\":%d}", code);
+    // Informational: handler failures already journal request_failed with
+    // full resource detail; this mostly records probe 404s.
     event_journal_emit(
-        "http", "server_error_event", EVENT_SEVERITY_WARN,
-        "httpd_transport_error", details, false, 30000
+        "http", "error_response", EVENT_SEVERITY_INFO,
+        "httpd_error_status", details, false, 30000
     );
 }
 
@@ -279,10 +311,14 @@ static void webui_status_json(cJSON *root)
                             status.session_high_water);
     cJSON_AddNumberToObject(http, "session_table_full_count",
                             status.session_table_full_count);
+    cJSON_AddNumberToObject(http, "error_response_count",
+                            status.error_response_count);
+    cJSON_AddNumberToObject(http, "last_error_response_code",
+                            status.last_error_response_code);
     cJSON_AddNumberToObject(http, "transport_error_count",
                             status.transport_error_count);
-    cJSON_AddNumberToObject(http, "last_transport_error_code",
-                            status.last_transport_error_code);
+    cJSON_AddNumberToObject(http, "last_transport_error_uptime_ms",
+                            (double)status.last_transport_error_uptime_ms);
     cJSON_AddNumberToObject(http, "send_stall_count",
                             status.send_stall_count);
     cJSON_AddNumberToObject(http, "max_chunk_send_ms",
@@ -301,6 +337,18 @@ static void webui_status_json(cJSON *root)
                             status.duration_le_2500ms);
     cJSON_AddNumberToObject(durations, "gt_2500ms",
                             status.duration_gt_2500ms);
+    cJSON *watchdog = cJSON_AddObjectToObject(http, "watchdog");
+    cJSON_AddNumberToObject(watchdog, "heartbeat_count",
+                            status.heartbeat_count);
+    cJSON_AddNumberToObject(watchdog, "heartbeat_max_latency_ms",
+                            status.heartbeat_max_latency_ms);
+    cJSON_AddNumberToObject(watchdog, "heartbeat_queue_failure_count",
+                            status.heartbeat_queue_failure_count);
+    cJSON_AddNumberToObject(watchdog, "stall_count",
+                            status.heartbeat_stall_count);
+    cJSON_AddBoolToObject(watchdog, "stalled", status.heartbeat_stalled);
+    cJSON_AddNumberToObject(watchdog, "last_heartbeat_uptime_ms",
+                            (double)status.last_heartbeat_uptime_ms);
 }
 
 static esp_err_t root_get_handler(httpd_req_t *req)
@@ -1110,6 +1158,11 @@ static esp_err_t observed_handler(httpd_req_t *req)
         if (s_current_response_error) {
             s_http_status.response_error_count++;
         }
+        if (diagnostic_error == ESP_ERR_HTTPD_RESP_SEND) {
+            s_http_status.transport_error_count++;
+            s_http_status.last_transport_error_uptime_ms =
+                (uint64_t)esp_timer_get_time() / 1000U;
+        }
         s_http_status.last_error = diagnostic_error;
         s_http_status.last_error_uptime_ms =
             (uint64_t)esp_timer_get_time() / 1000U;
@@ -1163,15 +1216,104 @@ static esp_err_t observed_handler(httpd_req_t *req)
     return result;
 }
 
+// Web-service watchdog. A heartbeat work item is queued onto the server
+// task through its internal control socket (no extra lwIP socket), so it
+// runs only when the task returns to its select() loop; a heartbeat still
+// pending after WEBUI_WATCHDOG_STALL_MS means the task is wedged in a
+// handler or send. Detection only: httpd_stop() signals the server task and
+// then waits for it to exit, so it cannot recover a wedged task, and a
+// reboot escalation is a field-safety decision this plan has not approved.
+static httpd_handle_t s_server;
+
+static void heartbeat_work(void *arg)
+{
+    int64_t now_us = esp_timer_get_time();
+    xSemaphoreTake(s_http_mutex, portMAX_DELAY);
+    uint32_t latency_ms =
+        (uint32_t)((now_us - s_http_status.heartbeat_queued_us) / 1000);
+    if (latency_ms > s_http_status.heartbeat_max_latency_ms) {
+        s_http_status.heartbeat_max_latency_ms = latency_ms;
+    }
+    s_http_status.heartbeat_count++;
+    s_http_status.heartbeat_pending = false;
+    s_http_status.last_heartbeat_uptime_ms = (uint64_t)now_us / 1000U;
+    xSemaphoreGive(s_http_mutex);
+}
+
+static void watchdog_task(void *arg)
+{
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(WEBUI_WATCHDOG_PERIOD_MS));
+        int64_t now_us = esp_timer_get_time();
+
+        xSemaphoreTake(s_http_mutex, portMAX_DELAY);
+        bool pending = s_http_status.heartbeat_pending;
+        bool was_stalled = s_http_status.heartbeat_stalled;
+        uint32_t waited_ms = pending
+            ? (uint32_t)((now_us - s_http_status.heartbeat_queued_us) / 1000)
+            : 0;
+        bool stalled = pending && waited_ms >= WEBUI_WATCHDOG_STALL_MS;
+        uint64_t last_request_ms = s_http_status.last_request_uptime_ms;
+        uint32_t sessions_open = s_http_status.sessions_open;
+        char last_uri[sizeof(s_http_status.last_uri)];
+        strlcpy(last_uri, s_http_status.last_uri, sizeof(last_uri));
+        if (stalled && !was_stalled) {
+            s_http_status.heartbeat_stalled = true;
+            s_http_status.heartbeat_stall_count++;
+        }
+        if (!pending) {
+            s_http_status.heartbeat_stalled = false;
+            s_http_status.heartbeat_pending = true;
+            s_http_status.heartbeat_queued_us = now_us;
+        }
+        xSemaphoreGive(s_http_mutex);
+
+        if (stalled && !was_stalled) {
+            char details[160];
+            snprintf(
+                details, sizeof(details),
+                "{\"waited_ms\":%lu,\"last_uri\":\"%.31s\","
+                "\"last_request_age_ms\":%lu,\"sessions_open\":%lu}",
+                (unsigned long)waited_ms, last_uri,
+                (unsigned long)((uint64_t)now_us / 1000U - last_request_ms),
+                (unsigned long)sessions_open
+            );
+            event_journal_emit(
+                "http", "server_unresponsive", EVENT_SEVERITY_ERROR,
+                "heartbeat_stalled", details, true, 0
+            );
+        } else if (!pending && was_stalled) {
+            event_journal_emit(
+                "http", "server_recovered", EVENT_SEVERITY_INFO,
+                "heartbeat_completed", "{}", true, 0
+            );
+        }
+
+        if (!pending &&
+            httpd_queue_work(s_server, heartbeat_work, NULL) != ESP_OK) {
+            xSemaphoreTake(s_http_mutex, portMAX_DELAY);
+            s_http_status.heartbeat_pending = false;
+            s_http_status.heartbeat_queue_failure_count++;
+            xSemaphoreGive(s_http_mutex);
+        }
+    }
+}
+
 void webui_init(void)
 {
     s_http_mutex = xSemaphoreCreateMutex();
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.lru_purge_enable = true;
-    // The server also owns three internal sockets. Four client sessions keep
-    // its total at seven of the ten lwIP slots, reserving three for MQTT, OTA,
-    // and transient outbound work.
+    // The server also owns three internal sockets. Eight client sessions keep
+    // its total at eleven of the sixteen lwIP slots, reserving five for MQTT,
+    // OTA, and transient outbound work. Eight also covers the six parallel
+    // connections one iOS Safari instance opens, so the browser's own
+    // fan-out no longer forces LRU purge of the live poll socket.
     cfg.max_open_sockets = WEBUI_MAX_CLIENT_SESSIONS;
+    cfg.keep_alive_enable = true;
+    cfg.keep_alive_idle = WEBUI_KEEPALIVE_IDLE_S;
+    cfg.keep_alive_interval = WEBUI_KEEPALIVE_INTERVAL_S;
+    cfg.keep_alive_count = WEBUI_KEEPALIVE_COUNT;
     cfg.max_uri_handlers = 18;  // default 8; observability adds /api/events
     cfg.stack_size = 8192;  // ping/DNS handler keeps sizeable buffers on the stack
     // A dead or RF-degraded client otherwise pins the single server task in
@@ -1189,6 +1331,7 @@ void webui_init(void)
 
     httpd_handle_t server = NULL;
     ESP_ERROR_CHECK(httpd_start(&server, &cfg));
+    s_server = server;
 
     static const httpd_uri_t routes[] = {
         { .uri = "/",           .method = HTTP_GET,  .handler = root_get_handler },
@@ -1218,4 +1361,10 @@ void webui_init(void)
         "http", "server_started", EVENT_SEVERITY_INFO, "listener_ready",
         "{\"port\":80}", true, 0
     );
+    if (xTaskCreate(watchdog_task, "web_wdog", 3072, NULL, 3, NULL) != pdPASS) {
+        event_journal_emit(
+            "http", "watchdog_start_failed", EVENT_SEVERITY_ERROR,
+            "task_create_failed", "{}", true, 0
+        );
+    }
 }

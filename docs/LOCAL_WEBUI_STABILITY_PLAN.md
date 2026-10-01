@@ -4,7 +4,8 @@ Status: in progress — Phase A complete and accepted on field evidence
 (2026-08-17). Phase B: PSRAM plus mbedTLS-in-PSRAM is published as `bffd324`
 and running on the device (2026-08-17). Four of five exit criteria pass; only
 the BMS + SD load soak is outstanding, pending the gateway's return to the
-pack.
+pack. Phase C implemented at source level (2026-09-30); hardware kill-test
+and publication pending. Phases D and D′ (SSE push) re-scoped 2026-09-30.
 
 Evidence date: 2026-08-08 (diagnosis), 2026-08-17 (Phase A field results)
 
@@ -822,15 +823,72 @@ Exit criteria:
   passes. Safari with six parallel connections never evicts the poll
   socket.
 
+#### Phase C implementation record — 2026-09-30
+
+- **Socket budget:** `CONFIG_LWIP_MAX_SOCKETS` 10 → 16 and
+  `WEBUI_MAX_CLIENT_SESSIONS` 4 → 8. httpd now holds 11 slots (8 sessions +
+  3 internal), leaving 5 for MQTT, OTA, and transient work. Eight covers
+  Safari's six parallel connections with two to spare, which addresses the
+  `session_table_full_count` / `session_high_water: 4` saturation recorded in
+  Phases A and B. `CONFIG_LWIP_MAX_ACTIVE_TCP` is already 16, so 8 sessions
+  plus MQTT and OTA still fit in the active PCB pool.
+- **TCP keepalive:** done with httpd's own `keep_alive_*` config fields, not a
+  custom `setsockopt` in `open_fn`. Idle 5 s, interval 2 s, count 3, so a
+  vanished client is dropped about 11 s after its last traffic.
+  `LWIP_TCP_KEEPALIVE` is already 1 in the IDF lwIP port.
+- **Error counter correction:** `HTTP_SERVER_EVENT_ERROR` (fired from
+  `httpd_resp_send_err()` with the status code) now feeds
+  `error_response_count` / `last_error_response_code`, and its journal entry
+  is `http/error_response` at INFO severity, renamed from
+  `http/server_error_event` with reason `httpd_transport_error`.
+  `transport_error_count` now counts real send failures: requests whose
+  handler or stream ended with `ESP_ERR_HTTPD_RESP_SEND`, plus
+  `last_transport_error_uptime_ms`. `last_transport_error_code` is removed.
+  Nothing outside `webui.c` read the old fields.
+- **Web-service watchdog — detection only, deliberately.** A `web_wdog` task
+  queues a heartbeat with `httpd_queue_work()` every 10 s. The heartbeat
+  travels over httpd's existing control socket, so it costs no lwIP slot, and
+  it runs only when the server task returns to its `select()` loop. If one
+  heartbeat is still pending after 60 s, the watchdog journals a critical
+  `http/server_unresponsive` event (waited ms, last URI, last-request age,
+  open sessions). When the task comes back it journals
+  `http/server_recovered`. `/api/status.http.watchdog` reports
+  `heartbeat_count`, `heartbeat_max_latency_ms`,
+  `heartbeat_queue_failure_count`, `stall_count`, `stalled`, and
+  `last_heartbeat_uptime_ms`. The 60 s threshold sits above the slowest
+  legitimate handler (`/api/ping` is about 40 s worst case including mutex
+  waits).
+  **Why there is no restart:** in IDF 5.5, `httpd_stop()` sends a stop
+  message and then loops until the server task reports `THREAD_STOPPED`. A
+  task wedged inside a handler never reads that message, so `httpd_stop()`
+  would hang the watchdog too. Restart-not-reboot therefore cannot recover
+  the failure the watchdog detects. The only effective escalation is a
+  reboot, which is a field-safety decision of the same kind as the disabled
+  modem-reset escalation. That needs explicit approval and field evidence
+  that a stall actually happens. `heartbeat_max_latency_ms` supplies that
+  evidence.
+- **Send/recv timeout verification** (2 s since Phase A) is folded into the
+  hardware kill-test below.
+- Validation: 32 host tests pass. The socket contract now checks sessions
+  ≥ 6 and at least 3 reserved slots, replacing the exact old values, and new
+  contracts cover keepalive, watchdog detection-only, and the counter split.
+  The pinned ESP-IDF 5.5 / Python 3.10 build is clean: the app is
+  `0x155f90` bytes, leaving 67% of the smallest app partition free. Not
+  flashed, not published. The kill-test exit criterion, plus confirming
+  internal min free heap with up to 8 sessions open, remain hardware gates.
+
 ### Phase D: One poll request, friendlier cadence
 
 Shrinks exposure to every remaining failure mechanism (L4).
 
 Deliverables:
 
-- Fold the `wifi` and `ota` payloads into `/api/status` (both already
-  exist as builder fragments; the standalone endpoints stay for
-  compatibility and manual use). The dashboard makes **one** request per
+- Fold the `wifi` and `ota` payloads into `/api/status`. The standalone
+  endpoints stay for compatibility and manual use. Correction (2026-09-30):
+  the existing `wifi` status fragment (`wifi_status_json`) carries only
+  counters. The UI-facing fields that `/api/wifi` serves (`ssid`, `ip`,
+  `rssi_dbm`, `ap_ssid`, `connected`) must be added to it, and `ota` needs a
+  new `ota_status_json` builder extracted from `ota_get_handler`. The dashboard makes **one** request per
   cycle instead of three: ~3× fewer requests, aborts, and socket events.
 - Slow the cycle to 3 s; all cards update atomically so perceived
   freshness is unchanged or better.
@@ -843,8 +901,65 @@ Deliverables:
 - Keep the visible error banner; add a small "last update N s ago"
   freshness indicator so a paused/backed-off state is legible.
 
+- **Cache the page itself, with no stale-UI risk.** Serve `/` with
+  `ETag` = the running image's `app_elf_sha256` and
+  `Cache-Control: no-cache`, and answer a matching `If-None-Match` with 304
+  and no body. Every OTA changes the ETag, so a browser can never run an old
+  UI against new firmware.
+  Embed a build-time gzip of `index.html` (CMake custom command feeding
+  `EMBED_FILES`) and serve it with `Content-Encoding: gzip`, about
+  31 KB → 8 KB on a cold load.
+  No filename fingerprinting: all CSS and JS are inline in one file, and
+  splitting them out would add requests and sockets per load, which runs
+  against this plan. If assets are split later, emit
+  `name.<hash>.ext` from CMake and serve those with
+  `max-age=31536000, immutable`; `index.html` keeps the ETag treatment.
+- Answer `/favicon.ico` with a cacheable 204. The Phase A 404s that inflated
+  the old error counter were mostly this probe.
+
 Exit criteria: soak passes with request rate ≤ 1/3 s per client; banner
-appears only when the device is genuinely unreachable.
+appears only when the device is genuinely unreachable. A reload with an
+unchanged image gets a 304.
+
+### Phase D′: Server-sent events (optional, evidence-gated)
+
+Added 2026-09-30, moved out of the rejected list below. Do this if the
+Phase D soak or field counters still show send stalls, session churn, or
+table saturation.
+
+Why SSE beats the earlier "aggregated polling is enough" verdict: with
+`httpd_req_async_handler_begin()`, the stream request is detached onto a
+dedicated broadcaster task. A slow or dead client then stalls *that* task,
+not the single httpd task, so the L1 send-stall mechanism is isolated
+structurally. Polling cannot do this. SSE is preferred over WebSocket
+because:
+- data flows one way only (commands stay as POSTs);
+- it is plain HTTP, so `CONFIG_HTTPD_WS_SUPPORT` stays off;
+- `EventSource` reconnects on its own, which matters because iOS kills
+  streams on screen lock.
+
+Deliverables:
+
+- `GET /api/stream` (`text/event-stream`) streams the Phase D aggregate
+  status document as one event per cycle (~3 s), with
+  `retry:` and a periodic comment heartbeat. Cap of 1–2 concurrent streams;
+  over cap → 503 so the client falls back to polling.
+- The broadcaster task owns the detached requests and calls
+  `httpd_req_async_handler_complete()` on send failure or disconnect.
+  Verify how detached requests interact with the custom `close_fn` session
+  accounting.
+- The dashboard prefers `EventSource` and falls back to Phase D polling on
+  error or cap. Polling remains the contract for `curl`, the soak tool, and
+  any future native client.
+- Counters: streams open, events sent, broadcaster send-stall max,
+  stream-cap rejections.
+
+Prerequisite: Phase C. Each stream permanently holds a session, so the old
+4-session budget made this unsafe.
+
+Exit criteria: soak with one streaming client plus one polling client passes;
+a stalled streaming client (`--slow-reader`) produces no `send_stall` on the
+httpd task and no poll failures.
 
 ### Phase E: Keep the AP available (APSTA field mode)
 
@@ -914,10 +1029,17 @@ the Phase A duration counters.
 
 ## Explicitly rejected / deferred alternatives
 
-- **SSE or WebSocket push** instead of polling: holds a session socket open
-  permanently per client and adds a second code path through the socket
-  budget; aggregated 3 s polling achieves the same UX with less machinery.
-  Reconsider after Phase C/D if request volume still matters.
+- **SSE or WebSocket push**: originally rejected because each client holds
+  a socket permanently. Reconsidered 2026-09-30 and promoted to the gated
+  Phase D′ (SSE only) after Phase C relieved the socket budget. WebSocket
+  stays rejected for now, since it adds a protocol and Kconfig surface that a
+  one-way stream does not need.
+- **Moving the UI off-device (native client app)**: considered 2026-09-30.
+  Serving `index.html` is under 1% of request volume, so it does not relieve
+  the server. A native app is worth revisiting for its own capabilities
+  (BLE transport, remote view via MQTT, notifications), not for load. If
+  that happens, add an `api_version` field to `/api/status` first; the
+  Phase D aggregate and Phase D′ stream become its API.
 - **Second HTTP server task first**: the send-stall problem is better fixed
   by timeouts, keepalive, and socket budget than by adding concurrency to
   an embedded server.

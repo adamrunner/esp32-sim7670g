@@ -73,12 +73,43 @@ class FieldSafetyContractTests(unittest.TestCase):
         ).read_text()
         defaults = _config_assignments(sdkconfig_defaults)
 
-        self.assertIn("#define WEBUI_MAX_CLIENT_SESSIONS 4", webui_source)
+        sessions = int(
+            re.search(
+                r"#define WEBUI_MAX_CLIENT_SESSIONS (\d+)", webui_source
+            ).group(1)
+        )
+        max_sockets = int(defaults["CONFIG_LWIP_MAX_SOCKETS"])
         self.assertIn(
             "cfg.max_open_sockets = WEBUI_MAX_CLIENT_SESSIONS;",
             webui_source,
         )
-        self.assertEqual(defaults.get("CONFIG_LWIP_MAX_SOCKETS"), "10")
+        # Safari opens up to six parallel connections; fewer sessions than
+        # that lets the browser's own fan-out LRU-purge the poll socket.
+        self.assertGreaterEqual(sessions, 6)
+        # httpd holds three internal sockets; at least three more stay
+        # reserved for MQTT, OTA, and transient outbound work.
+        self.assertGreaterEqual(max_sockets - (sessions + 3), 3)
+
+    def test_webui_sessions_use_tcp_keepalive(self):
+        webui_source = (
+            REPOSITORY_ROOT / "main" / "webui.c"
+        ).read_text()
+        self.assertIn("cfg.keep_alive_enable = true;", webui_source)
+        self.assertIn(
+            "cfg.keep_alive_idle = WEBUI_KEEPALIVE_IDLE_S;", webui_source
+        )
+
+    def test_webui_watchdog_detects_without_restarting(self):
+        webui_source = _code(
+            (REPOSITORY_ROOT / "main" / "webui.c").read_text()
+        )
+        self.assertIn("httpd_queue_work(s_server, heartbeat_work", webui_source)
+        self.assertIn('"server_unresponsive"', webui_source)
+        # Detection only: httpd_stop() waits for a wedged task forever, and
+        # reboot escalation has not been approved for the field.
+        self.assertNotIn("httpd_stop(", webui_source)
+        self.assertNotIn("esp_restart()", webui_source.split(
+            "static void watchdog_task", 1)[1].split("void webui_init", 1)[0])
 
     def test_static_manual_ota_api_route_is_registered(self):
         webui_source = (
@@ -107,6 +138,11 @@ class FieldSafetyContractTests(unittest.TestCase):
         # slow-client send stalls, and polling during OTA transport.
         self.assertIn('"session_table_full"', webui_source)
         self.assertIn("HTTP_SERVER_EVENT_ERROR", webui_source)
+        # HTTP_SERVER_EVENT_ERROR carries an HTTP status, not a socket
+        # error; transport failures are counted from failed sends instead.
+        self.assertIn('"error_response_count"', webui_source)
+        self.assertIn("diagnostic_error == ESP_ERR_HTTPD_RESP_SEND", webui_source)
+        self.assertNotIn('"httpd_transport_error"', webui_source)
         self.assertIn('"send_stall"', webui_source)
         self.assertIn('"request_during_ota"', webui_source)
 
