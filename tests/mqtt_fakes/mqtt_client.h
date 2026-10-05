@@ -31,6 +31,7 @@ typedef struct {
             int qos;
             bool retain;
         } last_will;
+        int message_retransmit_timeout;
     } session;
     struct {
         int limit;

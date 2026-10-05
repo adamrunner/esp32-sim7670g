@@ -33,6 +33,14 @@ static const char *TAG = "mqtt";
 // The SD spool is the durability layer, so a failed/slow session shouldn't
 // hoard RAM: keep esp-mqtt's own outbox small and let publishes fail fast.
 #define OUTBOX_LIMIT_BYTES 4096
+// esp-mqtt resends the oldest unacked QoS 1 publish (DUP set) every
+// message_retransmit_timeout, default 1 s, without restarting its clock, so a
+// stalled cellular link queues one copy per second in the TCP send buffer and
+// the broker forwards every one: up to ~30 duplicate rows per sample. TCP
+// already guarantees in-session delivery and the SD spool owns retries after
+// PUBACK_TIMEOUT_MS, so keep this above esp-mqtt's 30 s outbox expiry and the
+// timer never fires.
+#define MQTT_RETRANSMIT_TIMEOUT_MS 60000
 
 static SemaphoreHandle_t s_mutex;       // guards config/status/client swaps
 static SemaphoreHandle_t s_pub_mutex;   // serializes publish+ack round-trips
@@ -312,6 +320,7 @@ static void restart_client_locked(void)
         .session.last_will.msg = will_payload,
         .session.last_will.qos = 1,
         .session.last_will.retain = true,
+        .session.message_retransmit_timeout = MQTT_RETRANSMIT_TIMEOUT_MS,
         .outbox.limit = OUTBOX_LIMIT_BYTES,
         .network.disable_auto_reconnect = false,
     };

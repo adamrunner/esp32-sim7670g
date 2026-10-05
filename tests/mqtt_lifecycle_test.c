@@ -50,6 +50,7 @@ static esp_event_handler_t s_mqtt_event_handler;
 static TaskFunction_t s_status_task;
 static char s_will_payloads[4][256];
 static size_t s_will_payload_count;
+static int s_retransmit_timeout_ms;
 static char s_enqueued_payloads[8][1024];
 static bool s_enqueued_success[8];
 static size_t s_enqueued_payload_count;
@@ -269,6 +270,7 @@ esp_mqtt_client_handle_t esp_mqtt_client_init(
              sizeof(s_will_payloads[s_will_payload_count]), "%s",
              config->session.last_will.msg);
     s_will_payload_count++;
+    s_retransmit_timeout_ms = config->session.message_retransmit_timeout;
     return s_client_init_fails ? NULL : &s_fake_client;
 }
 
@@ -604,6 +606,9 @@ static void test_shared_boot_identity(bool journal_setup_fails)
     mqtt_init();
     assert(s_will_payload_count == 1);
     assert_boot_id_document(s_will_payloads[0], expected_boot_id);
+    // Must exceed esp-mqtt's 30 s OUTBOX_EXPIRED_TIMEOUT_MS so in-session
+    // DUP retransmits never fire (0 or unset falls back to the 1 s default).
+    assert(s_retransmit_timeout_ms > 30000);
 
     assert(s_mqtt_event_handler);
     esp_mqtt_event_t connected = {0};
